@@ -97,6 +97,27 @@ This tool uniquely exports **both** VBA code and Excel file structure (tables, w
 - 🏗️ **Professional Workflows**: Bring software engineering practices to Excel development
 - 🤝 **Team Collaboration**: Review and merge changes like any software project
 
+## 🛠️ Contributing & Building a Release
+
+**Repo layout:**
+
+- `VBA Sync.xlam` — the live, distributable add-in (binary). Users download this file.
+- `VBA Sync/Modules/*.bas` — the source-of-truth VBA code that lives inside the `.xlam`.
+
+The `.xlam` is the artifact users install, but the `.bas` files are what you edit in your IDE and what Git diffs. The two must be kept in sync before every commit that changes behaviour.
+
+**To ship a code change:**
+
+1. Edit the `.bas`/`.cls` files under `VBA Sync/` in your IDE of choice.
+2. Open `VBA Sync.xlam` in Excel (Alt+F11 to reach the VBA editor).
+3. Use **VBA Sync → Import** (the add-in imports itself from the folder next to it) — or manually right-click each module in the VBA editor → Remove → Import File.
+4. Save the add-in: **File → Save** (or Ctrl+S) from within Excel with the `.xlam` active.
+5. Close Excel to release the file lock.
+6. `git status` should show both the updated `.bas` and the updated `VBA Sync.xlam` as modified.
+7. Commit both together so users who only download the `.xlam` get the fix.
+
+> ⚠️ If you commit only the `.bas` changes, the published add-in is still stale and end users won't see the fix. Always rebuild the `.xlam`.
+
 ## 📄 License
 
 This project is released under the MIT License - feel free to use, modify, and distribute!
