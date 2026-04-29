@@ -217,35 +217,127 @@ NextComponent:
     MsgBox "VBA Sync export completed successfully!" & vbCrLf & "Files exported to: " & rootPath, vbInformation, "VBA Sync"
 End Sub
 
-'Extract Excel file structure for version control and collaboration
+' Extract Excel file structure for version control. The actual XML normalisation
+' (pretty-printing, attribute reordering, volatile-noise stripping, LAMBDA
+' deduplication, MANIFEST.json generation, password-hash redaction) lives in
+' Normalize-ExcelXml.ps1 next to this add-in. We orchestrate: copy the .xlsm to
+' a temp .zip, expand it, shell out to the normaliser, capture the log, clean up.
+'
+' v0.2 layout (replaces the old single-line workbook.xml + sheet1.xml + tableN.xml):
+'   Excel/
+'   |-- MANIFEST.json                      Workbook structure as JSON
+'   |-- lambdas/<Name>.lambda              One file per unique LAMBDA defined name
+'   |-- worksheets/<NN> - <Name>.xml       sheetId-prefixed, multi-line, normalised
+'   |-- tables/<TableName>.xml             Named after the table, not the rId
+'   `-- STRUCTURE_SUMMARY.md               Human-readable overview (VBA-generated)
+'
+' The .normalize.log is read after the shell call and surfaces any redactions
+' (sheet/workbook protection password hashes) to the user via the structure
+' summary. We deliberately do NOT pop a MsgBox for redactions -- they're
+' informational; users can see them in the log if they want.
 Private Sub ExtractExcelStructure(wb As Workbook, rootPath As String, exported As Object)
     On Error GoTo ExcelStructureError
-    
+
     Dim excelDir As String: excelDir = rootPath & "Excel\"
     EnsureFolder excelDir
-    
+
     ' Create temporary copy of workbook as ZIP
     Dim tempZip As String: tempZip = wb.Path & "\" & wb.Name & ".temp.zip"
     Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
     fso.CopyFile wb.FullName, tempZip
     Debug.Print "VBA Sync: Creating temporary ZIP copy..."
-    
+
     ' Extract Excel structure using Shell
     Dim tempExtract As String: tempExtract = wb.Path & "\temp_excel_extract"
     EnsureFolder tempExtract
-    
-    ' Use PowerShell to extract ZIP (more reliable than Shell.Application)
+
     Debug.Print "VBA Sync: Extracting Excel XML structure..."
     Dim psCmd As String
-    psCmd = "powershell -Command ""Expand-Archive -Path '" & Replace(tempZip, "'", "''") & "' -DestinationPath '" & Replace(tempExtract, "'", "''") & "' -Force"""
+    psCmd = "powershell -NoProfile -Command ""Expand-Archive -Path '" & Replace(tempZip, "'", "''") & "' -DestinationPath '" & Replace(tempExtract, "'", "''") & "' -Force"""
     CreateObject("WScript.Shell").Run psCmd, 0, True
-    
-    ' Copy key Excel files to src/Excel/
-    Debug.Print "VBA Sync: Copying workbook structure..."
+
+    ' Locate the normaliser script. It ships next to VBA Sync.xlam in the add-in
+    ' folder. If missing (user deleted it, or older xlam without it), we fall back
+    ' to the legacy raw-copy path below.
+    Dim normalizerPath As String
+    normalizerPath = LocateNormaliserScript()
+
+    If Len(normalizerPath) > 0 Then
+        Debug.Print "VBA Sync: Normalising via " & normalizerPath
+        Dim normCmd As String
+        normCmd = "powershell -NoProfile -ExecutionPolicy Bypass -File """ & normalizerPath & """ " & _
+                  "-Source """ & tempExtract & """ -Destination """ & excelDir & """"
+        Dim exitCode As Long
+        exitCode = CreateObject("WScript.Shell").Run(normCmd, 0, True)
+        If exitCode <> 0 Then
+            Debug.Print "VBA Sync: Normaliser exit code " & exitCode & " (see " & excelDir & ".normalize.log)"
+        End If
+
+        ' Mark all output files as exported so PruneStaleFiles doesn't delete them
+        MarkNormaliserOutputAsExported excelDir, exported
+    Else
+        Debug.Print "VBA Sync: Normalize-ExcelXml.ps1 not found, falling back to raw copy"
+        LegacyCopyExcelStructure tempExtract, excelDir, exported
+    End If
+
+    ' Create Excel structure summary (live workbook → readable .md)
+    CreateExcelStructureSummary wb, excelDir, exported
+
+    ' Cleanup temporary files
+    On Error Resume Next
+    fso.DeleteFile tempZip, True
+    fso.DeleteFolder tempExtract, True
+    On Error GoTo 0
+
+    Exit Sub
+
+ExcelStructureError:
+    Debug.Print "VBA Sync: Excel structure extraction failed: " & Err.Description
+    On Error Resume Next
+    If fso.FileExists(tempZip) Then fso.DeleteFile tempZip, True
+    If fso.FolderExists(tempExtract) Then fso.DeleteFolder tempExtract, True
+    On Error GoTo 0
+    ' Continue without Excel structure rather than failing the whole VBA export
+End Sub
+
+' Locate Normalize-ExcelXml.ps1. It must live next to VBA Sync.xlam (in the
+' add-in folder). Returns "" if not found.
+Private Function LocateNormaliserScript() As String
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    Dim candidate As String
+    candidate = ThisWorkbook.Path & "\Normalize-ExcelXml.ps1"
+    If fso.FileExists(candidate) Then
+        LocateNormaliserScript = candidate
+        Exit Function
+    End If
+    LocateNormaliserScript = ""
+End Function
+
+' Walk the normaliser's output and record every file in the exported dictionary
+' so PruneStaleFiles knows not to delete them.
+Private Sub MarkNormaliserOutputAsExported(excelDir As String, exported As Object)
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FolderExists(excelDir) Then Exit Sub
+    MarkFolderRecursive fso.GetFolder(excelDir), exported
+End Sub
+
+Private Sub MarkFolderRecursive(folder As Object, exported As Object)
+    Dim f As Object, sub_ As Object
+    For Each f In folder.Files
+        exported(AddSlash(f.Path)) = True
+    Next
+    For Each sub_ In folder.SubFolders
+        MarkFolderRecursive sub_, exported
+    Next
+End Sub
+
+' Fallback path used when Normalize-ExcelXml.ps1 isn't found alongside the
+' xlam. Reproduces the v0.1 behaviour (raw single-line XML copies) so an export
+' still produces *something* useful even without the normaliser.
+Private Sub LegacyCopyExcelStructure(tempExtract As String, excelDir As String, exported As Object)
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
     CopyExcelFile tempExtract & "\xl\workbook.xml", excelDir, "workbook.xml", exported
-    
-    ' Copy table definitions
-    Debug.Print "VBA Sync: Copying table definitions..."
+
     Dim tablesDir As String: tablesDir = excelDir & "tables\"
     If fso.FolderExists(tempExtract & "\xl\tables") Then
         EnsureFolder tablesDir
@@ -256,9 +348,7 @@ Private Sub ExtractExcelStructure(wb As Workbook, rootPath As String, exported A
             End If
         Next
     End If
-    
-    ' Copy worksheet structure (limited lines to avoid huge data files)
-    Debug.Print "VBA Sync: Copying worksheet schemas..."
+
     Dim worksheetsDir As String: worksheetsDir = excelDir & "worksheets\"
     If fso.FolderExists(tempExtract & "\xl\worksheets") Then
         EnsureFolder worksheetsDir
@@ -269,25 +359,6 @@ Private Sub ExtractExcelStructure(wb As Workbook, rootPath As String, exported A
             End If
         Next
     End If
-    
-    ' Create Excel structure summary
-    CreateExcelStructureSummary wb, excelDir, exported
-    
-    ' Cleanup temporary files
-    On Error Resume Next
-    fso.DeleteFile tempZip, True
-    fso.DeleteFolder tempExtract, True
-    On Error GoTo 0
-    
-    Exit Sub
-    
-ExcelStructureError:
-    ' Cleanup on error
-    On Error Resume Next
-    If fso.FileExists(tempZip) Then fso.DeleteFile tempZip, True
-    If fso.FolderExists(tempExtract) Then fso.DeleteFolder tempExtract, True
-    On Error GoTo 0
-    ' Continue without Excel structure if extraction fails
 End Sub
 
 Private Sub CopyExcelFile(sourcePath As String, destDir As String, fileName As String, exported As Object)
@@ -371,10 +442,31 @@ Private Sub CreateExcelStructureSummary(wb As Workbook, excelDir As String, expo
     summary = summary & vbCrLf
     
     summary = summary & "## Files Included" & vbCrLf
-    summary = summary & "- `workbook.xml` - Overall workbook structure" & vbCrLf
-    summary = summary & "- `tables/*.xml` - Excel table definitions" & vbCrLf
-    summary = summary & "- `worksheets/*.xml` - Worksheet schemas (first " & WORKSHEET_LINE_LIMIT & " lines)" & vbCrLf
-    
+    summary = summary & "- `MANIFEST.json` - Workbook structure (sheets, defined names, lambdas, calc settings)" & vbCrLf
+    summary = summary & "- `tables/<TableName>.xml` - Excel table definitions, named after the table" & vbCrLf
+    summary = summary & "- `worksheets/<NN> - <SheetName>.xml` - Worksheet schemas, sheetId-prefixed for stable sort" & vbCrLf
+    summary = summary & "- `lambdas/<Name>.lambda` - LAMBDA defined names (deduplicated across sheets)" & vbCrLf
+    summary = summary & vbCrLf
+
+    ' Surface any password-hash redactions from the normaliser log
+    Dim logPath As String: logPath = excelDir & ".normalize.log"
+    If fso.FileExists(logPath) Then
+        Dim logText As String
+        logText = fso.OpenTextFile(logPath, 1).ReadAll
+        If InStr(logText, "REDACTED:") > 0 Then
+            summary = summary & "## Redactions" & vbCrLf
+            summary = summary & "Password hashes were stripped from the exported XML to keep them out of Git history. " & _
+                                "The protections still exist on the .xlsx itself; only the on-disk export is sanitised." & vbCrLf & vbCrLf
+            Dim ln As Variant
+            For Each ln In Split(logText, vbCrLf)
+                If InStr(CStr(ln), "REDACTED:") > 0 Then
+                    Dim msg As String: msg = Mid$(CStr(ln), InStr(CStr(ln), "REDACTED:"))
+                    summary = summary & "- " & msg & vbCrLf
+                End If
+            Next
+        End If
+    End If
+
     Dim ts As Object: Set ts = fso.CreateTextFile(summaryPath, True)
     ts.Write summary
     ts.Close
@@ -495,14 +587,16 @@ End Sub
 'Delete any .bas/.cls/.frm/.frx/.xml file that wasn't exported this run
 Private Sub PruneStaleFiles(rootPath As String, exported As Object)
     Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+
+    ' VBA component folders -- flat, fixed extensions
     Dim subFolder As Variant, folderPath As String
-    For Each subFolder In Array("Modules", "ClassModules", "Forms", "Objects", "Misc", "Excel", "Excel/tables", "Excel/worksheets")
+    For Each subFolder In Array("Modules", "ClassModules", "Forms", "Objects", "Misc")
         folderPath = rootPath & subFolder & "\"
         If fso.FolderExists(folderPath) Then
             Dim f As Object
             For Each f In fso.GetFolder(folderPath).Files
                 Dim ext As String: ext = LCase$(fso.GetExtensionName(f.Path))
-                If ext = "bas" Or ext = "cls" Or ext = "frm" Or ext = "frx" Or ext = "xml" Or ext = "md" Then
+                If ext = "bas" Or ext = "cls" Or ext = "frm" Or ext = "frx" Then
                     If Not exported.Exists(AddSlash(f.Path)) Then
                         On Error Resume Next
                         f.Delete True
@@ -511,6 +605,43 @@ Private Sub PruneStaleFiles(rootPath As String, exported As Object)
                 End If
             Next
         End If
+    Next
+
+    ' Excel folder -- recursive walk (the v0.2 layout adds lambdas/ and may add
+    ' more subfolders in v0.3). Anything under Excel/ that isn't in the export
+    ' set gets pruned. The .normalize.log is preserved (we don't track it in
+    ' exported, but it's harmless to leave).
+    Dim excelDir As String: excelDir = rootPath & "Excel\"
+    If fso.FolderExists(excelDir) Then
+        PruneFolderRecursive fso.GetFolder(excelDir), exported
+    End If
+End Sub
+
+Private Sub PruneFolderRecursive(folder As Object, exported As Object)
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    Dim f As Object, sub_ As Object
+    Dim toDelete As Object: Set toDelete = CreateObject("Scripting.Dictionary")
+
+    For Each f In folder.Files
+        Dim ext As String: ext = LCase$(fso.GetExtensionName(f.Path))
+        ' Preserve the normaliser's log file
+        If LCase$(f.Name) = ".normalize.log" Then
+            ' skip
+        ElseIf ext = "xml" Or ext = "md" Or ext = "json" Or ext = "lambda" Then
+            If Not exported.Exists(AddSlash(f.Path)) Then
+                toDelete(f.Path) = True
+            End If
+        End If
+    Next
+    Dim p As Variant
+    For Each p In toDelete.Keys
+        On Error Resume Next
+        fso.DeleteFile p, True
+        On Error GoTo 0
+    Next
+
+    For Each sub_ In folder.SubFolders
+        PruneFolderRecursive sub_, exported
     Next
 End Sub
 
@@ -535,9 +666,11 @@ Private Sub WriteGitAttributes(basePath As String)
           "*.cls text eol=crlf" & vbCrLf & _
           "*.frm text eol=crlf" & vbCrLf & _
           vbCrLf & _
-          "# Excel structure files" & vbCrLf & _
+          "# Excel structure files (XML + Markdown use CRLF; JSON/lambda use LF)" & vbCrLf & _
           "*.xml text eol=crlf" & vbCrLf & _
           "*.md text eol=crlf" & vbCrLf & _
+          "*.json text eol=lf" & vbCrLf & _
+          "*.lambda text eol=lf" & vbCrLf & _
           vbCrLf & _
           "# Binary partner of UserForms" & vbCrLf & _
           "*.frx binary" & vbCrLf & _

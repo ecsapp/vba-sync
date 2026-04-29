@@ -184,8 +184,11 @@ function Get-IgnorableNamespaces {
     foreach ($prefix in $prefixes) {
         if (-not $prefix) { continue }
         $ns = $root.GetNamespaceOfPrefix($prefix)
-        if ($ns -and ($NS_KEEP -notcontains $ns.NamespaceName)) {
-            $uris += $ns.NamespaceName
+        if (-not $ns) { continue }   # prefix listed but not declared on root -- skip
+        $uri = $ns.NamespaceName
+        if (-not $uri) { continue }
+        if ($NS_KEEP -notcontains $uri) {
+            $uris += $uri
         }
     }
     return $uris
@@ -223,7 +226,10 @@ function Remove-VolatileNamespaces {
     $mcIgnorable = $Doc.Root.Attribute([System.Xml.Linq.XName]::Get('Ignorable', $NS.mc))
     if ($mcIgnorable) {
         $remaining = @($mcIgnorable.Value -split '\s+' | Where-Object {
-            $_ -and ($NS_KEEP -contains $Doc.Root.GetNamespaceOfPrefix($_).NamespaceName)
+            if (-not $_) { return $false }
+            $ns = $Doc.Root.GetNamespaceOfPrefix($_)
+            if (-not $ns) { return $false }
+            return ($NS_KEEP -contains $ns.NamespaceName)
         })
         if ($remaining.Count -eq 0) {
             $mcIgnorable.Remove()
@@ -553,11 +559,88 @@ function Process-Workbook {
 
 function Save-Manifest {
     param([System.Collections.Specialized.OrderedDictionary]$Manifest, [string]$Path)
-    # ConvertTo-Json on PS 5.1 needs -Depth deep enough for nested ordered hashtables.
-    $json = $Manifest | ConvertTo-Json -Depth 20
-    # PS 5.1 escapes non-ASCII as \uXXXX; for our manifest this is harmless and idempotent.
-    # JSON files use LF line endings (gitattributes will reinforce this).
-    Write-Utf8NoBom -Path $Path -Text $json -LineEnding "`n"
+    # PS 5.1's ConvertTo-Json indents oddly (4 spaces + double-space after colon).
+    # Use ConvertTo-Json then post-process to standard 2-space, single-space.
+    $raw = $Manifest | ConvertTo-Json -Depth 20 -Compress:$false
+    $pretty = Format-Json -Json $raw
+    Write-Utf8NoBom -Path $Path -Text $pretty -LineEnding "`n"
+}
+
+function Format-Json {
+    # Reformat a PS5.1 ConvertTo-Json output to canonical 2-space indent
+    # with single-space after colon. Walks the string char-by-char respecting
+    # quoted strings (no JSON parse needed -- ConvertTo-Json output is always
+    # valid and balanced).
+    param([string]$Json)
+    $sb = New-Object System.Text.StringBuilder
+    $depth = 0
+    $inString = $false
+    $escaped = $false
+    $atLineStart = $false
+    for ($i = 0; $i -lt $Json.Length; $i++) {
+        $c = $Json[$i]
+        if ($inString) {
+            [void]$sb.Append($c)
+            if ($escaped) { $escaped = $false }
+            elseif ($c -eq '\') { $escaped = $true }
+            elseif ($c -eq '"') { $inString = $false }
+            continue
+        }
+        switch ($c) {
+            '"' {
+                $inString = $true
+                [void]$sb.Append($c)
+                $atLineStart = $false
+            }
+            '{' {
+                $depth++
+                [void]$sb.Append('{')
+                [void]$sb.Append("`n")
+                [void]$sb.Append(('  ' * $depth))
+                $atLineStart = $true
+            }
+            '[' {
+                $depth++
+                [void]$sb.Append('[')
+                [void]$sb.Append("`n")
+                [void]$sb.Append(('  ' * $depth))
+                $atLineStart = $true
+            }
+            '}' {
+                $depth--
+                [void]$sb.Append("`n")
+                [void]$sb.Append(('  ' * $depth))
+                [void]$sb.Append('}')
+                $atLineStart = $false
+            }
+            ']' {
+                $depth--
+                [void]$sb.Append("`n")
+                [void]$sb.Append(('  ' * $depth))
+                [void]$sb.Append(']')
+                $atLineStart = $false
+            }
+            ',' {
+                [void]$sb.Append(',')
+                [void]$sb.Append("`n")
+                [void]$sb.Append(('  ' * $depth))
+                $atLineStart = $true
+            }
+            ':' {
+                [void]$sb.Append(': ')
+                $atLineStart = $false
+            }
+            { $_ -eq ' ' -or $_ -eq "`t" -or $_ -eq "`r" -or $_ -eq "`n" } {
+                # Skip whitespace from PS's formatter; we control our own
+                if (-not $atLineStart) { }
+            }
+            default {
+                [void]$sb.Append($c)
+                $atLineStart = $false
+            }
+        }
+    }
+    return $sb.ToString()
 }
 
 function Save-Lambdas {

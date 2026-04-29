@@ -25,20 +25,26 @@ This Excel add-in automatically exports your VBA project AND Excel file structur
 
 ```
 YourWorkbook/
-├── Modules/              # Standard VBA modules (.bas)
-├── ClassModules/         # VBA class modules (.cls)
-├── Forms/                # UserForms (.frm + .frx)
-├── Objects/              # ThisWorkbook & Sheet modules (.cls)
-└── Excel/                # Excel file structure
-    ├── workbook.xml      # Workbook structure & named ranges
-    ├── tables/           # Excel table definitions (*.xml)
-    ├── worksheets/       # Worksheet schemas (*.xml)
-    └── STRUCTURE_SUMMARY.md  # Human-readable data model summary
+├── Modules/                            # Standard VBA modules (.bas)
+├── ClassModules/                       # VBA class modules (.cls)
+├── Forms/                              # UserForms (.frm + .frx)
+├── Objects/                            # ThisWorkbook & Sheet modules (.cls)
+└── Excel/                              # Excel file structure
+    ├── MANIFEST.json                   # Workbook structure: sheets, defined names, lambdas, calc settings
+    ├── lambdas/                        # LAMBDA defined names, one .lambda file per unique body
+    │   └── AppendRange.lambda
+    ├── tables/
+    │   └── <TableName>.xml             # Named after the Excel table, not its internal rId
+    ├── worksheets/
+    │   └── <NN> - <SheetName>.xml      # SheetId-prefixed (rename-stable) + name (readable)
+    └── STRUCTURE_SUMMARY.md            # Human-readable data model summary
 ```
+
+The Excel/ XML files are produced by a PowerShell normaliser (`Normalize-ExcelXml.ps1`, ships next to the .xlam) that pretty-prints the OOXML, sorts attributes alphabetically, strips volatile metadata (revision GUIDs, window positions, build numbers, the local filesystem path that Excel embeds), redacts password hashes from sheet/workbook protection elements, and deduplicates LAMBDA copies. The result: small, readable diffs even after a "save with no changes".
 
 Plus auto-generated Git configuration files:
 
-- `.gitattributes` - Proper line endings for VBA files
+- `.gitattributes` - Line endings & encoding rules for the various file types
 - `.gitignore` - Excludes Excel temp files and system cruft
 - `README.md` - Auto-generated documentation (created once, never overwritten)
 
