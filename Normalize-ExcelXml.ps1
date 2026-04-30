@@ -730,6 +730,35 @@ function Read-WorkbookRels {
     return $map
 }
 
+# Read a worksheet's _rels file to find which tables (and other parts) it
+# references. Returns a hashtable: rId -> @{Type='table|drawing|comments|...';
+# Target='absolute xl-relative path'}.
+function Read-WorksheetRels {
+    param([string]$SourceXlPath, [string]$WorksheetSourceFile)
+    # WorksheetSourceFile is like 'worksheets/sheet5.xml' (relative to xl/)
+    $sheetName = [System.IO.Path]::GetFileName($WorksheetSourceFile)  # 'sheet5.xml'
+    $relsPath = Join-Path $SourceXlPath "worksheets\_rels\$sheetName.rels"
+    $map = @{}
+    if (-not (Test-Path -LiteralPath $relsPath)) { return $map }
+    $relsDoc = Load-Xml -Path $relsPath
+    foreach ($rel in $relsDoc.Descendants([System.Xml.Linq.XName]::Get('Relationship', $NS.rel))) {
+        $id = $rel.Attribute('Id').Value
+        $type = $rel.Attribute('Type').Value
+        $target = $rel.Attribute('Target').Value
+        # Resolve relative paths like '../tables/table1.xml' to xl-relative form
+        if ($target.StartsWith('../')) {
+            $target = $target.Substring(3)
+        } elseif (-not $target.Contains('/')) {
+            $target = "worksheets/$target"
+        }
+        # Extract the short type name from the schema URL
+        $shortType = $type
+        if ($type.Contains('/')) { $shortType = $type.Substring($type.LastIndexOf('/') + 1) }
+        $map[$id] = @{ Type = $shortType; Target = $target }
+    }
+    return $map
+}
+
 function Build-SheetIndex {
     # Reads the post-normalisation workbook XDocument and returns an array of
     # PSCustomObjects describing each sheet, in workbook tab order.
@@ -1054,15 +1083,20 @@ function Process-Worksheet {
     # v1.0: per-sheet folder with split files instead of one normalised XML.
     # The folder layout mirrors what we agreed in the spec:
     #   worksheets/<NN> - <Name>/
-    #     data.tsv             - cached cell values, header row of column letters
+    #     data.tsv             - cached cell values for non-table cells, with
+    #                            marker rows at table positions
     #     formulas.json        - cell formulas (A1 form, range-collapsed)
     #     styles.json          - resolved per-cell styles, range-merged
-    # Phases B+C add tables/, _meta.json, validations.json, conditional_formats.json,
-    # comments.json, drawings/, charts/, pivot_tables/.
+    #     tables/<TableName>/
+    #       definition.json    - schema, columns, calc formulas, overrides
+    #       data.tsv           - clean dataset (headers row 1, data rows below)
+    # Returns an array of table-manifest entries (consumed by Invoke-Normalize
+    # to populate MANIFEST.tables).
     param(
         [string]$SourceXmlPath,
         [PSCustomObject]$SheetMeta,
         [string]$DestDir,
+        [string]$SourceXlPath,
         [string[]]$SharedStrings,
         [hashtable]$Styles
     )
@@ -1079,6 +1113,60 @@ function Process-Worksheet {
     $padded = ([string]$SheetMeta.sheetId).PadLeft($padding, '0')
     $sheetFolder = Join-Path $DestDir "$padded - $safeName"
     Ensure-Directory -Path $sheetFolder
+
+    # Discover tables hosted on this sheet: walk <tableParts> for r:id refs,
+    # resolve each via the worksheet's _rels file to a tableN.xml path, parse
+    # each table to learn its name+ref so we can exclude its cells from the
+    # sheet's data.tsv and emit a marker row at the table's start.
+    $tableEntries = New-Object System.Collections.Generic.List[object]
+    $tableRanges  = New-Object System.Collections.Generic.List[object]   # @{ Name; Range = @{StartCol,StartRow,EndCol,EndRow}; CellsByKey }
+    $tablePartsEl = $doc.Descendants([System.Xml.Linq.XName]::Get('tableParts', $NS.main)) | Select-Object -First 1
+    if ($tablePartsEl -and $SourceXlPath) {
+        $rels = Read-WorksheetRels -SourceXlPath $SourceXlPath -WorksheetSourceFile $SheetMeta.sourceFile
+        foreach ($tp in $tablePartsEl.Elements([System.Xml.Linq.XName]::Get('tablePart', $NS.main))) {
+            $rIdAttr = $tp.Attribute([System.Xml.Linq.XName]::Get('id', $NS.r))
+            if (-not $rIdAttr) { continue }
+            $rel = $rels[$rIdAttr.Value]
+            if (-not $rel) { continue }
+            $tableXmlPath = Join-Path $SourceXlPath ($rel.Target -replace '/', '\')
+            if (-not (Test-Path -LiteralPath $tableXmlPath)) { continue }
+
+            try {
+                $tDoc = Load-Xml -Path $tableXmlPath
+                Remove-VolatileNamespaces -Doc $tDoc
+                Remove-VolatileAttributes -Doc $tDoc
+                $tName = $tDoc.Root.Attribute('name').Value
+                $tRef  = $tDoc.Root.Attribute('ref').Value
+                $tableSafe = Get-SafeFileName -Name $tName
+
+                $tableFolder = Join-Path (Join-Path $sheetFolder 'tables') $tableSafe
+                Ensure-Directory -Path $tableFolder
+
+                # Parse the range so we can exclude its cells from the sheet
+                $rng = ConvertFrom-A1Range -Range $tRef
+                if ($rng) {
+                    $tableRanges.Add(@{
+                        Name = $tName
+                        SafeName = $tableSafe
+                        Range = $rng
+                        Folder = $tableFolder
+                        XmlDoc = $tDoc
+                        Ref = $tRef
+                    })
+                }
+
+                $tableEntries.Add([ordered]@{
+                    name        = $tName
+                    displayName = if ($tDoc.Root.Attribute('displayName')) { $tDoc.Root.Attribute('displayName').Value } else { $tName }
+                    sheet       = $SheetMeta.name
+                    ref         = $tRef
+                    folder      = "worksheets/$padded - $safeName/tables/$tableSafe/"
+                })
+            } catch {
+                Write-NormalizeLog -Level WARN -Message "$($fileLabel): could not process table at $tableXmlPath - $_"
+            }
+        }
+    }
 
     # Walk <sheetData> once and collect three parallel views: values, formulas, styles
     $sheetData = $doc.Descendants([System.Xml.Linq.XName]::Get('sheetData', $NS.main)) | Select-Object -First 1
@@ -1180,6 +1268,46 @@ function Process-Worksheet {
         }
     }
 
+    # Phase B: extract table cells from $cellValues and $cellFormulas, then
+    # write per-table data.tsv + definition.json. Cells inside table ranges
+    # are removed from the sheet's $cellValues so they don't appear twice.
+    # A marker row is added at the table's first row so the sheet's data.tsv
+    # still shows where the table sits positionally.
+    $tableMarkers = @{}    # "col,row" -> marker text (single cell at table's start col,row)
+    foreach ($t in $tableRanges) {
+        # Carve out the table's cells
+        $tableCellValues   = @{}
+        $tableCellFormulas = @{}
+        for ($r = $t.Range.StartRow; $r -le $t.Range.EndRow; $r++) {
+            for ($c = $t.Range.StartCol; $c -le $t.Range.EndCol; $c++) {
+                $k = "$c,$r"
+                if ($cellValues.ContainsKey($k)) {
+                    $tableCellValues[$k] = $cellValues[$k]
+                    $cellValues.Remove($k)
+                }
+                if ($cellFormulas.ContainsKey($k)) {
+                    $tableCellFormulas[$k] = $cellFormulas[$k]
+                    $cellFormulas.Remove($k)
+                }
+            }
+        }
+
+        # Marker row at the table's start (first column of first row of table range)
+        $markerKey = "$($t.Range.StartCol),$($t.Range.StartRow)"
+        $tableMarkers[$markerKey] = "[table:$($t.Name) ref=$($t.Ref) -> tables/$($t.SafeName)/]"
+
+        # Write the table's data.tsv (clean: header row from cells in startRow,
+        # data rows below; coordinates rebased so that table's first row is row 1)
+        Save-TableDataTsv -Cells $tableCellValues -TableRange $t.Range -Path (Join-Path $t.Folder 'data.tsv')
+
+        # Write the table's definition.json (schema, columns, calc formulas,
+        # overrides). Built from the table's XML doc plus the table-cell formulas.
+        Save-TableDefinitionJson -TableXmlDoc $t.XmlDoc -TableRange $t.Range -CellFormulas $tableCellFormulas -Path (Join-Path $t.Folder 'definition.json')
+    }
+
+    # Merge marker rows into the sheet's cellValues so they appear at the right row
+    foreach ($k in $tableMarkers.Keys) { $cellValues[$k] = $tableMarkers[$k] }
+
     # Write data.tsv
     Save-DataTsv -Cells $cellValues -Path (Join-Path $sheetFolder 'data.tsv')
 
@@ -1188,6 +1316,129 @@ function Process-Worksheet {
 
     # Write styles.json
     Save-StylesJson -Cells $cellStyles -Path (Join-Path $sheetFolder 'styles.json')
+
+    # Return table manifest entries to the caller
+    return ,$tableEntries.ToArray()
+}
+
+# Write a table's clean data.tsv. Headers row comes from the cells in the
+# table's first row (range.StartRow); data rows are everything below. Cell
+# coordinates are rebased so the table's first column is "Col1" (we use the
+# original sheet column letters in the header for traceability).
+function Save-TableDataTsv {
+    param([hashtable]$Cells, [hashtable]$TableRange, [string]$Path)
+
+    $startCol = $TableRange.StartCol
+    $endCol   = $TableRange.EndCol
+    $startRow = $TableRange.StartRow
+    $endRow   = $TableRange.EndRow
+
+    # Group by row
+    $byRow = @{}
+    foreach ($k in $Cells.Keys) {
+        $parts = $k.Split(',')
+        $c = [int]$parts[0]; $r = [int]$parts[1]
+        if (-not $byRow.ContainsKey($r)) { $byRow[$r] = @{} }
+        $byRow[$r][$c] = $Cells[$k]
+    }
+
+    # Header: take values from the first row (table headers); fall back to
+    # column-letter for any blank header cell
+    $headers = @()
+    if ($byRow.ContainsKey($startRow)) {
+        for ($c = $startCol; $c -le $endCol; $c++) {
+            $h = if ($byRow[$startRow].ContainsKey($c)) { [string]$byRow[$startRow][$c] } else { '' }
+            if ([string]::IsNullOrEmpty($h)) { $h = ConvertTo-ColLetters -Col $c }
+            $headers += $h
+        }
+    } else {
+        for ($c = $startCol; $c -le $endCol; $c++) { $headers += (ConvertTo-ColLetters -Col $c) }
+    }
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append(($headers | ForEach-Object { Format-TsvCell -Value $_ }) -join "`t")
+    [void]$sb.Append("`r`n")
+
+    # Data rows (skip startRow which is the header row)
+    for ($r = $startRow + 1; $r -le $endRow; $r++) {
+        $line = @()
+        for ($c = $startCol; $c -le $endCol; $c++) {
+            $v = if ($byRow.ContainsKey($r) -and $byRow[$r].ContainsKey($c)) { $byRow[$r][$c] } else { '' }
+            $line += (Format-TsvCell -Value $v)
+        }
+        [void]$sb.Append($line -join "`t")
+        [void]$sb.Append("`r`n")
+    }
+
+    Write-Utf8NoBom -Path $Path -Text $sb.ToString() -LineEnding "`r`n"
+}
+
+# Write a table's definition.json. Schema, columns (with calc formulas where
+# present), and overrides (cells in a calc column whose formula differs from
+# the column default).
+function Save-TableDefinitionJson {
+    param(
+        [System.Xml.Linq.XDocument]$TableXmlDoc,
+        [hashtable]$TableRange,
+        [hashtable]$CellFormulas,
+        [string]$Path
+    )
+
+    $root = $TableXmlDoc.Root
+    $name = $root.Attribute('name').Value
+    $displayName = if ($root.Attribute('displayName')) { $root.Attribute('displayName').Value } else { $name }
+    $totalsRowShown = if ($root.Attribute('totalsRowShown')) { ($root.Attribute('totalsRowShown').Value -ne '0') } else { $true }
+
+    $columns = @()
+    $tableColumnsEl = $root.Element([System.Xml.Linq.XName]::Get('tableColumns', $NS.main))
+    $colIdx = 0
+    if ($tableColumnsEl) {
+        foreach ($tc in $tableColumnsEl.Elements([System.Xml.Linq.XName]::Get('tableColumn', $NS.main))) {
+            $colName = $tc.Attribute('name').Value
+            $col = [ordered]@{ name = $colName }
+            $calcFormulaEl = $tc.Element([System.Xml.Linq.XName]::Get('calculatedColumnFormula', $NS.main))
+            if ($calcFormulaEl) {
+                $defaultFormula = "=$($calcFormulaEl.Value)"
+                $col['formula'] = $defaultFormula
+
+                # Find overrides: walk this column's data cells, flag any whose
+                # formula differs from the default. Also flag cells that have
+                # no formula at all (manually overridden to a literal).
+                $sheetColIdx = $TableRange.StartCol + $colIdx
+                $overrides = [ordered]@{}
+                for ($r = $TableRange.StartRow + 1; $r -le $TableRange.EndRow; $r++) {
+                    $k = "$sheetColIdx,$r"
+                    $tableRowIdx = $r - $TableRange.StartRow   # 1-based table row
+                    if ($CellFormulas.ContainsKey($k)) {
+                        $cellF = $CellFormulas[$k]
+                        # Resolved shared-formula references match the default
+                        if ($cellF -ne $defaultFormula -and $cellF -notlike '*[shared:*]*') {
+                            $overrides["$tableRowIdx"] = $cellF
+                        }
+                    }
+                }
+                if ($overrides.Count -gt 0) { $col['overrides'] = $overrides }
+            }
+            $columns += $col
+            $colIdx++
+        }
+    }
+
+    $obj = [ordered]@{
+        name           = $name
+        displayName    = $displayName
+        ref            = $TableRange.StartCol.ToString() + ',' + $TableRange.StartRow.ToString() + ':' + $TableRange.EndCol.ToString() + ',' + $TableRange.EndRow.ToString()
+        a1Ref          = (ConvertTo-A1Ref -Col $TableRange.StartCol -Row $TableRange.StartRow) + ':' + (ConvertTo-A1Ref -Col $TableRange.EndCol -Row $TableRange.EndRow)
+        totalsRowShown = $totalsRowShown
+        columns        = $columns
+    }
+
+    # Replace the long winded "ref" with just a1Ref; ref above was just for completeness
+    $obj.Remove('ref')
+    $obj['ref'] = $obj['a1Ref']
+    $obj.Remove('a1Ref')
+
+    Save-Manifest -Manifest $obj -Path $Path
 }
 
 function Save-DataTsv {
@@ -1399,7 +1650,11 @@ function Invoke-Normalize {
     $styles = Load-Styles -SourceXlPath $sourceXl
     Write-NormalizeLog -Level INFO -Message "Loaded $($sharedStrings.Count) shared strings, $(if ($styles) { $styles.CellXfs.Count } else { 0 }) cellXfs"
 
-    # Step 2: worksheets (per-sheet folder with split files)
+    # Step 2: worksheets (per-sheet folder with split files). Tables are
+    # processed inside Process-Worksheet (nested under their host sheet folder),
+    # not as a separate step. Returned table-manifest entries get aggregated
+    # into MANIFEST.tables.
+    $allTableEntries = @()
     $worksheetsDir = Join-Path $Destination 'worksheets'
     Ensure-Directory -Path $worksheetsDir
     foreach ($sheet in $wbResult.Sheets) {
@@ -1410,32 +1665,17 @@ function Invoke-Normalize {
             continue
         }
         try {
-            Process-Worksheet -SourceXmlPath $sourcePath -SheetMeta $sheet -DestDir $worksheetsDir -SharedStrings $sharedStrings -Styles $styles
+            $tableEntries = Process-Worksheet -SourceXmlPath $sourcePath -SheetMeta $sheet -DestDir $worksheetsDir -SourceXlPath $sourceXl -SharedStrings $sharedStrings -Styles $styles
+            if ($tableEntries) { $allTableEntries += $tableEntries }
         } catch {
             Write-NormalizeLog -Level ERROR -Message "Failed to process sheet '$($sheet.name)' from $($sheet.sourceFile): $_"
             $script:FailedCount++
         }
     }
 
-    # Step 3: tables -- collect entries to populate manifest.tables
-    $tableEntries = @()
-    $sourceTablesDir = Join-Path $sourceXl 'tables'
-    if (Test-Path -LiteralPath $sourceTablesDir) {
-        $destTablesDir = Join-Path $Destination 'tables'
-        Ensure-Directory -Path $destTablesDir
-        $tableFiles = @(Get-ChildItem -LiteralPath $sourceTablesDir -Filter '*.xml' -File)
-        foreach ($tf in $tableFiles) {
-            try {
-                $entry = Process-Table -SourceXmlPath $tf.FullName -DestDir $destTablesDir
-                if ($entry) { $tableEntries += $entry }
-            } catch {
-                Write-NormalizeLog -Level ERROR -Message "Failed to process table $($tf.Name): $_"
-                $script:FailedCount++
-            }
-        }
-    }
-    # Sort tables by name for stable diffs
-    $sortedTables = @($tableEntries | Sort-Object -Property name)
+    # Step 3: tables are now processed per-worksheet (Phase B). The old
+    # Excel/tables/ folder no longer exists. Aggregate entries into manifest.
+    $sortedTables = @($allTableEntries | Sort-Object -Property @{Expression={$_.sheet}}, @{Expression={$_.name}})
     $wbResult.Manifest['tables'] = $sortedTables
 
     # Step 4: auxiliary files needed to interpret worksheet content.
