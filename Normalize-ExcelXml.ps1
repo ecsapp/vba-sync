@@ -172,6 +172,377 @@ function Load-Xml {
     return [System.Xml.Linq.XDocument]::Load($Path, [System.Xml.Linq.LoadOptions]::PreserveWhitespace)
 }
 
+# ---- Cell reference helpers -----------------------------------------------
+# Parse "B7" -> @{Col=2; Row=7}. Returns $null on malformed input.
+function ConvertFrom-A1Ref {
+    param([string]$Ref)
+    if ([string]::IsNullOrEmpty($Ref)) { return $null }
+    $m = [regex]::Match($Ref, '^\$?([A-Za-z]+)\$?(\d+)$')
+    if (-not $m.Success) { return $null }
+    $colLetters = $m.Groups[1].Value.ToUpperInvariant()
+    $rowNum = [int]$m.Groups[2].Value
+    $colNum = 0
+    foreach ($c in $colLetters.ToCharArray()) {
+        $colNum = $colNum * 26 + ([int]$c - 64)
+    }
+    return @{ Col = $colNum; Row = $rowNum }
+}
+
+# Convert column number (1-based) to letters: 1->A, 26->Z, 27->AA, 702->ZZ.
+function ConvertTo-ColLetters {
+    param([int]$Col)
+    $s = ''
+    while ($Col -gt 0) {
+        $r = ($Col - 1) % 26
+        $s = [char]([int]'A'[0] + $r) + $s
+        $Col = [Math]::Floor(($Col - 1) / 26)
+    }
+    return $s
+}
+
+# Build A1 ref from (col, row) — "5,2" -> "E2"
+function ConvertTo-A1Ref {
+    param([int]$Col, [int]$Row)
+    return (ConvertTo-ColLetters -Col $Col) + [string]$Row
+}
+
+# Parse a range "A1:C5" into start/end (col,row). Returns $null on malformed.
+function ConvertFrom-A1Range {
+    param([string]$Range)
+    if (-not $Range) { return $null }
+    $parts = $Range.Split(':')
+    if ($parts.Count -eq 1) {
+        $a = ConvertFrom-A1Ref -Ref $parts[0]
+        if (-not $a) { return $null }
+        return @{ StartCol = $a.Col; StartRow = $a.Row; EndCol = $a.Col; EndRow = $a.Row }
+    }
+    if ($parts.Count -ne 2) { return $null }
+    $a = ConvertFrom-A1Ref -Ref $parts[0]
+    $b = ConvertFrom-A1Ref -Ref $parts[1]
+    if (-not $a -or -not $b) { return $null }
+    return @{
+        StartCol = [Math]::Min($a.Col, $b.Col)
+        StartRow = [Math]::Min($a.Row, $b.Row)
+        EndCol   = [Math]::Max($a.Col, $b.Col)
+        EndRow   = [Math]::Max($a.Row, $b.Row)
+    }
+}
+
+# ---- SharedStrings + styles loaders ---------------------------------------
+# Both indexed-by-position lookups. Loaded once per workbook.
+
+function Load-SharedStrings {
+    # Returns a string array where index = sharedString id, value = string content.
+    # Returns @() if sharedStrings.xml doesn't exist.
+    param([string]$SourceXlPath)
+    $sstPath = Join-Path $SourceXlPath 'sharedStrings.xml'
+    if (-not (Test-Path -LiteralPath $sstPath)) { return @() }
+    $doc = Load-Xml -Path $sstPath
+    $strings = New-Object System.Collections.Generic.List[string]
+    foreach ($si in $doc.Descendants([System.Xml.Linq.XName]::Get('si', $NS.main))) {
+        # <si> can contain a single <t> OR multiple <r><t>...</t></r> runs (rich text).
+        # We want the concatenated text content either way.
+        $tElements = @($si.Descendants([System.Xml.Linq.XName]::Get('t', $NS.main)))
+        $text = ($tElements | ForEach-Object { $_.Value }) -join ''
+        $strings.Add($text)
+    }
+    return ,$strings.ToArray()
+}
+
+function Load-Styles {
+    # Returns a hashtable with:
+    #   CellXfs       -> array of cellXf records (style index -> resolved attrs)
+    #   Dxfs          -> array of dxf records (dxfId -> resolved attrs)
+    #   NumberFormats -> hashtable numFmtId -> formatCode
+    #   Fonts         -> array of font records
+    #   Fills         -> array of fill records (pattern + colour)
+    #   Borders       -> array of border records
+    # Returns $null if styles.xml missing.
+    param([string]$SourceXlPath)
+    $stylesPath = Join-Path $SourceXlPath 'styles.xml'
+    if (-not (Test-Path -LiteralPath $stylesPath)) { return $null }
+    $doc = Load-Xml -Path $stylesPath
+
+    # numFmts: built-in IDs (0-49) are predefined; custom IDs (>= 164) are in the file
+    $numFmts = @{}
+    $builtIns = @{
+        0='General'; 1='0'; 2='0.00'; 3='#,##0'; 4='#,##0.00';
+        9='0%'; 10='0.00%'; 11='0.00E+00'; 12='# ?/?'; 13='# ??/??';
+        14='m/d/yyyy'; 15='d-mmm-yy'; 16='d-mmm'; 17='mmm-yy'; 18='h:mm AM/PM';
+        19='h:mm:ss AM/PM'; 20='h:mm'; 21='h:mm:ss'; 22='m/d/yyyy h:mm';
+        37='#,##0 ;(#,##0)'; 38='#,##0 ;[Red](#,##0)'; 39='#,##0.00;(#,##0.00)';
+        40='#,##0.00;[Red](#,##0.00)'; 45='mm:ss'; 46='[h]:mm:ss'; 47='mmss.0';
+        48='##0.0E+0'; 49='@'
+    }
+    foreach ($k in $builtIns.Keys) { $numFmts[$k] = $builtIns[$k] }
+    foreach ($nf in $doc.Descendants([System.Xml.Linq.XName]::Get('numFmt', $NS.main))) {
+        $id = [int]$nf.Attribute('numFmtId').Value
+        $numFmts[$id] = $nf.Attribute('formatCode').Value
+    }
+
+    # Fonts, fills, borders — capture as resolved hashtables
+    $fonts = @()
+    $fontsParent = $doc.Descendants([System.Xml.Linq.XName]::Get('fonts', $NS.main)) | Select-Object -First 1
+    if ($fontsParent) {
+        foreach ($f in $fontsParent.Elements([System.Xml.Linq.XName]::Get('font', $NS.main))) {
+            $fonts += ConvertFrom-FontElement -Element $f
+        }
+    }
+
+    $fills = @()
+    $fillsParent = $doc.Descendants([System.Xml.Linq.XName]::Get('fills', $NS.main)) | Select-Object -First 1
+    if ($fillsParent) {
+        foreach ($fi in $fillsParent.Elements([System.Xml.Linq.XName]::Get('fill', $NS.main))) {
+            $fills += ConvertFrom-FillElement -Element $fi
+        }
+    }
+
+    $borders = @()
+    $bordersParent = $doc.Descendants([System.Xml.Linq.XName]::Get('borders', $NS.main)) | Select-Object -First 1
+    if ($bordersParent) {
+        foreach ($bo in $bordersParent.Elements([System.Xml.Linq.XName]::Get('border', $NS.main))) {
+            $borders += ConvertFrom-BorderElement -Element $bo
+        }
+    }
+
+    # cellXfs (the s="N" attribute on <c> indexes into this)
+    $cellXfs = @()
+    $cellXfsParent = $doc.Descendants([System.Xml.Linq.XName]::Get('cellXfs', $NS.main)) | Select-Object -First 1
+    if ($cellXfsParent) {
+        foreach ($xf in $cellXfsParent.Elements([System.Xml.Linq.XName]::Get('xf', $NS.main))) {
+            $cellXfs += @{
+                NumFmtId = if ($xf.Attribute('numFmtId')) { [int]$xf.Attribute('numFmtId').Value } else { 0 }
+                FontId   = if ($xf.Attribute('fontId'))   { [int]$xf.Attribute('fontId').Value }   else { 0 }
+                FillId   = if ($xf.Attribute('fillId'))   { [int]$xf.Attribute('fillId').Value }   else { 0 }
+                BorderId = if ($xf.Attribute('borderId')) { [int]$xf.Attribute('borderId').Value } else { 0 }
+                ApplyNumberFormat = (($xf.Attribute('applyNumberFormat')) -and ($xf.Attribute('applyNumberFormat').Value -eq '1'))
+                ApplyFont   = (($xf.Attribute('applyFont'))   -and ($xf.Attribute('applyFont').Value -eq '1'))
+                ApplyFill   = (($xf.Attribute('applyFill'))   -and ($xf.Attribute('applyFill').Value -eq '1'))
+                ApplyBorder = (($xf.Attribute('applyBorder')) -and ($xf.Attribute('applyBorder').Value -eq '1'))
+            }
+        }
+    }
+
+    # dxfs (table dataDxfId etc reference these — typically partial style overrides)
+    $dxfs = @()
+    $dxfsParent = $doc.Descendants([System.Xml.Linq.XName]::Get('dxfs', $NS.main)) | Select-Object -First 1
+    if ($dxfsParent) {
+        foreach ($dxf in $dxfsParent.Elements([System.Xml.Linq.XName]::Get('dxf', $NS.main))) {
+            $dxfs += ConvertFrom-DxfElement -Element $dxf
+        }
+    }
+
+    return @{
+        CellXfs       = $cellXfs
+        Dxfs          = $dxfs
+        NumberFormats = $numFmts
+        Fonts         = $fonts
+        Fills         = $fills
+        Borders       = $borders
+    }
+}
+
+# ---- Style sub-element parsers --------------------------------------------
+
+function ConvertFrom-FontElement {
+    param([System.Xml.Linq.XElement]$Element)
+    $r = [ordered]@{}
+    $name = $Element.Element([System.Xml.Linq.XName]::Get('name', $NS.main))
+    if ($name) { $r['name'] = $name.Attribute('val').Value }
+    $sz = $Element.Element([System.Xml.Linq.XName]::Get('sz', $NS.main))
+    if ($sz) { $r['size'] = [double]$sz.Attribute('val').Value }
+    if ($Element.Element([System.Xml.Linq.XName]::Get('b', $NS.main)))      { $r['bold']      = $true }
+    if ($Element.Element([System.Xml.Linq.XName]::Get('i', $NS.main)))      { $r['italic']    = $true }
+    if ($Element.Element([System.Xml.Linq.XName]::Get('u', $NS.main)))      { $r['underline'] = $true }
+    if ($Element.Element([System.Xml.Linq.XName]::Get('strike', $NS.main))) { $r['strike']    = $true }
+    $color = $Element.Element([System.Xml.Linq.XName]::Get('color', $NS.main))
+    if ($color) {
+        if ($color.Attribute('rgb'))     { $r['color'] = '#' + $color.Attribute('rgb').Value.ToUpperInvariant().TrimStart('F').PadLeft(6, '0') }
+        elseif ($color.Attribute('theme')) { $r['color'] = "theme:$($color.Attribute('theme').Value)" }
+        elseif ($color.Attribute('indexed')) { $r['color'] = "indexed:$($color.Attribute('indexed').Value)" }
+    }
+    return $r
+}
+
+function ConvertFrom-FillElement {
+    param([System.Xml.Linq.XElement]$Element)
+    $r = [ordered]@{}
+    $pf = $Element.Element([System.Xml.Linq.XName]::Get('patternFill', $NS.main))
+    if ($pf) {
+        $type = if ($pf.Attribute('patternType')) { $pf.Attribute('patternType').Value } else { 'none' }
+        if ($type -ne 'none') {
+            $r['pattern'] = $type
+            $fg = $pf.Element([System.Xml.Linq.XName]::Get('fgColor', $NS.main))
+            if ($fg -and $fg.Attribute('rgb')) {
+                $r['fill'] = '#' + $fg.Attribute('rgb').Value.ToUpperInvariant().TrimStart('F').PadLeft(6, '0')
+            }
+        }
+    }
+    return $r
+}
+
+function ConvertFrom-BorderElement {
+    param([System.Xml.Linq.XElement]$Element)
+    $r = [ordered]@{}
+    foreach ($side in @('left', 'right', 'top', 'bottom')) {
+        $b = $Element.Element([System.Xml.Linq.XName]::Get($side, $NS.main))
+        if ($b -and $b.Attribute('style')) {
+            $r[$side] = [ordered]@{ style = $b.Attribute('style').Value }
+            $col = $b.Element([System.Xml.Linq.XName]::Get('color', $NS.main))
+            if ($col -and $col.Attribute('rgb')) {
+                $r[$side]['color'] = '#' + $col.Attribute('rgb').Value.ToUpperInvariant().TrimStart('F').PadLeft(6, '0')
+            }
+        }
+    }
+    return $r
+}
+
+function ConvertFrom-DxfElement {
+    # A dxf is a partial override — only the bits that differ from the base style.
+    param([System.Xml.Linq.XElement]$Element)
+    $r = [ordered]@{}
+    $font = $Element.Element([System.Xml.Linq.XName]::Get('font', $NS.main))
+    if ($font) { $r['font'] = ConvertFrom-FontElement -Element $font }
+    $fill = $Element.Element([System.Xml.Linq.XName]::Get('fill', $NS.main))
+    if ($fill) {
+        $f = ConvertFrom-FillElement -Element $fill
+        if ($f.Count -gt 0) { foreach ($k in $f.Keys) { $r[$k] = $f[$k] } }
+    }
+    $border = $Element.Element([System.Xml.Linq.XName]::Get('border', $NS.main))
+    if ($border) {
+        $b = ConvertFrom-BorderElement -Element $border
+        if ($b.Count -gt 0) { $r['border'] = $b }
+    }
+    $numFmt = $Element.Element([System.Xml.Linq.XName]::Get('numFmt', $NS.main))
+    if ($numFmt -and $numFmt.Attribute('formatCode')) {
+        $r['numberFormat'] = $numFmt.Attribute('formatCode').Value
+    }
+    return $r
+}
+
+# Resolve a cell's s="N" style index into a flat hashtable of non-default attrs.
+function Resolve-CellStyle {
+    param([hashtable]$Styles, [int]$StyleIndex)
+    if (-not $Styles -or $StyleIndex -lt 0 -or $StyleIndex -ge $Styles.CellXfs.Count) { return @{} }
+    $xf = $Styles.CellXfs[$StyleIndex]
+    $r = [ordered]@{}
+
+    # Number format (skip if General / id 0)
+    if ($xf.NumFmtId -ne 0 -and $Styles.NumberFormats.ContainsKey($xf.NumFmtId)) {
+        $r['numberFormat'] = $Styles.NumberFormats[$xf.NumFmtId]
+    }
+    # Font (skip default font index 0)
+    if ($xf.FontId -gt 0 -and $xf.FontId -lt $Styles.Fonts.Count) {
+        $f = $Styles.Fonts[$xf.FontId]
+        if ($f.Count -gt 0) { $r['font'] = $f }
+    }
+    # Fill (default fill is index 0; index 1 is also default-ish "gray125"; skip both)
+    if ($xf.FillId -gt 1 -and $xf.FillId -lt $Styles.Fills.Count) {
+        $fi = $Styles.Fills[$xf.FillId]
+        if ($fi.Count -gt 0) { foreach ($k in $fi.Keys) { $r[$k] = $fi[$k] } }
+    }
+    # Border (default border is index 0; skip)
+    if ($xf.BorderId -gt 0 -and $xf.BorderId -lt $Styles.Borders.Count) {
+        $bo = $Styles.Borders[$xf.BorderId]
+        if ($bo.Count -gt 0) { $r['border'] = $bo }
+    }
+    return $r
+}
+
+# ---- Range merging --------------------------------------------------------
+# Given a hashtable mapping "col,row" -> value (any type, but compared by canonical
+# JSON serialisation), produce a list of (range, value) where adjacent cells with
+# equal values are merged into greedy rectangles.
+#
+# Algorithm: scan top-to-bottom, left-to-right. For each unvisited cell with
+# a value, expand right while same value, then expand down while every cell in
+# the row stripe matches. Mark visited, emit range. O(n) where n = cell count.
+function Compress-CellsToRanges {
+    param([hashtable]$Cells)
+    if (-not $Cells -or $Cells.Count -eq 0) { return @() }
+
+    # Build a parallel hashtable of canonical JSON strings for value comparison
+    # (so we can compare nested hashtables/arrays as values without walking them
+    # each time).
+    $serialised = @{}
+    foreach ($k in $Cells.Keys) {
+        $v = $Cells[$k]
+        $serialised[$k] = if ($v -is [string]) { $v } else { ConvertTo-Json $v -Depth 10 -Compress }
+    }
+
+    # Determine bounds and bucket cells by (row, col) parsed from "col,row" key
+    $minRow = [int]::MaxValue; $maxRow = 0
+    $minCol = [int]::MaxValue; $maxCol = 0
+    foreach ($k in $Cells.Keys) {
+        $parts = $k.Split(',')
+        $c = [int]$parts[0]; $r = [int]$parts[1]
+        if ($r -lt $minRow) { $minRow = $r }
+        if ($r -gt $maxRow) { $maxRow = $r }
+        if ($c -lt $minCol) { $minCol = $c }
+        if ($c -gt $maxCol) { $maxCol = $c }
+    }
+
+    $visited = @{}
+    $output = New-Object System.Collections.Generic.List[object]
+
+    for ($r = $minRow; $r -le $maxRow; $r++) {
+        for ($c = $minCol; $c -le $maxCol; $c++) {
+            $key = "$c,$r"
+            if ($visited.ContainsKey($key) -or -not $Cells.ContainsKey($key)) { continue }
+            $val = $serialised[$key]
+
+            # Extend right
+            $endCol = $c
+            while ($endCol + 1 -le $maxCol) {
+                $nextKey = "$($endCol + 1),$r"
+                if (-not $Cells.ContainsKey($nextKey) -or $visited.ContainsKey($nextKey) -or $serialised[$nextKey] -ne $val) { break }
+                $endCol++
+            }
+            # Extend down: each candidate row must have all cells $c..$endCol matching
+            $endRow = $r
+            $canExtend = $true
+            while ($endRow + 1 -le $maxRow -and $canExtend) {
+                for ($cc = $c; $cc -le $endCol; $cc++) {
+                    $nextKey = "$cc,$($endRow + 1)"
+                    if (-not $Cells.ContainsKey($nextKey) -or $visited.ContainsKey($nextKey) -or $serialised[$nextKey] -ne $val) {
+                        $canExtend = $false; break
+                    }
+                }
+                if ($canExtend) { $endRow++ }
+            }
+
+            # Mark visited
+            for ($rr = $r; $rr -le $endRow; $rr++) {
+                for ($cc = $c; $cc -le $endCol; $cc++) {
+                    $visited["$cc,$rr"] = $true
+                }
+            }
+
+            $startRef = ConvertTo-A1Ref -Col $c -Row $r
+            $endRef   = ConvertTo-A1Ref -Col $endCol -Row $endRow
+            $rangeStr = if ($startRef -eq $endRef) { $startRef } else { "$startRef`:$endRef" }
+            $output.Add(@{ Range = $rangeStr; Value = $Cells[$key] })
+        }
+    }
+    return $output.ToArray()
+}
+
+# ---- TSV escaping ---------------------------------------------------------
+# Escape a cell value for inclusion in a TSV. Handles \, \t, \n, \r.
+# Empty/null becomes ''.
+function Format-TsvCell {
+    param($Value)
+    if ($null -eq $Value) { return '' }
+    $s = [string]$Value
+    if ($s.Length -eq 0) { return '' }
+    # Escape backslash first, then tab/newline/carriage return
+    $s = $s.Replace('\', '\\')
+    $s = $s.Replace("`t", '\t')
+    $s = $s.Replace("`n", '\n')
+    $s = $s.Replace("`r", '\r')
+    return $s
+}
+
 function Get-IgnorableNamespaces {
     # Resolve the prefixes listed in mc:Ignorable on the root element to their
     # namespace URIs, then drop the ones in our allowlist.
@@ -680,20 +1051,22 @@ function Save-Lambdas {
 }
 
 function Process-Worksheet {
-    param([string]$SourceXmlPath, [PSCustomObject]$SheetMeta, [string]$DestDir)
+    # v1.0: per-sheet folder with split files instead of one normalised XML.
+    # The folder layout mirrors what we agreed in the spec:
+    #   worksheets/<NN> - <Name>/
+    #     data.tsv             - cached cell values, header row of column letters
+    #     formulas.json        - cell formulas (A1 form, range-collapsed)
+    #     styles.json          - resolved per-cell styles, range-merged
+    # Phases B+C add tables/, _meta.json, validations.json, conditional_formats.json,
+    # comments.json, drawings/, charts/, pivot_tables/.
+    param(
+        [string]$SourceXmlPath,
+        [PSCustomObject]$SheetMeta,
+        [string]$DestDir,
+        [string[]]$SharedStrings,
+        [hashtable]$Styles
+    )
 
-    # Strategy for keeping <sheetData> compact: XmlWriter with Indent=true
-    # ignores xml:space="preserve", so we cannot rely on the writer to leave
-    # cell content alone. Instead:
-    #   1. Load the document, locate <sheetData> via the parser (NOT regex on
-    #      raw bytes -- that risks matching literal "<sheetData" inside a cell
-    #      value and corrupting the sheet). Capture its single-line serialised
-    #      form via XElement.ToString(SaveOptions.DisableFormatting).
-    #   2. Replace <sheetData> with a uniquely-named marker element.
-    #   3. Save the doc with XmlWriter (rest pretty-printed).
-    #   4. Post-process: string-replace the marker line with the captured
-    #      sheetData. Because the marker name contains underscores not legal in
-    #      OOXML element names, false positives are impossible.
     $doc = Load-Xml -Path $SourceXmlPath
     Remove-VolatileNamespaces -Doc $doc
     $fileLabel = "worksheets/$($SheetMeta.name)"
@@ -701,39 +1074,241 @@ function Process-Worksheet {
     Strip-ProtectionSecrets -Doc $doc -FileLabel $fileLabel
     Remove-VolatileAttributes -Doc $doc
 
-    $markerName = 'VBASYNC_SHEETDATA_MARKER'
-    $rawSheetData = ''
-    $sheetData = $doc.Descendants([System.Xml.Linq.XName]::Get('sheetData', $NS.main)) | Select-Object -First 1
-    if ($sheetData) {
-        # ToString(DisableFormatting) yields one-line XML without re-adding
-        # whitespace. Combined with PreserveWhitespace at load, original cell
-        # content (including formulas with embedded newlines) is preserved.
-        $rawSheetData = $sheetData.ToString([System.Xml.Linq.SaveOptions]::DisableFormatting)
-        $marker = New-Object System.Xml.Linq.XElement([System.Xml.Linq.XName]::Get($markerName, $NS.main))
-        $sheetData.ReplaceWith($marker)
-    }
-
-    Sort-AttributesAlphabetically -Element $doc.Root
-
     $padding = if ($SheetMeta.PSObject.Properties['padWidth']) { $SheetMeta.padWidth } else { 2 }
     $safeName = Get-SafeFileName -Name $SheetMeta.name
     $padded = ([string]$SheetMeta.sheetId).PadLeft($padding, '0')
-    $destPath = Join-Path $DestDir "$padded - $safeName.xml"
-    Save-PrettyXml -Doc $doc -Path $destPath
+    $sheetFolder = Join-Path $DestDir "$padded - $safeName"
+    Ensure-Directory -Path $sheetFolder
 
-    # Splice the raw sheetData back in over the marker. The marker name contains
-    # underscores which are not legal in OOXML element names, so this regex
-    # cannot match anywhere except where we placed the marker.
-    if ($rawSheetData) {
-        $written = [System.IO.File]::ReadAllText($destPath, [System.Text.UTF8Encoding]::new($false))
-        $markerPattern = '(?m)^(\s*)<' + [regex]::Escape($markerName) + '(?:\s[^>]*)?\s*/>\s*$'
-        $written = [regex]::Replace($written, $markerPattern, {
-            param($m)
-            $indent = $m.Groups[1].Value
-            return $indent + $rawSheetData
-        })
-        Write-Utf8NoBom -Path $destPath -Text $written -LineEnding "`r`n"
+    # Walk <sheetData> once and collect three parallel views: values, formulas, styles
+    $sheetData = $doc.Descendants([System.Xml.Linq.XName]::Get('sheetData', $NS.main)) | Select-Object -First 1
+    $cellValues   = @{}   # "col,row" -> resolved value (string or number)
+    $cellFormulas = @{}   # "col,row" -> A1 formula string
+    $cellStyles   = @{}   # "col,row" -> resolved style hashtable
+    $sharedFormulasMaster = @{}   # si -> @{ Formula = '...'; Ref = 'A1:A100' }
+
+    if ($sheetData) {
+        foreach ($row in $sheetData.Elements([System.Xml.Linq.XName]::Get('row', $NS.main))) {
+            foreach ($cell in $row.Elements([System.Xml.Linq.XName]::Get('c', $NS.main))) {
+                $refAttr = $cell.Attribute('r')
+                if (-not $refAttr) { continue }
+                $coord = ConvertFrom-A1Ref -Ref $refAttr.Value
+                if (-not $coord) { continue }
+                $key = "$($coord.Col),$($coord.Row)"
+
+                # Cell type: t="s" (sharedString), t="b" (boolean), t="str" (inline string from formula),
+                #   t="inlineStr" (inline string), t="e" (error), default = number
+                $type = if ($cell.Attribute('t')) { $cell.Attribute('t').Value } else { 'n' }
+
+                # Value
+                $vEl = $cell.Element([System.Xml.Linq.XName]::Get('v', $NS.main))
+                $isEl = $cell.Element([System.Xml.Linq.XName]::Get('is', $NS.main))
+                $rawValue = $null
+                if ($vEl) { $rawValue = $vEl.Value }
+                elseif ($isEl) {
+                    # inline string: concat all <t> contents
+                    $tList = @($isEl.Descendants([System.Xml.Linq.XName]::Get('t', $NS.main)))
+                    $rawValue = ($tList | ForEach-Object { $_.Value }) -join ''
+                }
+
+                if ($null -ne $rawValue -and $rawValue -ne '') {
+                    if ($type -eq 's') {
+                        $idx = [int]$rawValue
+                        if ($idx -ge 0 -and $idx -lt $SharedStrings.Count) {
+                            $cellValues[$key] = $SharedStrings[$idx]
+                        } else {
+                            $cellValues[$key] = "[!sst-$idx]"
+                        }
+                    } elseif ($type -eq 'b') {
+                        $cellValues[$key] = if ($rawValue -eq '1') { 'TRUE' } else { 'FALSE' }
+                    } elseif ($type -eq 'e') {
+                        $cellValues[$key] = $rawValue   # e.g. "#N/A", "#REF!"
+                    } else {
+                        # number, str, inlineStr -- emit as-is
+                        $cellValues[$key] = $rawValue
+                    }
+                }
+
+                # Formula
+                $fEl = $cell.Element([System.Xml.Linq.XName]::Get('f', $NS.main))
+                if ($fEl) {
+                    $fType = if ($fEl.Attribute('t')) { $fEl.Attribute('t').Value } else { 'normal' }
+                    $si    = if ($fEl.Attribute('si')) { [int]$fEl.Attribute('si').Value } else { -1 }
+                    $body  = $fEl.Value
+
+                    if ($fType -eq 'shared') {
+                        if ($body) {
+                            # Master formula for this si group
+                            $ref = if ($fEl.Attribute('ref')) { $fEl.Attribute('ref').Value } else { $refAttr.Value }
+                            $sharedFormulasMaster[$si] = @{ Formula = $body; Ref = $ref }
+                            $cellFormulas[$key] = "=$body"
+                        } else {
+                            # Reference to a master we'll resolve in pass 2
+                            $cellFormulas[$key] = "[!shared-$si]"
+                        }
+                    } elseif ($body) {
+                        $cellFormulas[$key] = "=$body"
+                    }
+                }
+
+                # Style
+                $sAttr = $cell.Attribute('s')
+                if ($sAttr -and $Styles) {
+                    $resolved = Resolve-CellStyle -Styles $Styles -StyleIndex ([int]$sAttr.Value)
+                    if ($resolved.Count -gt 0) {
+                        $cellStyles[$key] = $resolved
+                    }
+                }
+            }
+        }
+
+        # Pass 2: resolve shared-formula references. Excel only stores the body
+        # on one cell of each shared-formula group; siblings just reference si=N.
+        # We could R1C1-translate the master to each sibling's position, but
+        # that's risky without a real formula parser. Instead emit "=[shared:N]"
+        # markers so the diff stays readable, and add a "sharedFormulas" section
+        # to formulas.json that gives the masters their own entries.
+        $needsShared = @($cellFormulas.GetEnumerator() | Where-Object { $_.Value -like '`[!shared-*' })
+        foreach ($e in $needsShared) {
+            $si = [int]($e.Value -replace '\[!shared-', '' -replace '\]', '')
+            if ($sharedFormulasMaster.ContainsKey($si)) {
+                $cellFormulas[$e.Key] = "[shared:$si]"
+            } else {
+                # Master not seen -- shouldn't happen but fall back to empty
+                $cellFormulas.Remove($e.Key)
+            }
+        }
     }
+
+    # Write data.tsv
+    Save-DataTsv -Cells $cellValues -Path (Join-Path $sheetFolder 'data.tsv')
+
+    # Write formulas.json
+    Save-FormulasJson -Cells $cellFormulas -SharedMasters $sharedFormulasMaster -Path (Join-Path $sheetFolder 'formulas.json')
+
+    # Write styles.json
+    Save-StylesJson -Cells $cellStyles -Path (Join-Path $sheetFolder 'styles.json')
+}
+
+function Save-DataTsv {
+    param([hashtable]$Cells, [string]$Path)
+    if ($Cells.Count -eq 0) {
+        # Write empty header so the file's existence still signals "this sheet processed"
+        Write-Utf8NoBom -Path $Path -Text "Row`r`n" -LineEnding "`r`n"
+        return
+    }
+
+    # Determine extents
+    $maxCol = 0; $maxRow = 0; $minRow = [int]::MaxValue
+    foreach ($k in $Cells.Keys) {
+        $parts = $k.Split(',')
+        $c = [int]$parts[0]; $r = [int]$parts[1]
+        if ($c -gt $maxCol) { $maxCol = $c }
+        if ($r -gt $maxRow) { $maxRow = $r }
+        if ($r -lt $minRow) { $minRow = $r }
+    }
+
+    # Group cells by row for fast lookup
+    $byRow = @{}
+    foreach ($k in $Cells.Keys) {
+        $parts = $k.Split(',')
+        $c = [int]$parts[0]; $r = [int]$parts[1]
+        if (-not $byRow.ContainsKey($r)) { $byRow[$r] = @{} }
+        $byRow[$r][$c] = $Cells[$k]
+    }
+
+    $sb = New-Object System.Text.StringBuilder
+    # Header: Row | A | B | C | ...
+    [void]$sb.Append('Row')
+    for ($c = 1; $c -le $maxCol; $c++) {
+        [void]$sb.Append("`t")
+        [void]$sb.Append((ConvertTo-ColLetters -Col $c))
+    }
+    [void]$sb.Append("`r`n")
+
+    # Body: only emit rows that have at least one populated cell
+    $sortedRows = @($byRow.Keys | Sort-Object)
+    foreach ($r in $sortedRows) {
+        [void]$sb.Append([string]$r)
+        $rowCells = $byRow[$r]
+        for ($c = 1; $c -le $maxCol; $c++) {
+            [void]$sb.Append("`t")
+            if ($rowCells.ContainsKey($c)) {
+                [void]$sb.Append((Format-TsvCell -Value $rowCells[$c]))
+            }
+        }
+        [void]$sb.Append("`r`n")
+    }
+
+    Write-Utf8NoBom -Path $Path -Text $sb.ToString() -LineEnding "`r`n"
+}
+
+function Save-FormulasJson {
+    param([hashtable]$Cells, [hashtable]$SharedMasters, [string]$Path)
+    if ($Cells.Count -eq 0 -and (-not $SharedMasters -or $SharedMasters.Count -eq 0)) {
+        # Don't write empty formulas.json -- absence means "no formulas"
+        return
+    }
+
+    # Convert hashtable keyed by "col,row" to one keyed by A1 ref
+    $byRef = @{}
+    foreach ($k in $Cells.Keys) {
+        $parts = $k.Split(',')
+        $byRef[(ConvertTo-A1Ref -Col ([int]$parts[0]) -Row ([int]$parts[1]))] = $Cells[$k]
+    }
+
+    # Range-merge: greedy rectangles where adjacent cells share an identical formula
+    $merged = Compress-CellsToRanges -Cells $Cells
+
+    $ranges = [ordered]@{}
+    $cellsOnly = [ordered]@{}
+    $sortedMerged = @($merged | Sort-Object -Property @{ Expression = {
+        $r = ConvertFrom-A1Range -Range ($_.Range -split ':' | Select-Object -First 1)
+        if (-not $r) { return 0 }
+        return $r.StartRow * 100000 + $r.StartCol
+    } })
+    foreach ($entry in $sortedMerged) {
+        if ($entry.Range -match ':') {
+            $ranges[$entry.Range] = $entry.Value
+        } else {
+            $cellsOnly[$entry.Range] = $entry.Value
+        }
+    }
+
+    $obj = [ordered]@{}
+    if ($ranges.Count -gt 0) { $obj['ranges'] = $ranges }
+    if ($cellsOnly.Count -gt 0) { $obj['cells'] = $cellsOnly }
+    if ($SharedMasters -and $SharedMasters.Count -gt 0) {
+        $sm = [ordered]@{}
+        foreach ($si in ($SharedMasters.Keys | Sort-Object)) {
+            $sm["shared$si"] = [ordered]@{
+                ref     = $SharedMasters[$si].Ref
+                formula = "=$($SharedMasters[$si].Formula)"
+            }
+        }
+        $obj['sharedFormulas'] = $sm
+    }
+
+    Save-Manifest -Manifest $obj -Path $Path
+}
+
+function Save-StylesJson {
+    param([hashtable]$Cells, [string]$Path)
+    if ($Cells.Count -eq 0) { return }   # Don't write empty styles.json
+
+    $merged = Compress-CellsToRanges -Cells $Cells
+    $sortedMerged = @($merged | Sort-Object -Property @{ Expression = {
+        $r = ConvertFrom-A1Range -Range ($_.Range -split ':' | Select-Object -First 1)
+        if (-not $r) { return 0 }
+        return $r.StartRow * 100000 + $r.StartCol
+    } })
+
+    $obj = [ordered]@{}
+    foreach ($entry in $sortedMerged) {
+        $obj[$entry.Range] = $entry.Value
+    }
+
+    Save-Manifest -Manifest $obj -Path $Path
 }
 
 function Process-Table {
@@ -818,7 +1393,13 @@ function Invoke-Normalize {
         return  # Without sheet metadata we can't process worksheets meaningfully
     }
 
-    # Step 2: worksheets (per-sheet, with name lookup)
+    # Step 1b: load sharedStrings + styles ONCE (per-worksheet processing
+    # references both)
+    $sharedStrings = Load-SharedStrings -SourceXlPath $sourceXl
+    $styles = Load-Styles -SourceXlPath $sourceXl
+    Write-NormalizeLog -Level INFO -Message "Loaded $($sharedStrings.Count) shared strings, $(if ($styles) { $styles.CellXfs.Count } else { 0 }) cellXfs"
+
+    # Step 2: worksheets (per-sheet folder with split files)
     $worksheetsDir = Join-Path $Destination 'worksheets'
     Ensure-Directory -Path $worksheetsDir
     foreach ($sheet in $wbResult.Sheets) {
@@ -829,7 +1410,7 @@ function Invoke-Normalize {
             continue
         }
         try {
-            Process-Worksheet -SourceXmlPath $sourcePath -SheetMeta $sheet -DestDir $worksheetsDir
+            Process-Worksheet -SourceXmlPath $sourcePath -SheetMeta $sheet -DestDir $worksheetsDir -SharedStrings $sharedStrings -Styles $styles
         } catch {
             Write-NormalizeLog -Level ERROR -Message "Failed to process sheet '$($sheet.name)' from $($sheet.sourceFile): $_"
             $script:FailedCount++
