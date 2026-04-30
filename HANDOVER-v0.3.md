@@ -127,6 +127,22 @@ When you start work, post your responses to these to the user before implementin
 
 ---
 
+## Known v0.2 gaps to address in v0.3
+
+These are accepted-and-shipped in v0.2 but worth fixing as part of the v0.3 work:
+
+- **`tabColor` only handles `rgb=` attribute.** Indexed colours (`indexed=`) and theme colours (`theme=`) silently become `null` in MANIFEST. Need to resolve theme colours via `xl/theme/theme1.xml` and indexed colours via the legacy palette in `styles.xml`. Lookup tables for both are well-documented in ECMA-376 Part 1.
+
+- **`Get-SafeFileName` truncates at 100 chars.** Two sheet names sharing a 100-character prefix would produce identical filenames. Vanishingly unlikely in practice (Excel allows up to 31 chars in a sheet name), but worth a defensive uniqueness check + suffix if collision detected.
+
+- **`tabColor` capture in `Annotate-SheetMetadata`** strips the alpha channel (`Substring(2)`). Excel's RGB for tabColor is in `AARRGGBB` form; we drop the alpha, which is fine since tabs don't support transparency, but make this explicit when reworking colour handling.
+
+- **No round-trip for byte-copied `sharedStrings.xml`.** When v0.4 adds round-trip import, sst regeneration is needed (Excel will not re-key cell `<v>` indices after edits to sst entries). Punt to v0.4; v0.3 can still byte-copy.
+
+- **Stale `<workbookProtection>`/`<sheetProtection>` element bodies remain after hash strip.** We strip the secret attributes (`hashValue`, `saltValue`, etc.) but leave the element with its non-secret attributes (`lockStructure`, `selectLockedCells`, etc.). On import, Excel will treat these as "protected with no password" — possibly surprising for users who wanted to restore the password. Consider adding a clear comment in MANIFEST or STRUCTURE_SUMMARY explaining that re-importing strips passwords entirely.
+
+---
+
 ## Existing code you'll touch
 
 Files in `c:/Users/ArnaudLavignolle/AppData/Roaming/Microsoft/AddIns/`:

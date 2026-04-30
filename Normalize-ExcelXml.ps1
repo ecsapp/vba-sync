@@ -419,7 +419,6 @@ function Extract-Lambdas {
     param([System.Xml.Linq.XDocument]$Doc)
 
     $lambdas = [ordered]@{}      # name -> body  (canonical order: alphabetical name)
-    $bodyToName = @{}            # bodyHash -> name (for cross-name dedup, optional)
 
     $definedNames = @($Doc.Descendants([System.Xml.Linq.XName]::Get('definedName', $NS.main)))
     foreach ($dn in $definedNames) {
@@ -541,13 +540,16 @@ function Process-Workbook {
     # Workbook properties
     $wbProps = Get-WorkbookProperties -Doc $doc
 
-    # Build the manifest
+    # Build the manifest. The tables array stays empty here -- it gets populated
+    # later by Process-Table calls in Invoke-Normalize, before Save-Manifest.
     $manifest = [ordered]@{
-        schemaVersion = 1
-        workbook      = $wbProps
-        sheets        = @()
-        definedNames  = $definedNames
-        lambdas       = @($lambdas.Keys | Sort-Object)
+        schemaVersion    = 1
+        generatorVersion = '0.2'
+        workbook         = $wbProps
+        sheets           = @()
+        tables           = @()
+        definedNames     = $definedNames
+        lambdas          = @($lambdas.Keys | Sort-Object)
     }
 
     # Compute padding width: at least 2, more if any sheetId exceeds 99 (e.g.
@@ -582,6 +584,9 @@ function Save-Manifest {
     # Use ConvertTo-Json then post-process to standard 2-space, single-space.
     $raw = $Manifest | ConvertTo-Json -Depth 20 -Compress:$false
     $pretty = Format-Json -Json $raw
+    # Collapse empty containers: {\n  \n} -> {} and [\n  \n] -> []
+    $pretty = [regex]::Replace($pretty, '\{\s*\n\s*\}', '{}')
+    $pretty = [regex]::Replace($pretty, '\[\s*\n\s*\]', '[]')
     Write-Utf8NoBom -Path $Path -Text $pretty -LineEnding "`n"
 }
 
@@ -680,27 +685,15 @@ function Process-Worksheet {
     # Strategy for keeping <sheetData> compact: XmlWriter with Indent=true
     # ignores xml:space="preserve", so we cannot rely on the writer to leave
     # cell content alone. Instead:
-    #   1. Read the source file as text and capture the raw <sheetData>...
-    #      </sheetData> substring -- this is exactly what we want to preserve,
-    #      byte-for-byte. The sharedString indices and formulas inside aren't
-    #      diff-meaningful when indented anyway.
-    #   2. Load+normalise the document with sheetData replaced by a marker
-    #      element so the rest gets pretty-printed correctly.
-    #   3. After save, string-replace the marker line with the raw sheetData.
-    $rawText = [System.IO.File]::ReadAllText($SourceXmlPath, [System.Text.UTF8Encoding]::new($false))
-    $rawSheetData = ''
-    $startMatch = [regex]::Match($rawText, '<sheetData(?:\s[^>]*)?(?:\s*/>|\s*>)')
-    if ($startMatch.Success) {
-        if ($startMatch.Value.EndsWith('/>')) {
-            $rawSheetData = $startMatch.Value
-        } else {
-            $endIdx = $rawText.IndexOf('</sheetData>', $startMatch.Index + $startMatch.Length)
-            if ($endIdx -ge 0) {
-                $rawSheetData = $rawText.Substring($startMatch.Index, $endIdx + '</sheetData>'.Length - $startMatch.Index)
-            }
-        }
-    }
-
+    #   1. Load the document, locate <sheetData> via the parser (NOT regex on
+    #      raw bytes -- that risks matching literal "<sheetData" inside a cell
+    #      value and corrupting the sheet). Capture its single-line serialised
+    #      form via XElement.ToString(SaveOptions.DisableFormatting).
+    #   2. Replace <sheetData> with a uniquely-named marker element.
+    #   3. Save the doc with XmlWriter (rest pretty-printed).
+    #   4. Post-process: string-replace the marker line with the captured
+    #      sheetData. Because the marker name contains underscores not legal in
+    #      OOXML element names, false positives are impossible.
     $doc = Load-Xml -Path $SourceXmlPath
     Remove-VolatileNamespaces -Doc $doc
     $fileLabel = "worksheets/$($SheetMeta.name)"
@@ -708,11 +701,14 @@ function Process-Worksheet {
     Strip-ProtectionSecrets -Doc $doc -FileLabel $fileLabel
     Remove-VolatileAttributes -Doc $doc
 
-    # Replace <sheetData> with a uniquely-identifiable marker element. We will
-    # find this line in the saved file and swap it for $rawSheetData.
     $markerName = 'VBASYNC_SHEETDATA_MARKER'
+    $rawSheetData = ''
     $sheetData = $doc.Descendants([System.Xml.Linq.XName]::Get('sheetData', $NS.main)) | Select-Object -First 1
     if ($sheetData) {
+        # ToString(DisableFormatting) yields one-line XML without re-adding
+        # whitespace. Combined with PreserveWhitespace at load, original cell
+        # content (including formulas with embedded newlines) is preserved.
+        $rawSheetData = $sheetData.ToString([System.Xml.Linq.SaveOptions]::DisableFormatting)
         $marker = New-Object System.Xml.Linq.XElement([System.Xml.Linq.XName]::Get($markerName, $NS.main))
         $sheetData.ReplaceWith($marker)
     }
@@ -725,13 +721,12 @@ function Process-Worksheet {
     $destPath = Join-Path $DestDir "$padded - $safeName.xml"
     Save-PrettyXml -Doc $doc -Path $destPath
 
-    # Splice the raw sheetData back in over the marker. The marker serialises
-    # as <VBASYNC_SHEETDATA_MARKER xmlns="..." /> on its own line with leading
-    # indentation; we replace that whole line with the raw sheetData (also
-    # indented to match).
+    # Splice the raw sheetData back in over the marker. The marker name contains
+    # underscores which are not legal in OOXML element names, so this regex
+    # cannot match anywhere except where we placed the marker.
     if ($rawSheetData) {
         $written = [System.IO.File]::ReadAllText($destPath, [System.Text.UTF8Encoding]::new($false))
-        $markerPattern = '(?m)^(\s*)<' + $markerName + '(?:\s[^>]*)?\s*/>\s*$'
+        $markerPattern = '(?m)^(\s*)<' + [regex]::Escape($markerName) + '(?:\s[^>]*)?\s*/>\s*$'
         $written = [regex]::Replace($written, $markerPattern, {
             param($m)
             $indent = $m.Groups[1].Value
@@ -742,6 +737,7 @@ function Process-Worksheet {
 }
 
 function Process-Table {
+    # Returns a hashtable with the table's manifest entry (name, ref, file).
     param([string]$SourceXmlPath, [string]$DestDir)
 
     $doc = Load-Xml -Path $SourceXmlPath
@@ -749,11 +745,20 @@ function Process-Table {
     Remove-VolatileAttributes -Doc $doc
 
     $tableName = $doc.Root.Attribute('name').Value
+    $displayName = if ($doc.Root.Attribute('displayName')) { $doc.Root.Attribute('displayName').Value } else { $tableName }
+    $ref = if ($doc.Root.Attribute('ref')) { $doc.Root.Attribute('ref').Value } else { $null }
     $safeName = Get-SafeFileName -Name $tableName
     $destPath = Join-Path $DestDir "$safeName.xml"
 
     Sort-AttributesAlphabetically -Element $doc.Root
     Save-PrettyXml -Doc $doc -Path $destPath
+
+    return [ordered]@{
+        name        = $tableName
+        displayName = $displayName
+        ref         = $ref
+        file        = "tables/$safeName.xml"
+    }
 }
 
 # Passthrough normalisation for the OOXML files that aren't workbook/sheet/table:
@@ -801,13 +806,12 @@ function Invoke-Normalize {
 
     Write-NormalizeLog -Level INFO -Message "Normalizing from $Source to $Destination"
 
-    # Step 1: workbook + manifest + lambdas
+    # Step 1: workbook + lambdas (manifest written at the end so tables array
+    # can be populated by Step 3)
     $wbResult = $null
     try {
         $wbResult = Process-Workbook -SourceXlPath $sourceXl -DestPath $Destination
-        Save-Manifest -Manifest $wbResult.Manifest -Path (Join-Path $Destination 'MANIFEST.json')
         Save-Lambdas -Lambdas $wbResult.Lambdas -LambdasDir (Join-Path $Destination 'lambdas')
-        Write-NormalizeLog -Level INFO -Message "Wrote MANIFEST.json with $($wbResult.Sheets.Count) sheets, $($wbResult.Lambdas.Count) lambdas"
     } catch {
         Write-NormalizeLog -Level ERROR -Message "Failed to process workbook.xml: $_"
         $script:FailedCount++
@@ -832,7 +836,8 @@ function Invoke-Normalize {
         }
     }
 
-    # Step 3: tables
+    # Step 3: tables -- collect entries to populate manifest.tables
+    $tableEntries = @()
     $sourceTablesDir = Join-Path $sourceXl 'tables'
     if (Test-Path -LiteralPath $sourceTablesDir) {
         $destTablesDir = Join-Path $Destination 'tables'
@@ -840,13 +845,17 @@ function Invoke-Normalize {
         $tableFiles = @(Get-ChildItem -LiteralPath $sourceTablesDir -Filter '*.xml' -File)
         foreach ($tf in $tableFiles) {
             try {
-                Process-Table -SourceXmlPath $tf.FullName -DestDir $destTablesDir
+                $entry = Process-Table -SourceXmlPath $tf.FullName -DestDir $destTablesDir
+                if ($entry) { $tableEntries += $entry }
             } catch {
                 Write-NormalizeLog -Level ERROR -Message "Failed to process table $($tf.Name): $_"
                 $script:FailedCount++
             }
         }
     }
+    # Sort tables by name for stable diffs
+    $sortedTables = @($tableEntries | Sort-Object -Property name)
+    $wbResult.Manifest['tables'] = $sortedTables
 
     # Step 4: auxiliary files needed to interpret worksheet content.
     # styles.xml is pretty-printed (small, useful to read for dxfId resolution).
@@ -866,11 +875,27 @@ function Invoke-Normalize {
     $sstSrc = Join-Path $sourceXl 'sharedStrings.xml'
     if (Test-Path -LiteralPath $sstSrc) {
         try {
-            Copy-Item -LiteralPath $sstSrc -Destination (Join-Path $Destination 'sharedStrings.xml') -Force
+            # Byte-copy with one cosmetic normalisation: lowercase the encoding
+            # name in the XML declaration so it matches the rest of our output
+            # (XmlWriter writes encoding="utf-8"; Excel writes encoding="UTF-8").
+            $sstDest = Join-Path $Destination 'sharedStrings.xml'
+            $bytes = [System.IO.File]::ReadAllBytes($sstSrc)
+            $text = [System.Text.UTF8Encoding]::new($false).GetString($bytes)
+            $text = [regex]::Replace($text, '^(<\?xml[^?]*?encoding=")UTF-8(")', '${1}utf-8${2}', 'IgnoreCase')
+            [System.IO.File]::WriteAllText($sstDest, $text, [System.Text.UTF8Encoding]::new($false))
         } catch {
             Write-NormalizeLog -Level ERROR -Message "Failed to copy sharedStrings.xml: $_"
             $script:FailedCount++
         }
+    }
+
+    # Step 5: write the manifest (now that tables array is populated)
+    try {
+        Save-Manifest -Manifest $wbResult.Manifest -Path (Join-Path $Destination 'MANIFEST.json')
+        Write-NormalizeLog -Level INFO -Message "Wrote MANIFEST.json with $($wbResult.Sheets.Count) sheets, $($sortedTables.Count) tables, $($wbResult.Lambdas.Count) lambdas"
+    } catch {
+        Write-NormalizeLog -Level ERROR -Message "Failed to write MANIFEST.json: $_"
+        $script:FailedCount++
     }
 
     # Final log line summarising redactions for VBA to surface
