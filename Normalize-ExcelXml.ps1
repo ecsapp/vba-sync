@@ -61,6 +61,8 @@ $NS = @{
     r         = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
     rel       = 'http://schemas.openxmlformats.org/package/2006/relationships'
     mc        = 'http://schemas.openxmlformats.org/markup-compatibility/2006'
+    xdr       = 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing'
+    a         = 'http://schemas.openxmlformats.org/drawingml/2006/main'
 }
 
 # OOXML extension namespaces that are *always* safe to keep when not in mc:Ignorable.
@@ -1283,6 +1285,23 @@ function Process-Worksheet {
     Save-ConditionalFormatsJson -Doc $doc -Path (Join-Path $sheetFolder 'conditional_formats.json')
     Save-CommentsJson -SourceXlPath $SourceXlPath -SheetMeta $SheetMeta -Path (Join-Path $sheetFolder 'comments.json')
 
+    # Phase D1: drawings (shapes + pictures + macro references). Returns the
+    # drawing's image rels so Phase D1b can copy assets into _assets/.
+    $drawingsDir = Join-Path $sheetFolder 'drawings'
+    $drawingResult = Save-DrawingsJson -SourceXlPath $SourceXlPath -SheetMeta $SheetMeta -DestDir $drawingsDir
+    # Phase D1b: copy referenced image assets
+    if ($drawingResult.ImageRels.Count -gt 0 -and (Test-Path -LiteralPath (Join-Path $drawingsDir 'shapes.json'))) {
+        $assetsDir = Join-Path $drawingsDir '_assets'
+        Ensure-Directory -Path $assetsDir
+        foreach ($rel in $drawingResult.ImageRels.Values) {
+            $src = Join-Path $SourceXlPath ($rel.Target -replace '/', '\')
+            if (Test-Path -LiteralPath $src) {
+                $assetName = [System.IO.Path]::GetFileName($src)
+                Copy-Item -LiteralPath $src -Destination (Join-Path $assetsDir $assetName) -Force
+            }
+        }
+    }
+
     # Phase B: extract table cells from $cellValues and $cellFormulas, then
     # write per-table data.tsv + definition.json. Cells inside table ranges
     # are removed from the sheet's $cellValues so they don't appear twice.
@@ -1755,6 +1774,163 @@ function Save-CommentsJson {
     } })
     $obj = [ordered]@{ comments = $sorted }
     Save-Manifest -Manifest $obj -Path $Path
+}
+
+# ---- Phase D1: drawings (shapes, pictures, with OnAction macros) ----------
+
+function Save-DrawingsJson {
+    # Parse xl/drawings/drawingN.xml referenced by this worksheet, extract:
+    #   - shapes (rectangles, buttons, text boxes) with their assigned macro
+    #   - pictures (with image asset references)
+    #   - groups (preserve hierarchy)
+    # The macro reference is the killer feature for AI agents understanding
+    # the UI: a button labelled "Refresh" assigned to macro "DoRefresh" tells
+    # you what the workbook does without running it.
+    param(
+        [string]$SourceXlPath,
+        [PSCustomObject]$SheetMeta,
+        [string]$DestDir   # the sheet's drawings/ folder; created if needed and shapes exist
+    )
+
+    if (-not $SourceXlPath) { return @{ ImageRels = @{} } }
+    $rels = Read-WorksheetRels -SourceXlPath $SourceXlPath -WorksheetSourceFile $SheetMeta.sourceFile
+    $drawingRel = $rels.Values | Where-Object { $_.Type -eq 'drawing' } | Select-Object -First 1
+    if (-not $drawingRel) { return @{ ImageRels = @{} } }
+
+    $drawingPath = Join-Path $SourceXlPath ($drawingRel.Target -replace '/', '\')
+    if (-not (Test-Path -LiteralPath $drawingPath)) { return @{ ImageRels = @{} } }
+
+    # Drawing's own _rels (image references)
+    $drawingFileName = [System.IO.Path]::GetFileName($drawingPath)
+    $drawingRelsPath = Join-Path (Join-Path (Split-Path $drawingPath -Parent) '_rels') "$drawingFileName.rels"
+    $imageRels = @{}   # rId -> @{Type; Target (xl-relative)}
+    if (Test-Path -LiteralPath $drawingRelsPath) {
+        $drDoc = Load-Xml -Path $drawingRelsPath
+        foreach ($rel in $drDoc.Descendants([System.Xml.Linq.XName]::Get('Relationship', $NS.rel))) {
+            $rid = $rel.Attribute('Id').Value
+            $tgt = $rel.Attribute('Target').Value
+            if ($tgt.StartsWith('../')) { $tgt = $tgt.Substring(3) }
+            $imageRels[$rid] = @{ Target = $tgt }
+        }
+    }
+
+    $doc = Load-Xml -Path $drawingPath
+    Remove-VolatileNamespaces -Doc $doc
+
+    $shapes = New-Object System.Collections.Generic.List[object]
+    foreach ($anchor in $doc.Root.Elements()) {
+        $localName = $anchor.Name.LocalName
+        if ($localName -ne 'twoCellAnchor' -and $localName -ne 'oneCellAnchor' -and $localName -ne 'absoluteAnchor') {
+            continue
+        }
+        $entry = ConvertFrom-DrawingAnchor -Anchor $anchor -ImageRels $imageRels
+        if ($entry) { $shapes.Add($entry) }
+    }
+
+    if ($shapes.Count -eq 0) { return @{ ImageRels = $imageRels } }
+
+    Ensure-Directory -Path $DestDir
+    $obj = [ordered]@{ shapes = $shapes.ToArray() }
+    Save-Manifest -Manifest $obj -Path (Join-Path $DestDir 'shapes.json')
+    return @{ ImageRels = $imageRels }
+}
+
+function ConvertFrom-DrawingAnchor {
+    param([System.Xml.Linq.XElement]$Anchor, [hashtable]$ImageRels)
+
+    $entry = [ordered]@{}
+
+    # Anchor: from / to (col,row)-pairs OR positional (absoluteAnchor)
+    $fromEl = $Anchor.Element([System.Xml.Linq.XName]::Get('from', $NS.xdr))
+    $toEl   = $Anchor.Element([System.Xml.Linq.XName]::Get('to', $NS.xdr))
+    if ($fromEl -and $toEl) {
+        $fromCol = [int]($fromEl.Element([System.Xml.Linq.XName]::Get('col', $NS.xdr)).Value)
+        $fromRow = [int]($fromEl.Element([System.Xml.Linq.XName]::Get('row', $NS.xdr)).Value)
+        $toCol   = [int]($toEl.Element([System.Xml.Linq.XName]::Get('col', $NS.xdr)).Value)
+        $toRow   = [int]($toEl.Element([System.Xml.Linq.XName]::Get('row', $NS.xdr)).Value)
+        $entry['anchor'] = [ordered]@{
+            from = (ConvertTo-A1Ref -Col ($fromCol + 1) -Row ($fromRow + 1))
+            to   = (ConvertTo-A1Ref -Col ($toCol + 1)   -Row ($toRow + 1))
+        }
+    }
+
+    # Identify what's inside the anchor: sp (shape), pic (picture), grpSp (group), cxnSp (connector)
+    $sp     = $Anchor.Element([System.Xml.Linq.XName]::Get('sp', $NS.xdr))
+    $pic    = $Anchor.Element([System.Xml.Linq.XName]::Get('pic', $NS.xdr))
+    $grp    = $Anchor.Element([System.Xml.Linq.XName]::Get('grpSp', $NS.xdr))
+    $cxnSp  = $Anchor.Element([System.Xml.Linq.XName]::Get('cxnSp', $NS.xdr))
+
+    if ($sp) {
+        $entry['type'] = 'shape'
+        $cNvPr = $sp.Descendants([System.Xml.Linq.XName]::Get('cNvPr', $NS.xdr)) | Select-Object -First 1
+        if ($cNvPr -and $cNvPr.Attribute('name')) { $entry['name'] = $cNvPr.Attribute('name').Value }
+        # macro attribute: "[0]!MacroName" or just "MacroName"
+        $macroAttr = $sp.Attribute('macro')
+        if ($macroAttr -and $macroAttr.Value) {
+            $entry['macro'] = ($macroAttr.Value -replace '^\[\d+\]!', '')
+        }
+        # Preset geometry (rectangle, roundRect, ellipse, etc.)
+        $prstGeom = $sp.Descendants([System.Xml.Linq.XName]::Get('prstGeom', $NS.a)) | Select-Object -First 1
+        if ($prstGeom -and $prstGeom.Attribute('prst')) { $entry['preset'] = $prstGeom.Attribute('prst').Value }
+        # Text content (concat all <a:t>)
+        $tList = @($sp.Descendants([System.Xml.Linq.XName]::Get('t', $NS.a)))
+        if ($tList.Count -gt 0) {
+            $text = ($tList | ForEach-Object { $_.Value }) -join ''
+            if ($text.Length -gt 0) { $entry['text'] = $text }
+        }
+    }
+    elseif ($pic) {
+        $entry['type'] = 'picture'
+        $cNvPr = $pic.Descendants([System.Xml.Linq.XName]::Get('cNvPr', $NS.xdr)) | Select-Object -First 1
+        if ($cNvPr -and $cNvPr.Attribute('name')) { $entry['name'] = $cNvPr.Attribute('name').Value }
+        # Image asset via blip r:embed
+        $blip = $pic.Descendants([System.Xml.Linq.XName]::Get('blip', $NS.a)) | Select-Object -First 1
+        if ($blip) {
+            $rEmbed = $blip.Attribute([System.Xml.Linq.XName]::Get('embed', $NS.r))
+            if ($rEmbed -and $ImageRels.ContainsKey($rEmbed.Value)) {
+                $tgt = $ImageRels[$rEmbed.Value].Target
+                # Just the basename; the asset gets copied to drawings/_assets/
+                $entry['asset'] = '_assets/' + [System.IO.Path]::GetFileName($tgt)
+            }
+        }
+    }
+    elseif ($grp) {
+        $entry['type'] = 'group'
+        # Group children: each <sp> or <pic> nested under <grpSp>. We recurse
+        # but the wrapper isn't a real anchor, so manually descend.
+        $children = New-Object System.Collections.Generic.List[object]
+        foreach ($child in $grp.Elements()) {
+            $cn = $child.Name.LocalName
+            if ($cn -eq 'sp' -or $cn -eq 'pic') {
+                # Wrap it pseudo-anchor-style by reusing this function's body logic
+                # via a temporary parent. Simpler: build the entry inline.
+                $childEntry = [ordered]@{}
+                $cNvPr = $child.Descendants([System.Xml.Linq.XName]::Get('cNvPr', $NS.xdr)) | Select-Object -First 1
+                if ($cNvPr -and $cNvPr.Attribute('name')) { $childEntry['name'] = $cNvPr.Attribute('name').Value }
+                if ($cn -eq 'sp') {
+                    $childEntry['type'] = 'shape'
+                    $m = $child.Attribute('macro')
+                    if ($m -and $m.Value) { $childEntry['macro'] = ($m.Value -replace '^\[\d+\]!', '') }
+                    $tList = @($child.Descendants([System.Xml.Linq.XName]::Get('t', $NS.a)))
+                    if ($tList.Count -gt 0) { $childEntry['text'] = ($tList | ForEach-Object { $_.Value }) -join '' }
+                } else {
+                    $childEntry['type'] = 'picture'
+                }
+                $children.Add($childEntry)
+            }
+        }
+        if ($children.Count -gt 0) { $entry['children'] = $children.ToArray() }
+    }
+    elseif ($cxnSp) {
+        $entry['type'] = 'connector'
+        $cNvPr = $cxnSp.Descendants([System.Xml.Linq.XName]::Get('cNvPr', $NS.xdr)) | Select-Object -First 1
+        if ($cNvPr -and $cNvPr.Attribute('name')) { $entry['name'] = $cNvPr.Attribute('name').Value }
+    }
+    else {
+        return $null
+    }
+
+    return $entry
 }
 
 function Process-Table {
