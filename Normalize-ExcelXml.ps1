@@ -196,7 +196,7 @@ function Get-IgnorableNamespaces {
 
 function Remove-VolatileNamespaces {
     param([System.Xml.Linq.XDocument]$Doc)
-    $ignorableUris = Get-IgnorableNamespaces -Doc $Doc
+    $ignorableUris = @(Get-IgnorableNamespaces -Doc $Doc)  # @() guards against PS5.1 unwrapping empty arrays to $null
     if ($ignorableUris.Count -eq 0) { return }
 
     # Remove elements in volatile namespaces (descendant-walk first, then attributes)
@@ -271,7 +271,7 @@ function Remove-VolatileElements {
         if ($hits.Count -gt 0) {
             if ($qname -eq "{$($NS.main)}fileSharing") {
                 $script:RedactedFileSharing = $true
-                Write-NormalizeLog -Level WARN -Message "${FileLabel}: redacted <fileSharing> (workbook-open password hash)"
+                Write-NormalizeLog -Level INFO -Message "${FileLabel}: redacted <fileSharing> (workbook-open password hash)"
             }
             foreach ($hit in $hits) { $hit.Remove() }
         }
@@ -295,10 +295,10 @@ function Strip-ProtectionSecrets {
         if ($stripped) {
             if ($el.Name.LocalName -eq 'workbookProtection') {
                 $script:RedactedWorkbookProtection = $true
-                Write-NormalizeLog -Level WARN -Message "${FileLabel}: redacted <workbookProtection> hash/salt"
+                Write-NormalizeLog -Level INFO -Message "${FileLabel}: redacted <workbookProtection> hash/salt"
             } else {
                 $script:RedactedSheetProtection.Add($FileLabel)
-                Write-NormalizeLog -Level WARN -Message "${FileLabel}: redacted <sheetProtection> hash/salt"
+                Write-NormalizeLog -Level INFO -Message "${FileLabel}: redacted <sheetProtection> hash/salt"
             }
         }
     }
@@ -457,7 +457,10 @@ function Extract-Lambdas {
 function Build-DefinedNames {
     # After Extract-Lambdas has stripped the lambdas, collect remaining defined names.
     # Returns an [ordered] hashtable, sorted by (name, localSheetId) with globals first.
-    param([System.Xml.Linq.XDocument]$Doc)
+    # Local-sheet keys use the sheet *name* (e.g. "_FilterDatabase@TASKPRED") not
+    # the raw localSheetId index, which is opaque (Excel's localSheetId is a
+    # 0-based index into the sheets-in-tab-order list, not the sheetId).
+    param([System.Xml.Linq.XDocument]$Doc, [array]$Sheets)
 
     $entries = @()
     foreach ($dn in $Doc.Descendants([System.Xml.Linq.XName]::Get('definedName', $NS.main))) {
@@ -476,7 +479,17 @@ function Build-DefinedNames {
 
     $out = [ordered]@{}
     foreach ($e in $sorted) {
-        $key = if ($null -eq $e.localSheetId) { $e.name } else { "$($e.name)@sheet$($e.localSheetId)" }
+        if ($null -eq $e.localSheetId) {
+            $key = $e.name
+        } else {
+            # localSheetId is 0-based index into tab-order sheets list
+            $sheetName = if ($Sheets -and $e.localSheetId -lt $Sheets.Count -and $e.localSheetId -ge 0) {
+                $Sheets[$e.localSheetId].name
+            } else {
+                "sheet$($e.localSheetId)"  # fallback if the index is out of range
+            }
+            $key = "$($e.name)@$sheetName"
+        }
         $out[$key] = $e.value
     }
     return $out
@@ -523,7 +536,7 @@ function Process-Workbook {
     $lambdas = Extract-Lambdas -Doc $doc
 
     # Defined names (after lambda strip)
-    $definedNames = Build-DefinedNames -Doc $doc
+    $definedNames = Build-DefinedNames -Doc $doc -Sheets $sheets
 
     # Workbook properties
     $wbProps = Get-WorkbookProperties -Doc $doc
@@ -537,9 +550,15 @@ function Process-Workbook {
         lambdas       = @($lambdas.Keys | Sort-Object)
     }
 
+    # Compute padding width: at least 2, more if any sheetId exceeds 99 (e.g.
+    # P6 Tools has sheetIds up to 146). Lexicographic sort of zero-padded
+    # numbers only works when every number has the same width.
+    $maxSheetId = ($sheets | Measure-Object -Property sheetId -Maximum).Maximum
+    $padWidth = [Math]::Max(2, ([string]$maxSheetId).Length)
     foreach ($s in $sheets) {
+        $s | Add-Member -NotePropertyName padWidth -NotePropertyValue $padWidth -Force
         $safeName = Get-SafeFileName -Name $s.name
-        $padded = ([string]$s.sheetId).PadLeft(2, '0')
+        $padded = ([string]$s.sheetId).PadLeft($padWidth, '0')
         $manifest.sheets += [ordered]@{
             sheetId    = $s.sheetId
             name       = $s.name
@@ -658,6 +677,30 @@ function Save-Lambdas {
 function Process-Worksheet {
     param([string]$SourceXmlPath, [PSCustomObject]$SheetMeta, [string]$DestDir)
 
+    # Strategy for keeping <sheetData> compact: XmlWriter with Indent=true
+    # ignores xml:space="preserve", so we cannot rely on the writer to leave
+    # cell content alone. Instead:
+    #   1. Read the source file as text and capture the raw <sheetData>...
+    #      </sheetData> substring -- this is exactly what we want to preserve,
+    #      byte-for-byte. The sharedString indices and formulas inside aren't
+    #      diff-meaningful when indented anyway.
+    #   2. Load+normalise the document with sheetData replaced by a marker
+    #      element so the rest gets pretty-printed correctly.
+    #   3. After save, string-replace the marker line with the raw sheetData.
+    $rawText = [System.IO.File]::ReadAllText($SourceXmlPath, [System.Text.UTF8Encoding]::new($false))
+    $rawSheetData = ''
+    $startMatch = [regex]::Match($rawText, '<sheetData(?:\s[^>]*)?(?:\s*/>|\s*>)')
+    if ($startMatch.Success) {
+        if ($startMatch.Value.EndsWith('/>')) {
+            $rawSheetData = $startMatch.Value
+        } else {
+            $endIdx = $rawText.IndexOf('</sheetData>', $startMatch.Index + $startMatch.Length)
+            if ($endIdx -ge 0) {
+                $rawSheetData = $rawText.Substring($startMatch.Index, $endIdx + '</sheetData>'.Length - $startMatch.Index)
+            }
+        }
+    }
+
     $doc = Load-Xml -Path $SourceXmlPath
     Remove-VolatileNamespaces -Doc $doc
     $fileLabel = "worksheets/$($SheetMeta.name)"
@@ -665,41 +708,37 @@ function Process-Worksheet {
     Strip-ProtectionSecrets -Doc $doc -FileLabel $fileLabel
     Remove-VolatileAttributes -Doc $doc
 
-    # We do NOT recurse into <sheetData> for attribute reordering -- it can have
-    # tens of thousands of <c>/<v>/<f> elements with semantic content. Sort-
-    # AttributesAlphabetically is recursive though, so temporarily detach
-    # sheetData, sort the rest, then re-attach.
+    # Replace <sheetData> with a uniquely-identifiable marker element. We will
+    # find this line in the saved file and swap it for $rawSheetData.
+    $markerName = 'VBASYNC_SHEETDATA_MARKER'
     $sheetData = $doc.Descendants([System.Xml.Linq.XName]::Get('sheetData', $NS.main)) | Select-Object -First 1
-    $sheetDataParent = $null
-    $sheetDataIndex = -1
     if ($sheetData) {
-        $sheetDataParent = $sheetData.Parent
-        $siblings = @($sheetDataParent.Elements())
-        for ($i = 0; $i -lt $siblings.Count; $i++) {
-            if ([object]::ReferenceEquals($siblings[$i], $sheetData)) { $sheetDataIndex = $i; break }
-        }
-        $sheetData.Remove()
+        $marker = New-Object System.Xml.Linq.XElement([System.Xml.Linq.XName]::Get($markerName, $NS.main))
+        $sheetData.ReplaceWith($marker)
     }
 
     Sort-AttributesAlphabetically -Element $doc.Root
 
-    if ($sheetData -and $sheetDataParent) {
-        # Re-insert at the same index. XElement doesn't have InsertAt, but we can
-        # add then move via the previous sibling.
-        $allElements = @($sheetDataParent.Elements())
-        if ($sheetDataIndex -ge $allElements.Count) {
-            $sheetDataParent.Add($sheetData)
-        } elseif ($sheetDataIndex -le 0) {
-            $sheetDataParent.AddFirst($sheetData)
-        } else {
-            $allElements[$sheetDataIndex - 1].AddAfterSelf($sheetData)
-        }
-    }
-
+    $padding = if ($SheetMeta.PSObject.Properties['padWidth']) { $SheetMeta.padWidth } else { 2 }
     $safeName = Get-SafeFileName -Name $SheetMeta.name
-    $padded = ([string]$SheetMeta.sheetId).PadLeft(2, '0')
+    $padded = ([string]$SheetMeta.sheetId).PadLeft($padding, '0')
     $destPath = Join-Path $DestDir "$padded - $safeName.xml"
     Save-PrettyXml -Doc $doc -Path $destPath
+
+    # Splice the raw sheetData back in over the marker. The marker serialises
+    # as <VBASYNC_SHEETDATA_MARKER xmlns="..." /> on its own line with leading
+    # indentation; we replace that whole line with the raw sheetData (also
+    # indented to match).
+    if ($rawSheetData) {
+        $written = [System.IO.File]::ReadAllText($destPath, [System.Text.UTF8Encoding]::new($false))
+        $markerPattern = '(?m)^(\s*)<' + $markerName + '(?:\s[^>]*)?\s*/>\s*$'
+        $written = [regex]::Replace($written, $markerPattern, {
+            param($m)
+            $indent = $m.Groups[1].Value
+            return $indent + $rawSheetData
+        })
+        Write-Utf8NoBom -Path $destPath -Text $written -LineEnding "`r`n"
+    }
 }
 
 function Process-Table {
@@ -715,6 +754,33 @@ function Process-Table {
 
     Sort-AttributesAlphabetically -Element $doc.Root
     Save-PrettyXml -Doc $doc -Path $destPath
+}
+
+# Passthrough normalisation for the OOXML files that aren't workbook/sheet/table:
+# strip volatile namespaces + attributes, sort attrs, pretty-print, write to dest.
+# Used for xl/sharedStrings.xml and xl/styles.xml so worksheet <v>N</v> indices
+# and dxfId references can actually be resolved.
+#
+# For sharedStrings.xml in particular, mark <sst> as xml:space="preserve" so the
+# (potentially tens of thousands of) <si> entries don't blow up under XmlWriter
+# indentation -- same trick as <sheetData>.
+function Process-AuxiliaryXml {
+    param(
+        [string]$SourceXmlPath,
+        [string]$DestPath,
+        [string]$PreserveWhitespaceForRootChild = ''
+    )
+    $doc = Load-Xml -Path $SourceXmlPath
+    Remove-VolatileNamespaces -Doc $doc
+    Remove-VolatileAttributes -Doc $doc
+
+    if ($PreserveWhitespaceForRootChild -and $doc.Root) {
+        $xmlNs = [System.Xml.Linq.XNamespace]::Xml
+        $doc.Root.SetAttributeValue($xmlNs + 'space', 'preserve')
+    }
+
+    Sort-AttributesAlphabetically -Element $doc.Root
+    Save-PrettyXml -Doc $doc -Path $DestPath
 }
 
 # ---- main -----------------------------------------------------------------
@@ -779,6 +845,31 @@ function Invoke-Normalize {
                 Write-NormalizeLog -Level ERROR -Message "Failed to process table $($tf.Name): $_"
                 $script:FailedCount++
             }
+        }
+    }
+
+    # Step 4: auxiliary files needed to interpret worksheet content.
+    # styles.xml is pretty-printed (small, useful to read for dxfId resolution).
+    # sharedStrings.xml is byte-copied: it's an opaque Excel-managed string table,
+    # the diff signal IS "string N changed" regardless of formatting, and
+    # XmlWriter doesn't honor xml:space="preserve" so the splice trick used for
+    # sheetData would be needed -- not worth the complexity for an opaque file.
+    $stylesSrc = Join-Path $sourceXl 'styles.xml'
+    if (Test-Path -LiteralPath $stylesSrc) {
+        try {
+            Process-AuxiliaryXml -SourceXmlPath $stylesSrc -DestPath (Join-Path $Destination 'styles.xml') -PreserveWhitespaceForRootChild ''
+        } catch {
+            Write-NormalizeLog -Level ERROR -Message "Failed to process styles.xml: $_"
+            $script:FailedCount++
+        }
+    }
+    $sstSrc = Join-Path $sourceXl 'sharedStrings.xml'
+    if (Test-Path -LiteralPath $sstSrc) {
+        try {
+            Copy-Item -LiteralPath $sstSrc -Destination (Join-Path $Destination 'sharedStrings.xml') -Force
+        } catch {
+            Write-NormalizeLog -Level ERROR -Message "Failed to copy sharedStrings.xml: $_"
+            $script:FailedCount++
         }
     }
 
