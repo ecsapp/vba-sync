@@ -76,6 +76,11 @@ $NS_KEEP = @(
 
 # Attributes to strip by qualified name regardless of where they appear.
 # Format: '{namespaceUri}localName'  or  'localName' (no namespace)
+#
+# CAREFUL: anything in this list gets stripped from EVERY element. If an
+# attribute is sometimes meaningful (sqref on <dataValidation>, etc), don't
+# put it here -- handle the volatile case by stripping the parent element
+# wholesale via VOLATILE_ELEMENTS instead.
 $VOLATILE_ATTRS = @(
     # workbook.xml
     'lastEdited', 'lowestEdited', 'rupBuild',
@@ -90,8 +95,12 @@ $VOLATILE_ATTRS = @(
     'firstSheet', 'activeTab',
     # sheetView UI state
     'tabSelected', 'zoomScale', 'zoomScaleNormal', 'workbookViewId',
-    # selection / scroll position
-    'activeCell', 'sqref', 'topLeftCell', 'pane', 'activePane'
+    # <pane> scroll position (xSplit/ySplit/state for frozen panes are KEPT)
+    'topLeftCell'
+    # NOTE: sqref/activeCell/pane/activePane removed -- those only appeared
+    # inside <selection>, which is wholesale-stripped by VOLATILE_ELEMENTS.
+    # Keeping them here would corrupt <dataValidation sqref="..."> and
+    # <conditionalFormatting sqref="...">.
 )
 
 # Elements to strip wholesale by qualified name
@@ -1268,6 +1277,12 @@ function Process-Worksheet {
         }
     }
 
+    # Phase C: extract sheet-level metadata before tables modify cellValues
+    Save-MetaJson -Doc $doc -SheetMeta $SheetMeta -TableRanges $tableRanges -Path (Join-Path $sheetFolder '_meta.json')
+    Save-ValidationsJson -Doc $doc -Path (Join-Path $sheetFolder 'validations.json')
+    Save-ConditionalFormatsJson -Doc $doc -Path (Join-Path $sheetFolder 'conditional_formats.json')
+    Save-CommentsJson -SourceXlPath $SourceXlPath -SheetMeta $SheetMeta -Path (Join-Path $sheetFolder 'comments.json')
+
     # Phase B: extract table cells from $cellValues and $cellFormulas, then
     # write per-table data.tsv + definition.json. Cells inside table ranges
     # are removed from the sheet's $cellValues so they don't appear twice.
@@ -1559,6 +1574,186 @@ function Save-StylesJson {
         $obj[$entry.Range] = $entry.Value
     }
 
+    Save-Manifest -Manifest $obj -Path $Path
+}
+
+# ---- Phase C: per-sheet metadata files ------------------------------------
+
+function Save-MetaJson {
+    # Sheet-level metadata that's neither cell data nor formula nor style:
+    # tab colour, frozen panes, column widths, hidden state, hosted-tables
+    # references. Always written so a sheet folder is self-describing.
+    param(
+        [System.Xml.Linq.XDocument]$Doc,
+        [PSCustomObject]$SheetMeta,
+        [System.Collections.Generic.List[object]]$TableRanges,
+        [string]$Path
+    )
+
+    $obj = [ordered]@{
+        sheetId  = $SheetMeta.sheetId
+        name     = $SheetMeta.name
+        codeName = $SheetMeta.codeName
+        state    = $SheetMeta.state
+        tabColor = $SheetMeta.tabColor
+    }
+
+    # Frozen panes (from <sheetView><pane>)
+    $pane = $Doc.Descendants([System.Xml.Linq.XName]::Get('pane', $NS.main)) | Select-Object -First 1
+    if ($pane -and ($pane.Attribute('state') -and $pane.Attribute('state').Value -eq 'frozen')) {
+        $frozen = [ordered]@{}
+        if ($pane.Attribute('xSplit')) { $frozen['xSplit'] = [int]$pane.Attribute('xSplit').Value }
+        if ($pane.Attribute('ySplit')) { $frozen['ySplit'] = [int]$pane.Attribute('ySplit').Value }
+        $obj['frozenPanes'] = $frozen
+    }
+
+    # Show gridlines (default true; only emit when overridden)
+    $sv = $Doc.Descendants([System.Xml.Linq.XName]::Get('sheetView', $NS.main)) | Select-Object -First 1
+    if ($sv -and $sv.Attribute('showGridLines') -and $sv.Attribute('showGridLines').Value -eq '0') {
+        $obj['showGridLines'] = $false
+    }
+
+    # Column widths (only non-default ones; default is 8.43-ish, captured in defaultColWidth)
+    $cols = New-Object System.Collections.Generic.List[object]
+    foreach ($colsEl in $Doc.Descendants([System.Xml.Linq.XName]::Get('cols', $NS.main))) {
+        foreach ($colEl in $colsEl.Elements([System.Xml.Linq.XName]::Get('col', $NS.main))) {
+            $entry = [ordered]@{}
+            if ($colEl.Attribute('min')) { $entry['min'] = [int]$colEl.Attribute('min').Value }
+            if ($colEl.Attribute('max')) { $entry['max'] = [int]$colEl.Attribute('max').Value }
+            if ($colEl.Attribute('width')) { $entry['width'] = [double]$colEl.Attribute('width').Value }
+            if ($colEl.Attribute('customWidth') -and $colEl.Attribute('customWidth').Value -eq '1') { $entry['customWidth'] = $true }
+            if ($colEl.Attribute('hidden') -and $colEl.Attribute('hidden').Value -eq '1') { $entry['hidden'] = $true }
+            if ($colEl.Attribute('bestFit') -and $colEl.Attribute('bestFit').Value -eq '1') { $entry['bestFit'] = $true }
+            $cols.Add($entry)
+        }
+    }
+    if ($cols.Count -gt 0) { $obj['columns'] = $cols.ToArray() }
+
+    # Merged cells
+    $mergedCells = New-Object System.Collections.Generic.List[string]
+    foreach ($mc in $Doc.Descendants([System.Xml.Linq.XName]::Get('mergeCell', $NS.main))) {
+        $mergedCells.Add($mc.Attribute('ref').Value)
+    }
+    if ($mergedCells.Count -gt 0) {
+        $obj['mergedCells'] = @($mergedCells.ToArray() | Sort-Object)
+    }
+
+    # Hosted tables (cross-reference for context)
+    if ($TableRanges -and $TableRanges.Count -gt 0) {
+        $hostedTables = @()
+        foreach ($t in $TableRanges) { $hostedTables += [ordered]@{ name = $t.Name; ref = $t.Ref } }
+        $obj['tables'] = @($hostedTables | Sort-Object -Property name)
+    }
+
+    Save-Manifest -Manifest $obj -Path $Path
+}
+
+function Save-ValidationsJson {
+    # Data-validation rules (dropdowns, ranges, etc) keyed by sqref range.
+    # Sorted by range for stable diffs. Only emitted if any rules exist.
+    param([System.Xml.Linq.XDocument]$Doc, [string]$Path)
+
+    $entries = New-Object System.Collections.Generic.List[object]
+    foreach ($dv in $Doc.Descendants([System.Xml.Linq.XName]::Get('dataValidation', $NS.main))) {
+        $entry = [ordered]@{}
+        $entry['sqref'] = if ($dv.Attribute('sqref')) { $dv.Attribute('sqref').Value } else { '' }
+        if ($dv.Attribute('type')) { $entry['type'] = $dv.Attribute('type').Value }
+        if ($dv.Attribute('operator')) { $entry['operator'] = $dv.Attribute('operator').Value }
+        if ($dv.Attribute('allowBlank') -and $dv.Attribute('allowBlank').Value -eq '1') { $entry['allowBlank'] = $true }
+        if ($dv.Attribute('showInputMessage') -and $dv.Attribute('showInputMessage').Value -eq '1') { $entry['showInputMessage'] = $true }
+        if ($dv.Attribute('showErrorMessage') -and $dv.Attribute('showErrorMessage').Value -eq '1') { $entry['showErrorMessage'] = $true }
+        if ($dv.Attribute('errorTitle')) { $entry['errorTitle'] = $dv.Attribute('errorTitle').Value }
+        if ($dv.Attribute('error')) { $entry['error'] = $dv.Attribute('error').Value }
+        if ($dv.Attribute('promptTitle')) { $entry['promptTitle'] = $dv.Attribute('promptTitle').Value }
+        if ($dv.Attribute('prompt')) { $entry['prompt'] = $dv.Attribute('prompt').Value }
+        $f1 = $dv.Element([System.Xml.Linq.XName]::Get('formula1', $NS.main))
+        if ($f1) { $entry['formula1'] = $f1.Value }
+        $f2 = $dv.Element([System.Xml.Linq.XName]::Get('formula2', $NS.main))
+        if ($f2) { $entry['formula2'] = $f2.Value }
+        $entries.Add($entry)
+    }
+
+    if ($entries.Count -eq 0) { return }
+    $sorted = @($entries.ToArray() | Sort-Object -Property sqref)
+    $obj = [ordered]@{ validations = $sorted }
+    Save-Manifest -Manifest $obj -Path $Path
+}
+
+function Save-ConditionalFormatsJson {
+    # Conditional-formatting rules keyed by sqref. Each <conditionalFormatting>
+    # block has a sqref attribute and one or more <cfRule> children. Sort by
+    # sqref then by priority for stable diffs.
+    param([System.Xml.Linq.XDocument]$Doc, [string]$Path)
+
+    $entries = New-Object System.Collections.Generic.List[object]
+    foreach ($cf in $Doc.Descendants([System.Xml.Linq.XName]::Get('conditionalFormatting', $NS.main))) {
+        $sqref = if ($cf.Attribute('sqref')) { $cf.Attribute('sqref').Value } else { '' }
+        foreach ($rule in $cf.Elements([System.Xml.Linq.XName]::Get('cfRule', $NS.main))) {
+            $r = [ordered]@{}
+            $r['sqref'] = $sqref
+            if ($rule.Attribute('type')) { $r['type'] = $rule.Attribute('type').Value }
+            if ($rule.Attribute('priority')) { $r['priority'] = [int]$rule.Attribute('priority').Value }
+            if ($rule.Attribute('operator')) { $r['operator'] = $rule.Attribute('operator').Value }
+            if ($rule.Attribute('dxfId')) { $r['dxfId'] = [int]$rule.Attribute('dxfId').Value }
+            if ($rule.Attribute('text')) { $r['text'] = $rule.Attribute('text').Value }
+            if ($rule.Attribute('aboveAverage')) { $r['aboveAverage'] = ($rule.Attribute('aboveAverage').Value -ne '0') }
+            $formulae = @()
+            foreach ($f in $rule.Elements([System.Xml.Linq.XName]::Get('formula', $NS.main))) {
+                $formulae += $f.Value
+            }
+            if ($formulae.Count -gt 0) { $r['formulae'] = $formulae }
+            $entries.Add($r)
+        }
+    }
+
+    if ($entries.Count -eq 0) { return }
+    $sorted = @($entries.ToArray() | Sort-Object -Property `
+        @{ Expression = { $_.sqref } }, `
+        @{ Expression = { if ($_.PSObject.Properties['priority']) { $_.priority } else { 0 } } })
+    $obj = [ordered]@{ conditionalFormats = $sorted }
+    Save-Manifest -Manifest $obj -Path $Path
+}
+
+function Save-CommentsJson {
+    # Cell comments: text + author + cell ref. Source is xl/commentsN.xml,
+    # referenced via the worksheet's _rels file. Sorted by cell ref.
+    param([string]$SourceXlPath, [PSCustomObject]$SheetMeta, [string]$Path)
+
+    if (-not $SourceXlPath) { return }
+    $rels = Read-WorksheetRels -SourceXlPath $SourceXlPath -WorksheetSourceFile $SheetMeta.sourceFile
+    $commentsRel = $rels.Values | Where-Object { $_.Type -eq 'comments' } | Select-Object -First 1
+    if (-not $commentsRel) { return }
+    $commentsXmlPath = Join-Path $SourceXlPath ($commentsRel.Target -replace '/', '\')
+    if (-not (Test-Path -LiteralPath $commentsXmlPath)) { return }
+
+    $cDoc = Load-Xml -Path $commentsXmlPath
+    Remove-VolatileNamespaces -Doc $cDoc
+
+    # Authors: index -> name
+    $authors = @()
+    foreach ($a in $cDoc.Descendants([System.Xml.Linq.XName]::Get('author', $NS.main))) {
+        $authors += $a.Value
+    }
+
+    $entries = New-Object System.Collections.Generic.List[object]
+    foreach ($cm in $cDoc.Descendants([System.Xml.Linq.XName]::Get('comment', $NS.main))) {
+        $ref = $cm.Attribute('ref').Value
+        $authorIdx = if ($cm.Attribute('authorId')) { [int]$cm.Attribute('authorId').Value } else { -1 }
+        $author = if ($authorIdx -ge 0 -and $authorIdx -lt $authors.Count) { $authors[$authorIdx] } else { $null }
+        # Concat all <t> contents
+        $tList = @($cm.Descendants([System.Xml.Linq.XName]::Get('t', $NS.main)))
+        $text = ($tList | ForEach-Object { $_.Value }) -join ''
+        $entry = [ordered]@{ ref = $ref; text = $text }
+        if ($author) { $entry['author'] = $author }
+        $entries.Add($entry)
+    }
+
+    if ($entries.Count -eq 0) { return }
+    $sorted = @($entries.ToArray() | Sort-Object -Property @{ Expression = {
+        $r = ConvertFrom-A1Ref -Ref $_.ref
+        if ($r) { return $r.Row * 16384 + $r.Col } else { return 0 }
+    } })
+    $obj = [ordered]@{ comments = $sorted }
     Save-Manifest -Manifest $obj -Path $Path
 }
 
