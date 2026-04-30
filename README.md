@@ -29,18 +29,40 @@ YourWorkbook/
 ├── ClassModules/                       # VBA class modules (.cls)
 ├── Forms/                              # UserForms (.frm + .frx)
 ├── Objects/                            # ThisWorkbook & Sheet modules (.cls)
-└── Excel/                              # Excel file structure
-    ├── MANIFEST.json                   # Workbook structure: sheets, defined names, lambdas, calc settings
+└── Excel/
+    ├── MANIFEST.json                   # Workbook structure: sheets, tables, defined names, lambdas, calc
     ├── lambdas/                        # LAMBDA defined names, one .lambda file per unique body
     │   └── AppendRange.lambda
-    ├── tables/
-    │   └── <TableName>.xml             # Named after the Excel table, not its internal rId
     ├── worksheets/
-    │   └── <NN> - <SheetName>.xml      # SheetId-prefixed (rename-stable) + name (readable)
-    └── STRUCTURE_SUMMARY.md            # Human-readable data model summary
+    │   └── <NN> - <SheetName>/         # One folder per sheet (sheetId-prefixed for stable sort)
+    │       ├── data.tsv                # Cell values, with shared strings resolved inline
+    │       ├── formulas.json           # Cell formulas, range-collapsed (B2:B100 = "=...")
+    │       ├── styles.json             # Resolved cell styles (fill/font/border/numFmt), range-merged
+    │       ├── _meta.json              # Tab colour, frozen panes, column widths, hosted tables
+    │       ├── validations.json        # Data validation rules (only if any)
+    │       ├── conditional_formats.json
+    │       ├── comments.json           # Cell comments + author
+    │       ├── tables/<TableName>/
+    │       │   ├── definition.json     # Schema, columns, calc formulas, overrides
+    │       │   └── data.tsv            # Clean dataset (headers row 1, data rows below)
+    │       └── drawings/
+    │           ├── shapes.json         # Shapes, pictures, **with OnAction macro names**
+    │           └── _assets/            # Embedded images
+    └── STRUCTURE_SUMMARY.md            # Human-readable overview
 ```
 
-The Excel/ XML files are produced by a PowerShell normaliser (`Normalize-ExcelXml.ps1`, ships next to the .xlam) that pretty-prints the OOXML, sorts attributes alphabetically, strips volatile metadata (revision GUIDs, window positions, build numbers, the local filesystem path that Excel embeds), redacts password hashes from sheet/workbook protection elements, and deduplicates LAMBDA copies. The result: small, readable diffs even after a "save with no changes".
+The whole Excel/ folder is produced by a PowerShell normaliser (`Normalize-ExcelXml.ps1`, ships next to the .xlam) that:
+
+- Resolves OOXML's compact-but-opaque shared-string and dxfId indices into readable inline values
+- Splits each worksheet into per-concern files so a data edit doesn't churn the styles file (and vice versa)
+- Range-merges adjacent cells with identical styles or formulas (a calc column with one formula across 700 rows is one entry, not 700)
+- Honours Excel's shared-formula structure (one master per `si` group)
+- Captures shape macros (`<xdr:sp macro="...">`) so AI agents can trace UI → VBA without opening Excel
+- Strips volatile metadata: revision GUIDs, window positions, build numbers, local filesystem path
+- Redacts password hashes from sheet/workbook protection elements (logged in `STRUCTURE_SUMMARY.md`)
+- Deduplicates LAMBDA copies (Excel writes one per sheet that uses it; we collapse to one file)
+
+The result: small, readable diffs even after a "save with no changes". A column added to a table touches one or two files; today it would have touched 25.
 
 Plus auto-generated Git configuration files:
 

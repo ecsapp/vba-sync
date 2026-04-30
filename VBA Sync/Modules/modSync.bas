@@ -81,7 +81,6 @@ Option Explicit
 Const GIT_ATTRIB As String = ".gitattributes"
 Const GIT_IGNORE As String = ".gitignore"
 Const README_FILE As String = "README.md"
-Const WORKSHEET_LINE_LIMIT As Long = 200
 
 '====================  Ribbon wrappers  ====================
 Public Sub ExportProject(control As Object)
@@ -217,18 +216,31 @@ NextComponent:
     MsgBox "VBA Sync export completed successfully!" & vbCrLf & "Files exported to: " & rootPath, vbInformation, "VBA Sync"
 End Sub
 
-' Extract Excel file structure for version control. The actual XML normalisation
-' (pretty-printing, attribute reordering, volatile-noise stripping, LAMBDA
-' deduplication, MANIFEST.json generation, password-hash redaction) lives in
-' Normalize-ExcelXml.ps1 next to this add-in. We orchestrate: copy the .xlsm to
-' a temp .zip, expand it, shell out to the normaliser, capture the log, clean up.
+' Extract Excel file structure for version control. All actual processing
+' (per-sheet folder split, data.tsv + formulas.json + styles.json, table
+' nesting, drawings + macro extraction, LAMBDA deduplication, MANIFEST.json
+' generation, password-hash redaction) lives in Normalize-ExcelXml.ps1 next
+' to this add-in. We orchestrate: copy the .xlsm to a temp .zip, expand it,
+' shell out to the normaliser, then mark the produced files as exported.
 '
-' v0.2 layout (replaces the old single-line workbook.xml + sheet1.xml + tableN.xml):
+' v1.0 layout:
 '   Excel/
-'   |-- MANIFEST.json                      Workbook structure as JSON
-'   |-- lambdas/<Name>.lambda              One file per unique LAMBDA defined name
-'   |-- worksheets/<NN> - <Name>.xml       sheetId-prefixed, multi-line, normalised
-'   |-- tables/<TableName>.xml             Named after the table, not the rId
+'   |-- MANIFEST.json                          Workbook structure as JSON
+'   |-- lambdas/<Name>.lambda                  Deduplicated LAMBDA defined names
+'   |-- worksheets/<NN> - <SheetName>/
+'   |   |-- data.tsv                           Cell values (sst-resolved)
+'   |   |-- formulas.json                      Range-collapsed cell formulas
+'   |   |-- styles.json                        Range-merged resolved styles
+'   |   |-- _meta.json                         Tab colour, panes, columns, etc.
+'   |   |-- validations.json                   (only if any rules)
+'   |   |-- conditional_formats.json           (only if any rules)
+'   |   |-- comments.json                      (only if any comments)
+'   |   |-- tables/<TableName>/
+'   |   |   |-- definition.json                Schema, columns, calc formulas
+'   |   |   `-- data.tsv                       Clean dataset
+'   |   `-- drawings/
+'   |       |-- shapes.json                    Shapes, pictures, OnAction macros
+'   |       `-- _assets/                       Embedded images
 '   `-- STRUCTURE_SUMMARY.md               Human-readable overview (VBA-generated)
 '
 ' The .normalize.log is read after the shell call and surfaces any redactions
@@ -256,29 +268,39 @@ Private Sub ExtractExcelStructure(wb As Workbook, rootPath As String, exported A
     psCmd = "powershell -NoProfile -Command ""Expand-Archive -Path '" & Replace(tempZip, "'", "''") & "' -DestinationPath '" & Replace(tempExtract, "'", "''") & "' -Force"""
     CreateObject("WScript.Shell").Run psCmd, 0, True
 
-    ' Locate the normaliser script. It ships next to VBA Sync.xlam in the add-in
-    ' folder. If missing (user deleted it, or older xlam without it), we fall back
-    ' to the legacy raw-copy path below.
+    ' Locate the normaliser script. It ships next to VBA Sync.xlam in the
+    ' add-in folder. v1.0 hard-requires it -- if missing, we surface a clear
+    ' error rather than silently falling back to a different output format.
     Dim normalizerPath As String
     normalizerPath = LocateNormaliserScript()
 
-    If Len(normalizerPath) > 0 Then
-        Debug.Print "VBA Sync: Normalising via " & normalizerPath
-        Dim normCmd As String
-        normCmd = "powershell -NoProfile -ExecutionPolicy Bypass -File """ & normalizerPath & """ " & _
-                  "-Source """ & tempExtract & """ -Destination """ & excelDir & """"
-        Dim exitCode As Long
-        exitCode = CreateObject("WScript.Shell").Run(normCmd, 0, True)
-        If exitCode <> 0 Then
-            Debug.Print "VBA Sync: Normaliser exit code " & exitCode & " (see " & excelDir & ".normalize.log)"
-        End If
-
-        ' Mark all output files as exported so PruneStaleFiles doesn't delete them
-        MarkNormaliserOutputAsExported excelDir, exported
-    Else
-        Debug.Print "VBA Sync: Normalize-ExcelXml.ps1 not found, falling back to raw copy"
-        LegacyCopyExcelStructure tempExtract, excelDir, exported
+    If Len(normalizerPath) = 0 Then
+        Debug.Print "VBA Sync: Normalize-ExcelXml.ps1 missing from add-in folder"
+        MsgBox "VBA Sync export needs Normalize-ExcelXml.ps1 next to VBA Sync.xlam." & vbCrLf & vbCrLf & _
+               "Expected at: " & ThisWorkbook.Path & "\Normalize-ExcelXml.ps1" & vbCrLf & vbCrLf & _
+               "Re-download the add-in package and ensure both files are installed.", _
+               vbCritical, "VBA Sync"
+        ' Cleanup what we already created
+        On Error Resume Next
+        Dim fsoCleanup As Object: Set fsoCleanup = CreateObject("Scripting.FileSystemObject")
+        fsoCleanup.DeleteFile tempZip, True
+        fsoCleanup.DeleteFolder tempExtract, True
+        On Error GoTo 0
+        Exit Sub
     End If
+
+    Debug.Print "VBA Sync: Normalising via " & normalizerPath
+    Dim normCmd As String
+    normCmd = "powershell -NoProfile -ExecutionPolicy Bypass -File """ & normalizerPath & """ " & _
+              "-Source """ & tempExtract & """ -Destination """ & excelDir & """"
+    Dim exitCode As Long
+    exitCode = CreateObject("WScript.Shell").Run(normCmd, 0, True)
+    If exitCode <> 0 Then
+        Debug.Print "VBA Sync: Normaliser exit code " & exitCode & " (see " & excelDir & ".normalize.log)"
+    End If
+
+    ' Mark all output files as exported so PruneStaleFiles doesn't delete them
+    MarkNormaliserOutputAsExported excelDir, exported
 
     ' Create Excel structure summary (live workbook → readable .md)
     CreateExcelStructureSummary wb, excelDir, exported
@@ -331,66 +353,6 @@ Private Sub MarkFolderRecursive(folder As Object, exported As Object)
     Next
 End Sub
 
-' Fallback path used when Normalize-ExcelXml.ps1 isn't found alongside the
-' xlam. Reproduces the v0.1 behaviour (raw single-line XML copies) so an export
-' still produces *something* useful even without the normaliser.
-Private Sub LegacyCopyExcelStructure(tempExtract As String, excelDir As String, exported As Object)
-    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
-    CopyExcelFile tempExtract & "\xl\workbook.xml", excelDir, "workbook.xml", exported
-
-    Dim tablesDir As String: tablesDir = excelDir & "tables\"
-    If fso.FolderExists(tempExtract & "\xl\tables") Then
-        EnsureFolder tablesDir
-        Dim tableFile As Object
-        For Each tableFile In fso.GetFolder(tempExtract & "\xl\tables").Files
-            If LCase(fso.GetExtensionName(tableFile.Name)) = "xml" Then
-                CopyExcelFile tableFile.Path, tablesDir, tableFile.Name, exported
-            End If
-        Next
-    End If
-
-    Dim worksheetsDir As String: worksheetsDir = excelDir & "worksheets\"
-    If fso.FolderExists(tempExtract & "\xl\worksheets") Then
-        EnsureFolder worksheetsDir
-        Dim wsFile As Object
-        For Each wsFile In fso.GetFolder(tempExtract & "\xl\worksheets").Files
-            If LCase(fso.GetExtensionName(wsFile.Name)) = "xml" And wsFile.Name <> "_rels" Then
-                CopyExcelFileWithLimit wsFile.Path, worksheetsDir, wsFile.Name, exported, WORKSHEET_LINE_LIMIT
-            End If
-        Next
-    End If
-End Sub
-
-Private Sub CopyExcelFile(sourcePath As String, destDir As String, fileName As String, exported As Object)
-    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
-    If fso.FileExists(sourcePath) Then
-        Dim destPath As String: destPath = destDir & fileName
-        fso.CopyFile sourcePath, destPath, True
-        exported(AddSlash(destPath)) = True
-    End If
-End Sub
-
-Private Sub CopyExcelFileWithLimit(sourcePath As String, destDir As String, fileName As String, exported As Object, maxLines As Long)
-    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
-    If fso.FileExists(sourcePath) Then
-        Dim sourceText As String
-        sourceText = fso.OpenTextFile(sourcePath, 1).ReadAll
-        
-        ' Limit to first N lines to avoid huge worksheet data files
-        Dim Lines As Variant: Lines = Split(sourceText, vbCrLf)
-        If UBound(Lines) > maxLines Then
-            ReDim Preserve Lines(0 To maxLines)
-            sourceText = Join(Lines, vbCrLf) & vbCrLf & _
-                        "<!-- Truncated at " & maxLines & " lines by VBA Sync to avoid large files -->"
-        End If
-        
-        Dim destPath As String: destPath = destDir & fileName
-        Dim ts As Object: Set ts = fso.CreateTextFile(destPath, True)
-        ts.Write sourceText
-        ts.Close
-        exported(AddSlash(destPath)) = True
-    End If
-End Sub
 
 Private Sub CreateExcelStructureSummary(wb As Workbook, excelDir As String, exported As Object)
     Dim summaryPath As String: summaryPath = excelDir & "STRUCTURE_SUMMARY.md"
@@ -442,10 +404,16 @@ Private Sub CreateExcelStructureSummary(wb As Workbook, excelDir As String, expo
     summary = summary & vbCrLf
     
     summary = summary & "## Files Included" & vbCrLf
-    summary = summary & "- `MANIFEST.json` - Workbook structure (sheets, defined names, lambdas, calc settings)" & vbCrLf
-    summary = summary & "- `tables/<TableName>.xml` - Excel table definitions, named after the table" & vbCrLf
-    summary = summary & "- `worksheets/<NN> - <SheetName>.xml` - Worksheet schemas, sheetId-prefixed for stable sort" & vbCrLf
+    summary = summary & "- `MANIFEST.json` - Workbook structure (sheets, tables, defined names, lambdas, calc settings)" & vbCrLf
     summary = summary & "- `lambdas/<Name>.lambda` - LAMBDA defined names (deduplicated across sheets)" & vbCrLf
+    summary = summary & "- `worksheets/<NN> - <SheetName>/` - One folder per sheet:" & vbCrLf
+    summary = summary & "    - `data.tsv` (cell values, sst-resolved)" & vbCrLf
+    summary = summary & "    - `formulas.json` (range-collapsed)" & vbCrLf
+    summary = summary & "    - `styles.json` (range-merged, dxf-resolved)" & vbCrLf
+    summary = summary & "    - `_meta.json` (tab colour, panes, columns, hosted tables)" & vbCrLf
+    summary = summary & "    - `validations.json`, `conditional_formats.json`, `comments.json` (only if any)" & vbCrLf
+    summary = summary & "    - `tables/<TableName>/{definition.json, data.tsv}` - Excel tables" & vbCrLf
+    summary = summary & "    - `drawings/{shapes.json, _assets/}` - shapes + pictures + macro refs" & vbCrLf
     summary = summary & vbCrLf
 
     ' Surface any password-hash redactions from the normaliser log
@@ -763,10 +731,13 @@ Private Sub WriteReadme(basePath As String, wb As Workbook)
           "|-- ClassModules/         # VBA class modules (.cls files)" & vbCrLf & _
           "|-- Forms/                # UserForms (.frm + .frx files)" & vbCrLf & _
           "|-- Objects/              # ThisWorkbook & Sheet code-behind (.cls files)" & vbCrLf & _
-          "|-- Excel/                # Excel structure (for AI & documentation)" & vbCrLf & _
-          "|   |-- workbook.xml      # Workbook metadata & named ranges" & vbCrLf & _
-          "|   |-- tables/           # Excel table definitions" & vbCrLf & _
-          "|   |-- worksheets/       # Worksheet schemas (truncated for size)" & vbCrLf & _
+          "|-- Excel/                # Excel structure split into per-concern files" & vbCrLf & _
+          "|   |-- MANIFEST.json         # Sheets, tables, defined names, lambdas" & vbCrLf & _
+          "|   |-- lambdas/              # Deduplicated LAMBDA defined names" & vbCrLf & _
+          "|   |-- worksheets/<NN>-<Name>/" & vbCrLf & _
+          "|   |       data.tsv, formulas.json, styles.json, _meta.json" & vbCrLf & _
+          "|   |       tables/<TableName>/{definition.json, data.tsv}" & vbCrLf & _
+          "|   |       drawings/{shapes.json, _assets/}" & vbCrLf & _
           "|   `-- STRUCTURE_SUMMARY.md  # Human-readable data model overview" & vbCrLf & _
           "|-- .gitattributes        # Git configuration for VBA files" & vbCrLf & _
           "|-- .gitignore            # Excludes temp files from version control" & vbCrLf & _

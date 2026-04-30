@@ -952,10 +952,11 @@ function Process-Workbook {
     $wbProps = Get-WorkbookProperties -Doc $doc
 
     # Build the manifest. The tables array stays empty here -- it gets populated
-    # later by Process-Table calls in Invoke-Normalize, before Save-Manifest.
+    # by Process-Worksheet returning per-sheet table entries, aggregated in
+    # Invoke-Normalize before Save-Manifest.
     $manifest = [ordered]@{
         schemaVersion    = 1
-        generatorVersion = '0.2'
+        generatorVersion = '1.0'
         workbook         = $wbProps
         sheets           = @()
         tables           = @()
@@ -1933,58 +1934,6 @@ function ConvertFrom-DrawingAnchor {
     return $entry
 }
 
-function Process-Table {
-    # Returns a hashtable with the table's manifest entry (name, ref, file).
-    param([string]$SourceXmlPath, [string]$DestDir)
-
-    $doc = Load-Xml -Path $SourceXmlPath
-    Remove-VolatileNamespaces -Doc $doc
-    Remove-VolatileAttributes -Doc $doc
-
-    $tableName = $doc.Root.Attribute('name').Value
-    $displayName = if ($doc.Root.Attribute('displayName')) { $doc.Root.Attribute('displayName').Value } else { $tableName }
-    $ref = if ($doc.Root.Attribute('ref')) { $doc.Root.Attribute('ref').Value } else { $null }
-    $safeName = Get-SafeFileName -Name $tableName
-    $destPath = Join-Path $DestDir "$safeName.xml"
-
-    Sort-AttributesAlphabetically -Element $doc.Root
-    Save-PrettyXml -Doc $doc -Path $destPath
-
-    return [ordered]@{
-        name        = $tableName
-        displayName = $displayName
-        ref         = $ref
-        file        = "tables/$safeName.xml"
-    }
-}
-
-# Passthrough normalisation for the OOXML files that aren't workbook/sheet/table:
-# strip volatile namespaces + attributes, sort attrs, pretty-print, write to dest.
-# Used for xl/sharedStrings.xml and xl/styles.xml so worksheet <v>N</v> indices
-# and dxfId references can actually be resolved.
-#
-# For sharedStrings.xml in particular, mark <sst> as xml:space="preserve" so the
-# (potentially tens of thousands of) <si> entries don't blow up under XmlWriter
-# indentation -- same trick as <sheetData>.
-function Process-AuxiliaryXml {
-    param(
-        [string]$SourceXmlPath,
-        [string]$DestPath,
-        [string]$PreserveWhitespaceForRootChild = ''
-    )
-    $doc = Load-Xml -Path $SourceXmlPath
-    Remove-VolatileNamespaces -Doc $doc
-    Remove-VolatileAttributes -Doc $doc
-
-    if ($PreserveWhitespaceForRootChild -and $doc.Root) {
-        $xmlNs = [System.Xml.Linq.XNamespace]::Xml
-        $doc.Root.SetAttributeValue($xmlNs + 'space', 'preserve')
-    }
-
-    Sort-AttributesAlphabetically -Element $doc.Root
-    Save-PrettyXml -Doc $doc -Path $DestPath
-}
-
 # ---- main -----------------------------------------------------------------
 
 function Invoke-Normalize {
@@ -2049,37 +1998,10 @@ function Invoke-Normalize {
     $sortedTables = @($allTableEntries | Sort-Object -Property @{Expression={$_.sheet}}, @{Expression={$_.name}})
     $wbResult.Manifest['tables'] = $sortedTables
 
-    # Step 4: auxiliary files needed to interpret worksheet content.
-    # styles.xml is pretty-printed (small, useful to read for dxfId resolution).
-    # sharedStrings.xml is byte-copied: it's an opaque Excel-managed string table,
-    # the diff signal IS "string N changed" regardless of formatting, and
-    # XmlWriter doesn't honor xml:space="preserve" so the splice trick used for
-    # sheetData would be needed -- not worth the complexity for an opaque file.
-    $stylesSrc = Join-Path $sourceXl 'styles.xml'
-    if (Test-Path -LiteralPath $stylesSrc) {
-        try {
-            Process-AuxiliaryXml -SourceXmlPath $stylesSrc -DestPath (Join-Path $Destination 'styles.xml') -PreserveWhitespaceForRootChild ''
-        } catch {
-            Write-NormalizeLog -Level ERROR -Message "Failed to process styles.xml: $_"
-            $script:FailedCount++
-        }
-    }
-    $sstSrc = Join-Path $sourceXl 'sharedStrings.xml'
-    if (Test-Path -LiteralPath $sstSrc) {
-        try {
-            # Byte-copy with one cosmetic normalisation: lowercase the encoding
-            # name in the XML declaration so it matches the rest of our output
-            # (XmlWriter writes encoding="utf-8"; Excel writes encoding="UTF-8").
-            $sstDest = Join-Path $Destination 'sharedStrings.xml'
-            $bytes = [System.IO.File]::ReadAllBytes($sstSrc)
-            $text = [System.Text.UTF8Encoding]::new($false).GetString($bytes)
-            $text = [regex]::Replace($text, '^(<\?xml[^?]*?encoding=")UTF-8(")', '${1}utf-8${2}', 'IgnoreCase')
-            [System.IO.File]::WriteAllText($sstDest, $text, [System.Text.UTF8Encoding]::new($false))
-        } catch {
-            Write-NormalizeLog -Level ERROR -Message "Failed to copy sharedStrings.xml: $_"
-            $script:FailedCount++
-        }
-    }
+    # Step 4: auxiliary files DROPPED in v1.0. styles.xml content is now
+    # absorbed into per-sheet styles.json (range-merged, resolved); shared
+    # strings are resolved inline into data.tsv. Keeping the source files
+    # would just create churn (Excel rewrites them on every save).
 
     # Step 5: write the manifest (now that tables array is populated)
     try {
