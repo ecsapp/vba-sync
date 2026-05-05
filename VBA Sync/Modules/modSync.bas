@@ -290,13 +290,35 @@ Private Sub ExtractExcelStructure(wb As Workbook, rootPath As String, exported A
     End If
 
     Debug.Print "VBA Sync: Normalising via " & normalizerPath
+    ' Trim trailing backslashes from the paths we pass to the shell. A trailing
+    ' "\" inside a "..." quoted argument escapes the closing quote on Windows
+    ' command lines, corrupting argument parsing. tempExtract has no trailing
+    ' backslash already; excelDir does (it's "...\Excel\") so trim it.
+    Dim srcArg As String: srcArg = tempExtract
+    Dim dstArg As String: dstArg = excelDir
+    If Right$(srcArg, 1) = "\" Then srcArg = Left$(srcArg, Len(srcArg) - 1)
+    If Right$(dstArg, 1) = "\" Then dstArg = Left$(dstArg, Len(dstArg) - 1)
+
     Dim normCmd As String
     normCmd = "powershell -NoProfile -ExecutionPolicy Bypass -File """ & normalizerPath & """ " & _
-              "-Source """ & tempExtract & """ -Destination """ & excelDir & """"
+              "-Source """ & srcArg & """ -Destination """ & dstArg & """"
+    Debug.Print "VBA Sync: Shell command: " & normCmd
     Dim exitCode As Long
     exitCode = CreateObject("WScript.Shell").Run(normCmd, 0, True)
+    Debug.Print "VBA Sync: Normaliser exit code " & exitCode
     If exitCode <> 0 Then
-        Debug.Print "VBA Sync: Normaliser exit code " & exitCode & " (see " & excelDir & ".normalize.log)"
+        ' Surface the failure clearly. The .normalize.log (if any) explains why.
+        Dim logHint As String: logHint = excelDir & ".normalize.log"
+        Dim logBody As String: logBody = ""
+        If CreateObject("Scripting.FileSystemObject").FileExists(logHint) Then
+            On Error Resume Next
+            logBody = vbCrLf & vbCrLf & "Last log lines:" & vbCrLf & _
+                      CreateObject("Scripting.FileSystemObject").OpenTextFile(logHint, 1).ReadAll
+            On Error GoTo 0
+        End If
+        MsgBox "VBA Sync: Excel normaliser failed (exit code " & exitCode & ")." & vbCrLf & vbCrLf & _
+               "Log: " & logHint & logBody, _
+               vbExclamation, "VBA Sync"
     End If
 
     ' Mark all output files as exported so PruneStaleFiles doesn't delete them
