@@ -2006,9 +2006,14 @@ function Invoke-Normalize {
     # Step 5: write the manifest (now that tables array is populated)
     try {
         Save-Manifest -Manifest $wbResult.Manifest -Path (Join-Path $Destination 'MANIFEST.json')
-        Write-NormalizeLog -Level INFO -Message "Wrote MANIFEST.json with $($wbResult.Sheets.Count) sheets, $($sortedTables.Count) tables, $($wbResult.Lambdas.Count) lambdas"
+        # PS5.1 strict mode + empty arrays returned from functions that unwrap
+        # to $null: wrap each .Count with @() to coerce.
+        $sheetCount  = @($wbResult.Sheets).Count
+        $tableCount  = @($sortedTables).Count
+        $lambdaCount = if ($wbResult.Lambdas) { @($wbResult.Lambdas.Keys).Count } else { 0 }
+        Write-NormalizeLog -Level INFO -Message "Wrote MANIFEST.json with $sheetCount sheets, $tableCount tables, $lambdaCount lambdas"
     } catch {
-        Write-NormalizeLog -Level ERROR -Message "Failed to write MANIFEST.json: $_"
+        Write-NormalizeLog -Level ERROR -Message "Failed to write MANIFEST.json: $_  STACK: $($_.ScriptStackTrace)"
         $script:FailedCount++
     }
 
