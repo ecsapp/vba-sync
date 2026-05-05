@@ -472,7 +472,7 @@ function Resolve-CellStyle {
 # the row stripe matches. Mark visited, emit range. O(n) where n = cell count.
 function Compress-CellsToRanges {
     param([hashtable]$Cells)
-    if (-not $Cells -or $Cells.Count -eq 0) { return @() }
+    if (-not $Cells -or $Cells.Count -eq 0) { return ,@() }   # ,@() prevents PS5.1 unwrap
 
     # Build a parallel hashtable of canonical JSON strings for value comparison
     # (so we can compare nested hashtables/arrays as values without walking them
@@ -562,7 +562,7 @@ function Get-IgnorableNamespaces {
     param([System.Xml.Linq.XDocument]$Doc)
     $root = $Doc.Root
     $mcIgnorable = $root.Attribute([System.Xml.Linq.XName]::Get('Ignorable', $NS.mc))
-    if (-not $mcIgnorable) { return @() }
+    if (-not $mcIgnorable) { return ,@() }   # ,@() prevents PS5.1 unwrap
     $prefixes = $mcIgnorable.Value -split '\s+'
     $uris = @()
     foreach ($prefix in $prefixes) {
@@ -575,7 +575,7 @@ function Get-IgnorableNamespaces {
             $uris += $uri
         }
     }
-    return $uris
+    return ,$uris
 }
 
 function Remove-VolatileNamespaces {
@@ -780,18 +780,27 @@ function Build-SheetIndex {
     $sheets = @()
     $sheetElements = @($WorkbookDoc.Descendants([System.Xml.Linq.XName]::Get('sheet', $NS.main)))
     foreach ($s in $sheetElements) {
-        $rId = $s.Attribute([System.Xml.Linq.XName]::Get('id', $NS.r)).Value
+        # All three attributes are schema-mandatory; corrupt/hand-edited
+        # workbook.xml files have been seen missing them. Skip rather than crash.
+        $rIdAttr = $s.Attribute([System.Xml.Linq.XName]::Get('id', $NS.r))
+        $sheetIdAttr = $s.Attribute('sheetId')
+        $nameAttr = $s.Attribute('name')
+        if (-not $rIdAttr -or -not $sheetIdAttr -or -not $nameAttr) {
+            Write-NormalizeLog -Level WARN -Message "workbook.xml: <sheet> missing required attribute (rId/sheetId/name); skipped"
+            continue
+        }
+        $rId = $rIdAttr.Value
         $target = $RelsMap[$rId]
         # target is e.g. 'worksheets/sheet5.xml' relative to the workbook file
         $sheets += [PSCustomObject]@{
-            sheetId    = [int]$s.Attribute('sheetId').Value
-            name       = $s.Attribute('name').Value
+            sheetId    = [int]$sheetIdAttr.Value
+            name       = $nameAttr.Value
             state      = if ($s.Attribute('state')) { $s.Attribute('state').Value } else { 'visible' }
             rId        = $rId
-            sourceFile = $target  # e.g. 'worksheets/sheet5.xml'
+            sourceFile = $target
         }
     }
-    return $sheets
+    return ,$sheets   # ,$ prevents PS5.1 unwrap of empty arrays to $null
 }
 
 function Annotate-SheetMetadata {
@@ -876,18 +885,19 @@ function Build-DefinedNames {
 
     $entries = @()
     foreach ($dn in $Doc.Descendants([System.Xml.Linq.XName]::Get('definedName', $NS.main))) {
-        $name = $dn.Attribute('name').Value
+        $nameAttr = $dn.Attribute('name')
+        if (-not $nameAttr) { continue }   # malformed definedName -- skip
         $localSheetId = if ($dn.Attribute('localSheetId')) { [int]$dn.Attribute('localSheetId').Value } else { $null }
         $entries += [PSCustomObject]@{
-            name = $name
+            name = $nameAttr.Value
             localSheetId = $localSheetId
             value = $dn.Value
         }
     }
 
-    $sorted = $entries | Sort-Object -Property `
+    $sorted = @($entries | Sort-Object -Property `
         @{ Expression = { $_.name } }, `
-        @{ Expression = { if ($null -eq $_.localSheetId) { -1 } else { $_.localSheetId } } }
+        @{ Expression = { if ($null -eq $_.localSheetId) { -1 } else { $_.localSheetId } } })
 
     $out = [ordered]@{}
     foreach ($e in $sorted) {
@@ -1149,8 +1159,14 @@ function Process-Worksheet {
                 $tDoc = Load-Xml -Path $tableXmlPath
                 Remove-VolatileNamespaces -Doc $tDoc
                 Remove-VolatileAttributes -Doc $tDoc
-                $tName = $tDoc.Root.Attribute('name').Value
-                $tRef  = $tDoc.Root.Attribute('ref').Value
+                $tNameAttr = $tDoc.Root.Attribute('name')
+                $tRefAttr  = $tDoc.Root.Attribute('ref')
+                if (-not $tNameAttr -or -not $tRefAttr) {
+                    Write-NormalizeLog -Level WARN -Message "$($fileLabel): table at $tableXmlPath missing name or ref; skipped"
+                    continue
+                }
+                $tName = $tNameAttr.Value
+                $tRef  = $tRefAttr.Value
                 $tableSafe = Get-SafeFileName -Name $tName
 
                 $tableFolder = Join-Path (Join-Path $sheetFolder 'tables') $tableSafe
@@ -1422,7 +1438,9 @@ function Save-TableDefinitionJson {
     )
 
     $root = $TableXmlDoc.Root
-    $name = $root.Attribute('name').Value
+    $nameAttr = $root.Attribute('name')
+    if (-not $nameAttr) { return }   # caller's try/catch will log; bare exit
+    $name = $nameAttr.Value
     $displayName = if ($root.Attribute('displayName')) { $root.Attribute('displayName').Value } else { $name }
     $totalsRowShown = if ($root.Attribute('totalsRowShown')) { ($root.Attribute('totalsRowShown').Value -ne '0') } else { $true }
 
@@ -1431,7 +1449,9 @@ function Save-TableDefinitionJson {
     $colIdx = 0
     if ($tableColumnsEl) {
         foreach ($tc in $tableColumnsEl.Elements([System.Xml.Linq.XName]::Get('tableColumn', $NS.main))) {
-            $colName = $tc.Attribute('name').Value
+            $colNameAttr = $tc.Attribute('name')
+            if (-not $colNameAttr) { $colIdx++; continue }   # skip but advance index
+            $colName = $colNameAttr.Value
             $col = [ordered]@{ name = $colName }
             $calcFormulaEl = $tc.Element([System.Xml.Linq.XName]::Get('calculatedColumnFormula', $NS.main))
             if ($calcFormulaEl) {
@@ -1654,7 +1674,8 @@ function Save-MetaJson {
     # Merged cells
     $mergedCells = New-Object System.Collections.Generic.List[string]
     foreach ($mc in $Doc.Descendants([System.Xml.Linq.XName]::Get('mergeCell', $NS.main))) {
-        $mergedCells.Add($mc.Attribute('ref').Value)
+        $refAttr = $mc.Attribute('ref')
+        if ($refAttr) { $mergedCells.Add($refAttr.Value) }
     }
     if ($mergedCells.Count -gt 0) {
         $obj['mergedCells'] = @($mergedCells.ToArray() | Sort-Object)
@@ -1759,7 +1780,9 @@ function Save-CommentsJson {
 
     $entries = New-Object System.Collections.Generic.List[object]
     foreach ($cm in $cDoc.Descendants([System.Xml.Linq.XName]::Get('comment', $NS.main))) {
-        $ref = $cm.Attribute('ref').Value
+        $refAttr = $cm.Attribute('ref')
+        if (-not $refAttr) { continue }   # malformed comment -- skip
+        $ref = $refAttr.Value
         $authorIdx = if ($cm.Attribute('authorId')) { [int]$cm.Attribute('authorId').Value } else { -1 }
         $author = if ($authorIdx -ge 0 -and $authorIdx -lt $authors.Count) { $authors[$authorIdx] } else { $null }
         # Concat all <t> contents
@@ -1843,17 +1866,25 @@ function ConvertFrom-DrawingAnchor {
 
     $entry = [ordered]@{}
 
-    # Anchor: from / to (col,row)-pairs OR positional (absoluteAnchor)
+    # Anchor: from / to (col,row)-pairs OR positional (absoluteAnchor).
+    # Hand-edited or third-party drawings may omit one of the col/row child
+    # elements -- guard each before .Value access (strict mode 3.0 throws).
     $fromEl = $Anchor.Element([System.Xml.Linq.XName]::Get('from', $NS.xdr))
     $toEl   = $Anchor.Element([System.Xml.Linq.XName]::Get('to', $NS.xdr))
     if ($fromEl -and $toEl) {
-        $fromCol = [int]($fromEl.Element([System.Xml.Linq.XName]::Get('col', $NS.xdr)).Value)
-        $fromRow = [int]($fromEl.Element([System.Xml.Linq.XName]::Get('row', $NS.xdr)).Value)
-        $toCol   = [int]($toEl.Element([System.Xml.Linq.XName]::Get('col', $NS.xdr)).Value)
-        $toRow   = [int]($toEl.Element([System.Xml.Linq.XName]::Get('row', $NS.xdr)).Value)
-        $entry['anchor'] = [ordered]@{
-            from = (ConvertTo-A1Ref -Col ($fromCol + 1) -Row ($fromRow + 1))
-            to   = (ConvertTo-A1Ref -Col ($toCol + 1)   -Row ($toRow + 1))
+        $fromColEl = $fromEl.Element([System.Xml.Linq.XName]::Get('col', $NS.xdr))
+        $fromRowEl = $fromEl.Element([System.Xml.Linq.XName]::Get('row', $NS.xdr))
+        $toColEl   = $toEl.Element([System.Xml.Linq.XName]::Get('col', $NS.xdr))
+        $toRowEl   = $toEl.Element([System.Xml.Linq.XName]::Get('row', $NS.xdr))
+        if ($fromColEl -and $fromRowEl -and $toColEl -and $toRowEl) {
+            $fromCol = [int]$fromColEl.Value
+            $fromRow = [int]$fromRowEl.Value
+            $toCol   = [int]$toColEl.Value
+            $toRow   = [int]$toRowEl.Value
+            $entry['anchor'] = [ordered]@{
+                from = (ConvertTo-A1Ref -Col ($fromCol + 1) -Row ($fromRow + 1))
+                to   = (ConvertTo-A1Ref -Col ($toCol + 1)   -Row ($toRow + 1))
+            }
         }
     }
 
