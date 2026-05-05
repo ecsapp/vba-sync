@@ -244,10 +244,12 @@ function ConvertFrom-A1Range {
 
 function Load-SharedStrings {
     # Returns a string array where index = sharedString id, value = string content.
-    # Returns @() if sharedStrings.xml doesn't exist.
+    # Returns an empty (but not $null) array if sharedStrings.xml doesn't exist.
+    # The leading comma in `,@()` is the no-unwrap idiom that prevents PS5.1
+    # from collapsing an empty pipeline result to $null at the caller.
     param([string]$SourceXlPath)
     $sstPath = Join-Path $SourceXlPath 'sharedStrings.xml'
-    if (-not (Test-Path -LiteralPath $sstPath)) { return @() }
+    if (-not (Test-Path -LiteralPath $sstPath)) { return ,@() }
     $doc = Load-Xml -Path $sstPath
     $strings = New-Object System.Collections.Generic.List[string]
     foreach ($si in $doc.Descendants([System.Xml.Linq.XName]::Get('si', $NS.main))) {
@@ -1965,10 +1967,13 @@ function Invoke-Normalize {
     }
 
     # Step 1b: load sharedStrings + styles ONCE (per-worksheet processing
-    # references both)
-    $sharedStrings = Load-SharedStrings -SourceXlPath $sourceXl
+    # references both). Defensive .Count via @() to survive PS5.1's empty-array
+    # unwrap when sst/styles missing or empty.
+    $sharedStrings = @(Load-SharedStrings -SourceXlPath $sourceXl)
     $styles = Load-Styles -SourceXlPath $sourceXl
-    Write-NormalizeLog -Level INFO -Message "Loaded $($sharedStrings.Count) shared strings, $(if ($styles) { $styles.CellXfs.Count } else { 0 }) cellXfs"
+    $sstCount = @($sharedStrings).Count
+    $cellXfCount = if ($styles -and $styles.CellXfs) { @($styles.CellXfs).Count } else { 0 }
+    Write-NormalizeLog -Level INFO -Message "Loaded $sstCount shared strings, $cellXfCount cellXfs"
 
     # Step 2: worksheets (per-sheet folder with split files). Tables are
     # processed inside Process-Worksheet (nested under their host sheet folder),
