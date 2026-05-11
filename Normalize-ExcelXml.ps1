@@ -243,13 +243,18 @@ function ConvertFrom-A1Range {
 # Both indexed-by-position lookups. Loaded once per workbook.
 
 function Load-SharedStrings {
-    # Returns a string array where index = sharedString id, value = string content.
-    # Returns an empty (but not $null) array if sharedStrings.xml doesn't exist.
-    # The leading comma in `,@()` is the no-unwrap idiom that prevents PS5.1
-    # from collapsing an empty pipeline result to $null at the caller.
+    # Returns a String[] where index = sharedString id, value = string content.
+    # Returns an empty String[] if sharedStrings.xml doesn't exist.
+    # Caller must wrap the call with @(...) to coerce a possibly-$null pipeline
+    # result back to an empty array -- @() handles both string[] and $null.
+    #
+    # DO NOT use `return ,$strings.ToArray()` here. The leading comma works for
+    # untyped Object[] but for a strongly-typed String[] it produces a 1-element
+    # Object[] wrapping the entire String[], which @() at the call site then
+    # interprets as a 1-element array. That collapses 5818 strings to 1.
     param([string]$SourceXlPath)
     $sstPath = Join-Path $SourceXlPath 'sharedStrings.xml'
-    if (-not (Test-Path -LiteralPath $sstPath)) { return ,@() }
+    if (-not (Test-Path -LiteralPath $sstPath)) { return @() }
     $doc = Load-Xml -Path $sstPath
     $strings = New-Object System.Collections.Generic.List[string]
     foreach ($si in $doc.Descendants([System.Xml.Linq.XName]::Get('si', $NS.main))) {
@@ -259,7 +264,7 @@ function Load-SharedStrings {
         $text = ($tElements | ForEach-Object { $_.Value }) -join ''
         $strings.Add($text)
     }
-    return ,$strings.ToArray()
+    return $strings.ToArray()
 }
 
 function Load-Styles {
