@@ -216,19 +216,17 @@ NextComponent:
     MsgBox "VBA Sync export completed successfully!" & vbCrLf & "Files exported to: " & rootPath, vbInformation, "VBA Sync"
 End Sub
 
-' Extract Excel file structure for version control. All actual processing
-' (per-sheet folder split, data.tsv + formulas.json + styles.json, table
-' nesting, drawings + macro extraction, LAMBDA deduplication, MANIFEST.json
-' generation, password-hash redaction) lives in Normalize-ExcelXml.ps1 next
-' to this add-in. We orchestrate: copy the .xlsm to a temp .zip, expand it,
-' shell out to the normaliser, then mark the produced files as exported.
+' Extract Excel file structure for version control. v1.1: implementation
+' lives entirely in modExcelExport, reading the live Excel object model
+' rather than unzipping the .xlsm and re-parsing OOXML. No external script
+' dependencies (no PowerShell, no .ps1 alongside the .xlam).
 '
-' v1.0 layout:
+' v1.1 layout (output format unchanged from v1.0):
 '   Excel/
 '   |-- MANIFEST.json                          Workbook structure as JSON
 '   |-- lambdas/<Name>.lambda                  Deduplicated LAMBDA defined names
 '   |-- worksheets/<NN> - <SheetName>/
-'   |   |-- data.tsv                           Cell values (sst-resolved)
+'   |   |-- data.tsv                           Cell values (resolved inline)
 '   |   |-- formulas.json                      Range-collapsed cell formulas
 '   |   |-- styles.json                        Range-merged resolved styles
 '   |   |-- _meta.json                         Tab colour, panes, columns, etc.
@@ -238,141 +236,25 @@ End Sub
 '   |   |-- tables/<TableName>/
 '   |   |   |-- definition.json                Schema, columns, calc formulas
 '   |   |   `-- data.tsv                       Clean dataset
-'   |   `-- drawings/
-'   |       |-- shapes.json                    Shapes, pictures, OnAction macros
-'   |       `-- _assets/                       Embedded images
-'   `-- STRUCTURE_SUMMARY.md               Human-readable overview (VBA-generated)
-'
-' The .normalize.log is read after the shell call and surfaces any redactions
-' (sheet/workbook protection password hashes) to the user via the structure
-' summary. We deliberately do NOT pop a MsgBox for redactions -- they're
-' informational; users can see them in the log if they want.
+'   |   `-- drawings/shapes.json               Shapes, pictures, OnAction macros
+'   `-- STRUCTURE_SUMMARY.md                   Human-readable overview
 Private Sub ExtractExcelStructure(wb As Workbook, rootPath As String, exported As Object)
     On Error GoTo ExcelStructureError
 
     Dim excelDir As String: excelDir = rootPath & "Excel\"
     EnsureFolder excelDir
 
-    ' Create temporary copy of workbook as ZIP
-    Dim tempZip As String: tempZip = wb.Path & "\" & wb.Name & ".temp.zip"
-    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
-    fso.CopyFile wb.FullName, tempZip
-    Debug.Print "VBA Sync: Creating temporary ZIP copy..."
+    Debug.Print "VBA Sync: Extracting Excel structure (live model)..."
+    modExcelExport.DoExportExcelStructure wb, rootPath, exported
 
-    ' Extract Excel structure using Shell
-    Dim tempExtract As String: tempExtract = wb.Path & "\temp_excel_extract"
-    EnsureFolder tempExtract
-
-    Debug.Print "VBA Sync: Extracting Excel XML structure..."
-    Dim psCmd As String
-    psCmd = "powershell -NoProfile -Command ""Expand-Archive -Path '" & Replace(tempZip, "'", "''") & "' -DestinationPath '" & Replace(tempExtract, "'", "''") & "' -Force"""
-    CreateObject("WScript.Shell").Run psCmd, 0, True
-
-    ' Locate the normaliser script. It ships next to VBA Sync.xlam in the
-    ' add-in folder. v1.0 hard-requires it -- if missing, we surface a clear
-    ' error rather than silently falling back to a different output format.
-    Dim normalizerPath As String
-    normalizerPath = LocateNormaliserScript()
-
-    If Len(normalizerPath) = 0 Then
-        Debug.Print "VBA Sync: Normalize-ExcelXml.ps1 missing from add-in folder"
-        MsgBox "VBA Sync export needs Normalize-ExcelXml.ps1 next to VBA Sync.xlam." & vbCrLf & vbCrLf & _
-               "Expected at: " & ThisWorkbook.Path & "\Normalize-ExcelXml.ps1" & vbCrLf & vbCrLf & _
-               "Re-download the add-in package and ensure both files are installed.", _
-               vbCritical, "VBA Sync"
-        ' Cleanup what we already created
-        On Error Resume Next
-        Dim fsoCleanup As Object: Set fsoCleanup = CreateObject("Scripting.FileSystemObject")
-        fsoCleanup.DeleteFile tempZip, True
-        fsoCleanup.DeleteFolder tempExtract, True
-        On Error GoTo 0
-        Exit Sub
-    End If
-
-    Debug.Print "VBA Sync: Normalising via " & normalizerPath
-    ' Trim trailing backslashes from the paths we pass to the shell. A trailing
-    ' "\" inside a "..." quoted argument escapes the closing quote on Windows
-    ' command lines, corrupting argument parsing. tempExtract has no trailing
-    ' backslash already; excelDir does (it's "...\Excel\") so trim it.
-    Dim srcArg As String: srcArg = tempExtract
-    Dim dstArg As String: dstArg = excelDir
-    If Right$(srcArg, 1) = "\" Then srcArg = Left$(srcArg, Len(srcArg) - 1)
-    If Right$(dstArg, 1) = "\" Then dstArg = Left$(dstArg, Len(dstArg) - 1)
-
-    Dim normCmd As String
-    normCmd = "powershell -NoProfile -ExecutionPolicy Bypass -File """ & normalizerPath & """ " & _
-              "-Source """ & srcArg & """ -Destination """ & dstArg & """"
-    Debug.Print "VBA Sync: Shell command: " & normCmd
-    Dim exitCode As Long
-    exitCode = CreateObject("WScript.Shell").Run(normCmd, 0, True)
-    Debug.Print "VBA Sync: Normaliser exit code " & exitCode
-    If exitCode <> 0 Then
-        ' Surface the failure clearly. The .normalize.log (if any) explains why.
-        Dim logHint As String: logHint = excelDir & ".normalize.log"
-        Dim logBody As String: logBody = ""
-        If CreateObject("Scripting.FileSystemObject").FileExists(logHint) Then
-            On Error Resume Next
-            logBody = vbCrLf & vbCrLf & "Last log lines:" & vbCrLf & _
-                      CreateObject("Scripting.FileSystemObject").OpenTextFile(logHint, 1).ReadAll
-            On Error GoTo 0
-        End If
-        MsgBox "VBA Sync: Excel normaliser failed (exit code " & exitCode & ")." & vbCrLf & vbCrLf & _
-               "Log: " & logHint & logBody, _
-               vbExclamation, "VBA Sync"
-    End If
-
-    ' Mark all output files as exported so PruneStaleFiles doesn't delete them
-    MarkNormaliserOutputAsExported excelDir, exported
-
-    ' Create Excel structure summary (live workbook → readable .md)
+    ' Create Excel structure summary (live workbook -> readable .md)
     CreateExcelStructureSummary wb, excelDir, exported
-
-    ' Cleanup temporary files
-    On Error Resume Next
-    fso.DeleteFile tempZip, True
-    fso.DeleteFolder tempExtract, True
-    On Error GoTo 0
 
     Exit Sub
 
 ExcelStructureError:
     Debug.Print "VBA Sync: Excel structure extraction failed: " & Err.Description
-    On Error Resume Next
-    If fso.FileExists(tempZip) Then fso.DeleteFile tempZip, True
-    If fso.FolderExists(tempExtract) Then fso.DeleteFolder tempExtract, True
-    On Error GoTo 0
     ' Continue without Excel structure rather than failing the whole VBA export
-End Sub
-
-' Locate Normalize-ExcelXml.ps1. It must live next to VBA Sync.xlam (in the
-' add-in folder). Returns "" if not found.
-Private Function LocateNormaliserScript() As String
-    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
-    Dim candidate As String
-    candidate = ThisWorkbook.Path & "\Normalize-ExcelXml.ps1"
-    If fso.FileExists(candidate) Then
-        LocateNormaliserScript = candidate
-        Exit Function
-    End If
-    LocateNormaliserScript = ""
-End Function
-
-' Walk the normaliser's output and record every file in the exported dictionary
-' so PruneStaleFiles knows not to delete them.
-Private Sub MarkNormaliserOutputAsExported(excelDir As String, exported As Object)
-    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
-    If Not fso.FolderExists(excelDir) Then Exit Sub
-    MarkFolderRecursive fso.GetFolder(excelDir), exported
-End Sub
-
-Private Sub MarkFolderRecursive(folder As Object, exported As Object)
-    Dim f As Object, sub_ As Object
-    For Each f In folder.Files
-        exported(AddSlash(f.Path)) = True
-    Next
-    For Each sub_ In folder.SubFolders
-        MarkFolderRecursive sub_, exported
-    Next
 End Sub
 
 
@@ -382,7 +264,6 @@ Private Sub CreateExcelStructureSummary(wb As Workbook, excelDir As String, expo
     
     Dim summary As String
     summary = "# Excel File Structure Summary" & vbCrLf & vbCrLf
-    summary = summary & "Generated: " & Format(Now, "yyyy-mm-dd hh:nn:ss") & vbCrLf
     summary = summary & "Workbook: " & wb.Name & vbCrLf & vbCrLf
     
     ' Worksheet summary
@@ -438,29 +319,13 @@ Private Sub CreateExcelStructureSummary(wb As Workbook, excelDir As String, expo
     summary = summary & "    - `drawings/{shapes.json, _assets/}` - shapes + pictures + macro refs" & vbCrLf
     summary = summary & vbCrLf
 
-    ' Surface any password-hash redactions from the normaliser log
-    Dim logPath As String: logPath = excelDir & ".normalize.log"
-    If fso.FileExists(logPath) Then
-        Dim logText As String
-        logText = fso.OpenTextFile(logPath, 1).ReadAll
-        If InStr(logText, "REDACTED:") > 0 Then
-            summary = summary & "## Redactions" & vbCrLf
-            summary = summary & "Password hashes were stripped from the exported XML to keep them out of Git history. " & _
-                                "The protections still exist on the .xlsx itself; only the on-disk export is sanitised." & vbCrLf & vbCrLf
-            Dim ln As Variant
-            For Each ln In Split(logText, vbCrLf)
-                If InStr(CStr(ln), "REDACTED:") > 0 Then
-                    Dim msg As String: msg = Mid$(CStr(ln), InStr(CStr(ln), "REDACTED:"))
-                    summary = summary & "- " & msg & vbCrLf
-                End If
-            Next
-        End If
-    End If
+    ' v1.1: password-hash redaction is no longer performed -- the export reads
+    ' the live Excel object model rather than the underlying OOXML. Sheet/
+    ' workbook protections (if any) still live on the .xlsm itself; only the
+    ' on-disk export folder is a clean *view* of the model.
 
-    Dim ts As Object: Set ts = fso.CreateTextFile(summaryPath, True)
-    ts.Write summary
-    ts.Close
-    exported(AddSlash(summaryPath)) = True
+    ' Write the summary via modExcelExport.WriteIfChanged for diff-friendliness
+    modExcelExport.WriteIfChanged summaryPath, summary, exported, True
 End Sub
 
 Private Sub DoImportProject()
@@ -687,9 +552,10 @@ Private Sub WriteGitAttributes(basePath As String)
           "*.cls text eol=crlf" & vbCrLf & _
           "*.frm text eol=crlf" & vbCrLf & _
           vbCrLf & _
-          "# Excel structure files (XML + Markdown use CRLF; JSON/lambda use LF)" & vbCrLf & _
+          "# Excel structure files (XML + Markdown + TSV use CRLF; JSON/lambda use LF)" & vbCrLf & _
           "*.xml text eol=crlf" & vbCrLf & _
           "*.md text eol=crlf" & vbCrLf & _
+          "*.tsv text eol=crlf" & vbCrLf & _
           "*.json text eol=lf" & vbCrLf & _
           "*.lambda text eol=lf" & vbCrLf & _
           vbCrLf & _
@@ -731,7 +597,6 @@ Private Sub WriteGitIgnore(basePath As String)
           vbCrLf & _
           "# VBA Sync temporary files" & vbCrLf & _
           "*.temp.zip" & vbCrLf & _
-          "temp_excel_extract/" & vbCrLf & _
           vbCrLf & _
           "# OS cruft" & vbCrLf & _
           "Thumbs.db" & vbCrLf & _
