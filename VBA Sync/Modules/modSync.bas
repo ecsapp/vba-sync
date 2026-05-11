@@ -607,17 +607,41 @@ Private Sub PruneStaleFiles(rootPath As String, exported As Object)
     End If
 End Sub
 
+' Recursively prune stale exported files from the Excel/ subtree.
+' Walks bottom-up so we can detect newly-emptied folders and remove them.
+' Preserves .normalize.log (it's overwritten by the next run anyway).
+'
+' Extensions covered: every output type the normaliser writes -- xml, json,
+' lambda, tsv, md, plus the image assets png/jpg/jpeg/gif/emf/bmp. Adding
+' a new output extension to the normaliser means adding it here too.
 Private Sub PruneFolderRecursive(folder As Object, exported As Object)
     Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
     Dim f As Object, sub_ As Object
-    Dim toDelete As Object: Set toDelete = CreateObject("Scripting.Dictionary")
 
+    ' Recurse FIRST so child folders get pruned before we check if this one
+    ' is empty. SubFolders enumeration mutates badly if we delete during
+    ' iteration -- collect to a list first.
+    Dim subFolders As Object: Set subFolders = CreateObject("Scripting.Dictionary")
+    For Each sub_ In folder.SubFolders
+        subFolders(sub_.Path) = True
+    Next
+    Dim subPath As Variant
+    For Each subPath In subFolders.Keys
+        On Error Resume Next
+        PruneFolderRecursive fso.GetFolder(CStr(subPath)), exported
+        On Error GoTo 0
+    Next
+
+    ' Files in THIS folder
+    Dim toDelete As Object: Set toDelete = CreateObject("Scripting.Dictionary")
     For Each f In folder.Files
         Dim ext As String: ext = LCase$(fso.GetExtensionName(f.Path))
         ' Preserve the normaliser's log file
         If LCase$(f.Name) = ".normalize.log" Then
             ' skip
-        ElseIf ext = "xml" Or ext = "md" Or ext = "json" Or ext = "lambda" Then
+        ElseIf ext = "xml" Or ext = "md" Or ext = "json" Or ext = "lambda" Or _
+               ext = "tsv" Or ext = "png" Or ext = "jpg" Or ext = "jpeg" Or _
+               ext = "gif" Or ext = "emf" Or ext = "bmp" Then
             If Not exported.Exists(AddSlash(f.Path)) Then
                 toDelete(f.Path) = True
             End If
@@ -630,9 +654,16 @@ Private Sub PruneFolderRecursive(folder As Object, exported As Object)
         On Error GoTo 0
     Next
 
-    For Each sub_ In folder.SubFolders
-        PruneFolderRecursive sub_, exported
-    Next
+    ' If this folder is now empty AND it's not the root Excel/ folder, remove it.
+    ' (We never delete the root Excel/ -- export creates it fresh.)
+    If LCase$(folder.Name) <> "excel" Then
+        On Error Resume Next
+        Dim refreshed As Object: Set refreshed = fso.GetFolder(folder.Path)
+        If refreshed.Files.Count = 0 And refreshed.SubFolders.Count = 0 Then
+            folder.Delete True
+        End If
+        On Error GoTo 0
+    End If
 End Sub
 
 Private Function AddSlash(p As String) As String
