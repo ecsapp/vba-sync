@@ -211,10 +211,53 @@ NextComponent:
     WriteGitAttributes repoPath
     WriteGitIgnore repoPath
     WriteReadme repoPath, wb
-    
-    Debug.Print "VBA Sync: Export completed successfully!"
-    MsgBox "VBA Sync export completed successfully!" & vbCrLf & "Files exported to: " & rootPath, vbInformation, "VBA Sync"
+
+    ' Check for per-sheet failures captured by modExcelExport. If any are
+    ' present, the success MsgBox is replaced with a warning summary so the
+    ' user can't miss that some sheets didn't fully export.
+    Dim sheetErrLog As String: sheetErrLog = rootPath & "Excel\.export_sheet_errors.log"
+    Dim sheetErrText As String: sheetErrText = ReadSheetErrors(sheetErrLog)
+    If Len(sheetErrText) > 0 Then
+        Debug.Print "VBA Sync: Export completed with sheet-level failures."
+        MsgBox "VBA Sync export completed, but some sheets had issues:" & vbCrLf & vbCrLf & _
+               sheetErrText & vbCrLf & _
+               "Full details: " & sheetErrLog, vbExclamation, "VBA Sync"
+    Else
+        Debug.Print "VBA Sync: Export completed successfully!"
+        MsgBox "VBA Sync export completed successfully!" & vbCrLf & "Files exported to: " & rootPath, vbInformation, "VBA Sync"
+    End If
 End Sub
+
+' Parse .export_sheet_errors.log into a human-readable summary
+' ("<sheet>: <phase> - <message>" lines). Returns "" if file missing or empty.
+Private Function ReadSheetErrors(path As String) As String
+    On Error GoTo Fail
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FileExists(path) Then ReadSheetErrors = "": Exit Function
+    Dim ts As Object: Set ts = fso.OpenTextFile(path, 1)
+    Dim contents As String
+    If Not ts.AtEndOfStream Then contents = ts.ReadAll
+    ts.Close
+    If Len(contents) = 0 Then ReadSheetErrors = "": Exit Function
+
+    Dim lines() As String: lines = Split(contents, vbCrLf)
+    Dim summary As String, i As Long, count As Long
+    For i = LBound(lines) To UBound(lines)
+        Dim ln As String: ln = Trim$(lines(i))
+        If Len(ln) > 0 Then
+            ' Strip the timestamp + "VBA Sync: " prefix for brevity in the MsgBox
+            Dim p As Long: p = InStr(ln, " VBA Sync: ")
+            If p > 0 Then ln = Mid$(ln, p + 11)
+            summary = summary & "  - " & ln & vbCrLf
+            count = count + 1
+        End If
+    Next
+    If count = 0 Then ReadSheetErrors = "": Exit Function
+    ReadSheetErrors = summary
+    Exit Function
+Fail:
+    ReadSheetErrors = ""
+End Function
 
 ' Extract Excel file structure for version control. v1.1: implementation
 ' lives entirely in modExcelExport, reading the live Excel object model

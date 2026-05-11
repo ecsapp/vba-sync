@@ -64,12 +64,24 @@ Option Explicit
 '   files are skipped to keep git diff noise to zero on "no-op" exports
 '   (e.g. when the user just opens the workbook and saves without edits).
 
+' Per-sheet phase tracker. Updated inside ProcessWorksheet, read by the
+' per-sheet error handler in DoExportExcelStructure so log messages can say
+' which sub-step raised, not just the sheet name.
+Private g_sheetPhase As String
+
 '====================  PUBLIC ENTRY  =======================
 Public Sub DoExportExcelStructure(wb As Workbook, rootPath As String, exported As Object)
     On Error GoTo Fail
 
     Dim excelDir As String: excelDir = rootPath & "Excel\"
     EnsureFolder excelDir
+
+    ' Clear stale logs from any previous run so the end-of-export summary
+    ' reflects only this invocation's failures.
+    On Error Resume Next
+    Kill excelDir & ".export_sheet_errors.log"
+    Kill excelDir & ".export_error.log"
+    On Error GoTo 0
 
     ' Phase tracker (updated at each major step) — surfaced in the failure log
     ' so we know which step blew up when Erl returns 0.
@@ -215,9 +227,18 @@ Public Sub DoExportExcelStructure(wb As Workbook, rootPath As String, exported A
                 End If
             End If
         End If
+        g_sheetPhase = "init"
         Set sheetEntries = ProcessWorksheet(ws, sheetIds(ws.Name), padWidth, worksheetsDir, exported, tableCalcFormulas, sheetDrawing)
         If Err.Number <> 0 Then
-            Debug.Print "VBA Sync: sheet '" & ws.Name & "' failed: " & Err.Description
+            Dim sErr As String
+            sErr = "VBA Sync: sheet '" & ws.Name & "' failed in '" & g_sheetPhase & "': " & _
+                   Err.Description & " (Err.Number=" & Err.Number & ")"
+            Debug.Print sErr
+            Dim sLogPath As String: sLogPath = excelDir & ".export_sheet_errors.log"
+            Dim sFnum As Integer: sFnum = FreeFile
+            Open sLogPath For Append As #sFnum
+            Print #sFnum, Format(Now, "yyyy-mm-dd hh:nn:ss") & " " & sErr
+            Close #sFnum
             Err.Clear
         End If
         On Error GoTo Fail
@@ -245,6 +266,14 @@ Public Sub DoExportExcelStructure(wb As Workbook, rootPath As String, exported A
     ' Write MANIFEST.json LAST (tables array now populated)
     phase = "write-manifest"
     WriteIfChanged excelDir & "MANIFEST.json", JsonPretty(manifest), exported, False
+
+    ' Post-export sanity check: every per-sheet folder must have _meta.json.
+    ' Empty folders mean the sheet was processed but failed to write — either
+    ' the per-sheet error handler already logged it, or it slipped through
+    ' (rare but possible). Append any unaccounted-for empties to the same log
+    ' so the user's failure summary catches them.
+    phase = "sanity-check"
+    SanityCheckSheetFolders worksheetsDir, excelDir
     phase = "done"
 
 Done:
@@ -288,6 +317,7 @@ Private Function ProcessWorksheet(ws As Worksheet, sheetId As Long, padWidth As 
     Dim tableRanges As Object: Set tableRanges = New Collection
     ' Each tableRange: dict { name, safeName, startCol, startRow, endCol, endRow, folder, listObject, ref }
 
+    g_sheetPhase = "list-objects-enum"
     Dim lo As ListObject
     Dim tablesDir As String: tablesDir = sheetFolder & "tables\"
     For Each lo In ws.ListObjects
@@ -322,6 +352,7 @@ Private Function ProcessWorksheet(ws As Worksheet, sheetId As Long, padWidth As 
     Next
 
     ' --- Walk cells once via 2D arrays from UsedRange ---
+    g_sheetPhase = "used-range"
     Dim ur As Range
     On Error Resume Next
     Set ur = ws.UsedRange
@@ -332,10 +363,12 @@ Private Function ProcessWorksheet(ws As Worksheet, sheetId As Long, padWidth As 
     Dim cellStyles As Object: Set cellStyles = CreateObject("Scripting.Dictionary")     ' "col,row" -> style dict
 
     If Not ur Is Nothing Then
+        g_sheetPhase = "walk-used-range"
         WalkUsedRange ur, cellValues, cellFormulas, cellStyles
     End If
 
     ' --- Carve out table cells (so they don't appear in sheet data.tsv) ---
+    g_sheetPhase = "tables-carve"
     Dim tableMarkers As Object: Set tableMarkers = CreateObject("Scripting.Dictionary")
     Dim ti As Variant
     For Each ti In tableRanges
@@ -371,18 +404,42 @@ Private Function ProcessWorksheet(ws As Worksheet, sheetId As Long, padWidth As 
     Next
 
     ' --- Write sheet-level files ---
-    SaveMetaJson sheetFolder & "_meta.json", ws, sheetId, tableRanges, exported
-    SaveDataTsv sheetFolder & "data.tsv", cellValues, exported
-    SaveFormulasJson sheetFolder & "formulas.json", cellFormulas, exported
-    SaveStylesJson sheetFolder & "styles.json", cellStyles, exported
-    SaveValidationsJson sheetFolder & "validations.json", ws, exported
-    SaveConditionalFormatsJson sheetFolder & "conditional_formats.json", ws, exported
-    SaveCommentsJson sheetFolder & "comments.json", ws, exported
-    SaveDrawingsJson sheetFolder & "drawings\", ws, exported, sheetDrawing
-    ExportCharts sheetFolder & "charts\", ws, exported
+    g_sheetPhase = "save-meta":          SaveMetaJson sheetFolder & "_meta.json", ws, sheetId, tableRanges, exported
+    g_sheetPhase = "save-data-tsv":      SaveDataTsv sheetFolder & "data.tsv", cellValues, exported
+    g_sheetPhase = "save-formulas":      SaveFormulasJson sheetFolder & "formulas.json", cellFormulas, exported
+    g_sheetPhase = "save-styles":        SaveStylesJson sheetFolder & "styles.json", cellStyles, exported
+    g_sheetPhase = "save-validations":   SaveValidationsJson sheetFolder & "validations.json", ws, exported
+    g_sheetPhase = "save-cf":            SaveConditionalFormatsJson sheetFolder & "conditional_formats.json", ws, exported
+    g_sheetPhase = "save-comments":      SaveCommentsJson sheetFolder & "comments.json", ws, exported
+    g_sheetPhase = "save-drawings":      SaveDrawingsJson sheetFolder & "drawings\", ws, exported, sheetDrawing
+    g_sheetPhase = "export-charts":      ExportCharts sheetFolder & "charts\", ws, exported
 
+    g_sheetPhase = "done"
     Set ProcessWorksheet = tableEntries
 End Function
+
+'====================  SANITY CHECK  =========================
+' Walks worksheetsDir, flags any per-sheet folder missing _meta.json.
+' Appends entries to .export_sheet_errors.log so the same MsgBox summary
+' downstream picks them up alongside in-process failures.
+Private Sub SanityCheckSheetFolders(worksheetsDir As String, excelDir As String)
+    On Error Resume Next
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FolderExists(worksheetsDir) Then Exit Sub
+    Dim folder As Object: Set folder = fso.GetFolder(worksheetsDir)
+    Dim sub_ As Object
+    Dim logPath As String: logPath = excelDir & ".export_sheet_errors.log"
+    For Each sub_ In folder.SubFolders
+        If Not fso.FileExists(sub_.path & "\_meta.json") Then
+            Dim fnum As Integer: fnum = FreeFile
+            Open logPath For Append As #fnum
+            Print #fnum, Format(Now, "yyyy-mm-dd hh:nn:ss") & _
+                " VBA Sync: sheet folder '" & sub_.Name & _
+                "' has no _meta.json (sanity check)"
+            Close #fnum
+        End If
+    Next
+End Sub
 
 '====================  USEDRANGE WALKER  =====================
 ' Reads UsedRange.Value2 and UsedRange.Formula in two big COM calls.
@@ -406,10 +463,38 @@ Private Sub WalkUsedRange(ur As Range, ByRef cellValues As Object, _
         ReDim values(1 To 1, 1 To 1)
         ReDim formulas(1 To 1, 1 To 1)
         values(1, 1) = ur.Value2
+        On Error Resume Next
         formulas(1, 1) = ur.Formula
+        On Error GoTo 0
     Else
+        ' Bulk-read both arrays in one COM call each. Range.Formula raises
+        ' 1004 when the range contains a multi-cell array formula (CSE) --
+        ' Excel forbids reading .Formula for those at range level. Fall back
+        ' to a per-cell loop with FormulaArray when the bulk read fails.
         values = ur.Value2
+        On Error Resume Next
         formulas = ur.Formula
+        If Err.Number <> 0 Then
+            Err.Clear
+            On Error GoTo 0
+            ReDim formulas(1 To nRows, 1 To nCols)
+            Dim ri As Long, ci As Long
+            For ri = 1 To nRows
+                For ci = 1 To nCols
+                    Dim cellRef As Range: Set cellRef = ur.Cells(ri, ci)
+                    Dim fStr As String: fStr = ""
+                    On Error Resume Next
+                    If cellRef.HasArray Then
+                        fStr = CStr(cellRef.FormulaArray)
+                    Else
+                        fStr = CStr(cellRef.Formula)
+                    End If
+                    On Error GoTo 0
+                    formulas(ri, ci) = fStr
+                Next
+            Next
+        End If
+        On Error GoTo 0
     End If
 
     Dim i As Long, j As Long
