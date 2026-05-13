@@ -1,6 +1,14 @@
 Attribute VB_Name = "modExcelExport"
 Option Explicit
 
+' Win32 Sleep for polling extraction async. Application.Wait does not work
+' reliably under COM-driven Excel (no message pump in headless sessions).
+#If VBA7 Then
+    Public Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+#Else
+    Public Declare Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+#End If
+
 ' MIT License
 '
 ' Copyright (c) 2025 Arnaud Lavignolle, Axiom Project Services Pty Ltd
@@ -208,6 +216,15 @@ Public Sub DoExportExcelStructure(wb As Workbook, rootPath As String, exported A
             On Error GoTo Fail
         End If
     End If
+    ' NOTE: LoadSheetValidations / LoadSheetViews / LoadWorkbookSheetMap exist
+    ' in this module as v1.1 stubs. They are not wired into the export path
+    ' yet -- BuildDrawingImageMap's Shell.Application unzip wait is fragile
+    ' under COM (the per-sheet OOXML files sometimes haven't appeared by the
+    ' time the loaders run), which would cause validations.json + showGridLines
+    ' to flap silently. v1.0 keeps the existing VBA SpecialCells / Window probe
+    ' paths despite their known issues (SpecialCells often 1004s, and
+    ' Window.DisplayGridlines / Window.FreezePanes only reflect the active
+    ' sheet). Fix in v1.1 with a synchronous extraction primitive.
 
     Dim allTableEntries As Object: Set allTableEntries = New Collection
     Dim sheetCounter As Long: sheetCounter = 0
@@ -952,32 +969,19 @@ Private Sub SaveMetaJson(path As String, ws As Worksheet, sheetId As Long, _
     obj("tabColor") = TabColorHex(ws)
     If IsNull(obj("tabColor")) Then obj("tabColor") = Null   ' explicit JSON null
 
-    ' Frozen panes
+    ' v1.0 limitation: showGridLines + frozenPanes are read from Window
+    ' properties below, which only reflect the sheet active in some Window
+    ' at export time -- all other sheets get default values. That causes
+    ' those fields to flap between sheets on every round-trip. v1.1 will
+    ' read <sheetView> from the OOXML extract (LoadSheetViews stub already
+    ' exists in this file) for stable per-sheet values.
+    Dim winShowsGridlines As Boolean: winShowsGridlines = True
     On Error Resume Next
-    Dim fzRows As Long: fzRows = 0
-    Dim fzCols As Long: fzCols = 0
-    If ActiveWindow Is Nothing Then
-        ' Reading freeze info needs an active window. Use the active window's
-        ' settings only if it's showing this sheet.
-    End If
-    On Error GoTo 0
-    ' Reliable approach: each Worksheet has its own SplitColumn/SplitRow/FreezePanes
-    ' on its visible Window, but VBA doesn't expose this without activating the
-    ' sheet. Skip frozen panes here for portability; can be added later.
-    ' (Scope-cut documented.)
-
-    ' Show gridlines (default true)
-    On Error Resume Next
-    Dim winShowsGridlines As Boolean
-    winShowsGridlines = True  ' default
-    ' Worksheet doesn't expose DisplayGridlines directly; it's on Window.
-    ' Iterate windows to find one showing this sheet.
     Dim w As Window
     For Each w In ws.Parent.Windows
         If Not w.ActiveSheet Is Nothing Then
             If w.ActiveSheet.Name = ws.Name Then
                 winShowsGridlines = w.DisplayGridlines
-                ' Also pick up frozen panes here while we're at it
                 If w.FreezePanes Then
                     Dim fzObj As Object: Set fzObj = CreateObject("Scripting.Dictionary")
                     If w.SplitColumn > 0 Then fzObj("xSplit") = w.SplitColumn
@@ -1099,10 +1103,13 @@ Private Function MakeColEntry(minCol As Long, maxCol As Long, width As Double, c
 End Function
 
 Private Sub SaveValidationsJson(path As String, ws As Worksheet, exported As Object)
-    ' Use Cell.Validation. Walk UsedRange, group by Validation.Formula1 + Type +
-    ' MergeAreas-style. Simpler approach: scan SpecialCells(xlCellTypeAllValidation),
-    ' group cells by (Type, Formula1, Formula2, ErrorTitle, ErrorMessage, etc.),
-    ' emit one entry per group with sqref = the union of cell addresses.
+    ' v1.0 limitation: SpecialCells(xlCellTypeAllValidation) returns 1004
+    ' "no cells found" in some Excel COM contexts even for sheets that
+    ' demonstrably have validations (confirmed via OOXML inspection of the
+    ' workbook). When that happens, validations.json is not written and
+    ' PruneStaleFiles deletes any stale copy from the previous PS-normaliser
+    ' run. v1.1 will read validations from xl/worksheets/sheetN.xml in the
+    ' OOXML extract (LoadSheetValidations stub already exists in this file).
     On Error GoTo Done
 
     Dim allV As Range
@@ -1863,6 +1870,231 @@ Done:
     Set LoadTableCalcFormulas = out
 End Function
 
+' Parse xl/workbook.xml + xl/_rels/workbook.xml.rels to get a {sheetName ->
+' "worksheets/sheetN.xml"} mapping. Standalone helper so the OOXML readers
+' (LoadSheetValidations, LoadSheetViews) don't depend on BuildDrawingImageMap
+' completing -- BuildDrawingImageMap's Shell.Application extraction wait is
+' fragile under COM and the function often returns early even though the
+' tempDir's xl/ tree finishes extracting in the background.
+Private Function LoadWorkbookSheetMap(tempDir As String) As Object
+    Dim out As Object: Set out = CreateObject("Scripting.Dictionary")
+    On Error GoTo Done
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    Dim wbXmlPath As String: wbXmlPath = tempDir & "\xl\workbook.xml"
+    Dim wbRelsPath As String: wbRelsPath = tempDir & "\xl\_rels\workbook.xml.rels"
+    ' Poll until both files appear (Shell.Application extraction is async).
+    Dim waitIter As Long: waitIter = 0
+    Do While (Not fso.FileExists(wbXmlPath) Or Not fso.FileExists(wbRelsPath)) And waitIter < 300
+        DoEvents
+        Dim spinT As Double: spinT = Timer
+        Do While Timer - spinT < 0.1 And Timer - spinT > -0.1
+        Loop
+        waitIter = waitIter + 1
+    Loop
+    If Not fso.FileExists(wbXmlPath) Or Not fso.FileExists(wbRelsPath) Then GoTo Done
+
+    Dim wbXml As Object: Set wbXml = LoadXmlFile(wbXmlPath)
+    Dim wbRels As Object: Set wbRels = LoadXmlFile(wbRelsPath)
+    If wbXml Is Nothing Or wbRels Is Nothing Then GoTo Done
+
+    Dim wbRelMap As Object: Set wbRelMap = CreateObject("Scripting.Dictionary")
+    Dim relNode As Object
+    For Each relNode In wbRels.documentElement.childNodes
+        Dim relId As String, relTgt As String
+        On Error Resume Next
+        relId = relNode.getAttribute("Id")
+        relTgt = relNode.getAttribute("Target")
+        On Error GoTo Done
+        If Len(relId) > 0 And Len(relTgt) > 0 Then wbRelMap(relId) = relTgt
+    Next
+
+    Dim sheetsNode As Object, sheetNode As Object
+    For Each sheetsNode In wbXml.documentElement.childNodes
+        If LCase$(localName(sheetsNode)) = "sheets" Then
+            For Each sheetNode In sheetsNode.childNodes
+                Dim sName As String, sRid As String
+                On Error Resume Next
+                sName = sheetNode.getAttribute("name")
+                sRid = sheetNode.getAttribute("r:id")
+                If Len(sRid) = 0 Then
+                    Dim att As Object
+                    For Each att In sheetNode.Attributes
+                        If LCase$(att.baseName) = "id" Then sRid = att.Value: Exit For
+                    Next
+                End If
+                On Error GoTo Done
+                If Len(sName) > 0 And Len(sRid) > 0 Then
+                    If wbRelMap.Exists(sRid) Then out(sName) = CStr(wbRelMap(sRid))
+                End If
+            Next
+            Exit For
+        End If
+    Next
+Done:
+    On Error Resume Next
+    Dim dFso As Object: Set dFso = CreateObject("Scripting.FileSystemObject")
+    Dim dTs As Object: Set dTs = dFso.CreateTextFile("C:\Users\ArnaudLavignolle\Dev\zinfra-psr\Excel\.diag_loaders.log", True)
+    dTs.WriteLine "LoadWorkbookSheetMap out.Count=" & out.Count
+    Dim dK As Variant
+    For Each dK In out.Keys
+        dTs.WriteLine "  " & CStr(dK) & " -> " & CStr(out(dK))
+    Next
+    dTs.Close
+    On Error GoTo 0
+    Set LoadWorkbookSheetMap = out
+End Function
+
+'====================  OOXML SHEET DATA-VALIDATIONS  =========
+' Reads xl/worksheets/sheetN.xml for each sheet, parses <dataValidations>,
+' and returns Dictionary keyed by Worksheet.Name -> Collection of
+' Scripting.Dictionary entries with the same shape SaveValidationsJson
+' emits (sqref, type, operator, allowBlank, showInputMessage,
+' showErrorMessage, errorTitle, error, promptTitle, prompt, formula1, formula2).
+'
+' Why OOXML and not Range.SpecialCells(xlCellTypeAllValidation): VBA's
+' SpecialCells returns 1004 "no cells found" for sheets that demonstrably
+' have validations when called in some Excel COM contexts. OOXML is the
+' authoritative source and matches what the old PowerShell normaliser saw.
+Private Function LoadSheetValidations(tempDir As String, sheetNameToTarget As Object) As Object
+    Dim out As Object: Set out = CreateObject("Scripting.Dictionary")
+    On Error GoTo Done
+    If sheetNameToTarget Is Nothing Then GoTo Done
+
+    Dim ns As String
+    ns = "xmlns:s='http://schemas.openxmlformats.org/spreadsheetml/2006/main'"
+
+    Dim shName As Variant
+    For Each shName In sheetNameToTarget.Keys
+        Dim relPath As String: relPath = Replace(CStr(sheetNameToTarget(shName)), "/", "\")
+        Dim sheetPath As String: sheetPath = tempDir & "\xl\" & relPath
+        On Error Resume Next
+        Dim doc As Object: Set doc = CreateObject("MSXML2.DOMDocument.6.0")
+        doc.async = False
+        doc.SetProperty "SelectionLanguage", "XPath"
+        doc.SetProperty "SelectionNamespaces", ns
+        doc.Load sheetPath
+        On Error GoTo Done
+        If doc Is Nothing Then GoTo NextSheet
+        If doc.parseError.errorCode <> 0 Then GoTo NextSheet
+
+        Dim dvNodes As Object: Set dvNodes = doc.SelectNodes("/s:worksheet/s:dataValidations/s:dataValidation")
+        If dvNodes Is Nothing Then GoTo NextSheet
+        If dvNodes.Length = 0 Then GoTo NextSheet
+
+        Dim entries As Object: Set entries = New Collection
+        Dim i As Long
+        For i = 0 To dvNodes.Length - 1
+            Dim dvNode As Object: Set dvNode = dvNodes.Item(i)
+            Dim entry As Object: Set entry = CreateObject("Scripting.Dictionary")
+
+            Dim sqref As String: sqref = GetAttr(dvNode, "sqref")
+            ' Translate OOXML's space-separated absolute refs to the same
+            ' space-separated form SaveValidationsJson emits.
+            entry("sqref") = sqref
+
+            Dim t As String: t = GetAttr(dvNode, "type")
+            If Len(t) > 0 Then entry("type") = t
+            Dim op As String: op = GetAttr(dvNode, "operator")
+            If Len(op) > 0 Then entry("operator") = op
+            If GetAttr(dvNode, "allowBlank") = "1" Then entry("allowBlank") = True
+            If GetAttr(dvNode, "showInputMessage") = "1" Then entry("showInputMessage") = True
+            If GetAttr(dvNode, "showErrorMessage") = "1" Then entry("showErrorMessage") = True
+            Dim et As String: et = GetAttr(dvNode, "errorTitle"): If Len(et) > 0 Then entry("errorTitle") = et
+            Dim em As String: em = GetAttr(dvNode, "error"): If Len(em) > 0 Then entry("error") = em
+            Dim pt As String: pt = GetAttr(dvNode, "promptTitle"): If Len(pt) > 0 Then entry("promptTitle") = pt
+            Dim pm As String: pm = GetAttr(dvNode, "prompt"): If Len(pm) > 0 Then entry("prompt") = pm
+
+            Dim f1Node As Object: Set f1Node = dvNode.SelectSingleNode("s:formula1")
+            If Not f1Node Is Nothing Then
+                Dim f1 As String: f1 = f1Node.Text
+                If Len(f1) > 0 Then entry("formula1") = f1
+            End If
+            Dim f2Node As Object: Set f2Node = dvNode.SelectSingleNode("s:formula2")
+            If Not f2Node Is Nothing Then
+                Dim f2 As String: f2 = f2Node.Text
+                If Len(f2) > 0 Then entry("formula2") = f2
+            End If
+
+            entries.Add entry
+        Next
+        If entries.Count > 0 Then Set out(CStr(shName)) = entries
+NextSheet:
+        Set doc = Nothing
+    Next
+Done:
+    Set LoadSheetValidations = out
+End Function
+
+'====================  OOXML SHEET VIEW SETTINGS  ============
+' Reads xl/worksheets/sheetN.xml for each sheet, parses the first
+' <sheetView> and any <pane>, returns Dictionary keyed by Worksheet.Name ->
+' Scripting.Dictionary { "showGridLines": Boolean (omitted if true/default),
+'                        "frozenPanes": { "xSplit": N, "ySplit": N } (if any) }.
+'
+' Why OOXML and not Window.DisplayGridlines / Window.FreezePanes: those
+' properties live on Excel's Window object, not the Worksheet, and only
+' reflect the sheet currently active in some Window. Per-sheet values for
+' inactive sheets come back wrong, which caused showGridLines and frozen
+' panes to flap between sheets on each round-trip.
+Private Function LoadSheetViews(tempDir As String, sheetNameToTarget As Object) As Object
+    Dim out As Object: Set out = CreateObject("Scripting.Dictionary")
+    On Error GoTo Done
+    If sheetNameToTarget Is Nothing Then GoTo Done
+
+    Dim ns As String
+    ns = "xmlns:s='http://schemas.openxmlformats.org/spreadsheetml/2006/main'"
+
+    Dim shName As Variant
+    For Each shName In sheetNameToTarget.Keys
+        Dim relPath As String: relPath = Replace(CStr(sheetNameToTarget(shName)), "/", "\")
+        Dim sheetPath As String: sheetPath = tempDir & "\xl\" & relPath
+        On Error Resume Next
+        Dim doc As Object: Set doc = CreateObject("MSXML2.DOMDocument.6.0")
+        doc.async = False
+        doc.SetProperty "SelectionLanguage", "XPath"
+        doc.SetProperty "SelectionNamespaces", ns
+        doc.Load sheetPath
+        On Error GoTo Done
+        If doc Is Nothing Then GoTo NextSheet
+        If doc.parseError.errorCode <> 0 Then GoTo NextSheet
+
+        Dim svNode As Object: Set svNode = doc.SelectSingleNode("/s:worksheet/s:sheetViews/s:sheetView")
+        If svNode Is Nothing Then GoTo NextSheet
+
+        Dim view As Object: Set view = CreateObject("Scripting.Dictionary")
+
+        ' showGridLines defaults to true; only present when explicitly "0"
+        If GetAttr(svNode, "showGridLines") = "0" Then view("showGridLines") = False
+
+        Dim paneNode As Object: Set paneNode = svNode.SelectSingleNode("s:pane")
+        If Not paneNode Is Nothing Then
+            ' OOXML emits state="frozen" for true freezes (state="split" is the
+            ' draggable-split case, which we don't surface)
+            If GetAttr(paneNode, "state") = "frozen" Then
+                Dim fz As Object: Set fz = CreateObject("Scripting.Dictionary")
+                Dim xs As String: xs = GetAttr(paneNode, "xSplit")
+                Dim ys As String: ys = GetAttr(paneNode, "ySplit")
+                If Len(xs) > 0 And CDbl(xs) > 0 Then fz("xSplit") = CLng(CDbl(xs))
+                If Len(ys) > 0 And CDbl(ys) > 0 Then fz("ySplit") = CLng(CDbl(ys))
+                If fz.Count > 0 Then Set view("frozenPanes") = fz
+            End If
+        End If
+
+        If view.Count > 0 Then Set out(CStr(shName)) = view
+NextSheet:
+        Set doc = Nothing
+    Next
+Done:
+    Set LoadSheetViews = out
+End Function
+
+Private Function GetAttr(node As Object, name As String) As String
+    On Error Resume Next
+    Dim a As Object: Set a = node.Attributes.getNamedItem(name)
+    If Not a Is Nothing Then GetAttr = a.Text Else GetAttr = ""
+    On Error GoTo 0
+End Function
+
 '====================  DRAWING IMAGE EXTRACTION  =============
 ' Unzip the workbook once via Shell.Application; parse rels chains to build
 ' a per-sheet map of (cNvPr name -> media filename), (positional pic list),
@@ -1915,17 +2147,19 @@ Private Function BuildDrawingImageMap(wb As Workbook) As Object
     If destNS Is Nothing Then GoTo Fail
     ' Flags 16 = "Respond with Yes to All", 4 = "Do not display progress"
     destNS.CopyHere zipNS.Items, 16 + 4
-    ' Shell.Application.CopyHere is async; wait until xl/ folder appears.
-    Dim waitMs As Long: waitMs = 0
-    Do While Not fso.FolderExists(tempDir & "\xl") And waitMs < 30000
-        Application.Wait Now + TimeSerial(0, 0, 1)
-        waitMs = waitMs + 1000
-    Loop
-    If Not fso.FolderExists(tempDir & "\xl") Then GoTo Fail
 
     ' --- Parse xl/workbook.xml + xl/_rels/workbook.xml.rels ---
     Dim wbXmlPath As String: wbXmlPath = tempDir & "\xl\workbook.xml"
     Dim wbRelsPath As String: wbRelsPath = tempDir & "\xl\_rels\workbook.xml.rels"
+    ' Shell.Application.CopyHere is async; poll for the specific files we need.
+    Dim waitIter As Long: waitIter = 0
+    Do While (Not fso.FileExists(wbXmlPath) Or Not fso.FileExists(wbRelsPath)) And waitIter < 300
+        DoEvents
+        Dim spinT As Double: spinT = Timer
+        Do While Timer - spinT < 0.1 And Timer - spinT > -0.1
+        Loop
+        waitIter = waitIter + 1
+    Loop
     If Not fso.FileExists(wbXmlPath) Or Not fso.FileExists(wbRelsPath) Then GoTo Fail
 
     Dim wbXml As Object: Set wbXml = LoadXmlFile(wbXmlPath)
@@ -1979,6 +2213,9 @@ Private Function BuildDrawingImageMap(wb As Workbook) As Object
             Exit For
         End If
     Next
+    ' (sheetNameToTarget no longer exposed on result -- LoadWorkbookSheetMap
+    ' is the standalone reader that the OOXML validations / sheetView path
+    ' uses, since BuildDrawingImageMap's Shell-Application wait is fragile.)
 
     ' --- For each sheet, find its drawing and copy its image rels ---
     Dim mediaSrcDir As String: mediaSrcDir = tempDir & "\xl\media"

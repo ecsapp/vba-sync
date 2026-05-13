@@ -130,12 +130,7 @@ Private Sub DoExportAddin()
         subDir = rootPath & CompFolder(comp.Type) & "\"
         EnsureFolder subDir
         fullPath = subDir & comp.Name & GetExt(comp.Type)
-        comp.Export fullPath
-        CleanExportedFile fullPath  ' Remove trailing empty lines
-        exported(AddSlash(fullPath)) = True
-        If comp.Type = vbext_ct_MSForm Then
-            exported(AddSlash(subDir & comp.Name & ".frx")) = True
-        End If
+        ExportComponent comp, fullPath, subDir, exported
 NextComponent:
     Next
 
@@ -189,12 +184,7 @@ Private Sub DoExportProject()
         subDir = rootPath & CompFolder(comp.Type) & "\"
         EnsureFolder subDir
         fullPath = subDir & comp.Name & GetExt(comp.Type)
-        comp.Export fullPath
-        CleanExportedFile fullPath  ' Remove trailing empty lines
-        exported(AddSlash(fullPath)) = True
-        If comp.Type = vbext_ct_MSForm Then
-            exported(AddSlash(subDir & comp.Name & ".frx")) = True
-        End If
+        ExportComponent comp, fullPath, subDir, exported
 NextComponent:
     Next
 
@@ -796,31 +786,142 @@ Private Function CleanCode(src As String) As String
 End Function
 
 ' Remove trailing empty lines from exported VBA files
+' Export one VBA component (.bas/.cls/.frm/.frx) to disk, with an extra
+' "is the new .frx essentially the same as the old one" guard for forms.
+' Excel rewrites a few metadata bytes inside .frx on every comp.Export even
+' when the form hasn't been touched; without this guard, .frx churn pollutes
+' every git diff. See FrxSubstantiallyEqual for the comparison heuristic.
+Private Sub ExportComponent(comp As Object, fullPath As String, subDir As String, exported As Object)
+    Dim oldFrxPath As String, hadOldFrx As Boolean, newFrx As String
+    If comp.Type = vbext_ct_MSForm Then
+        newFrx = subDir & comp.Name & ".frx"
+        If FileExistsLocal(newFrx) Then
+            oldFrxPath = newFrx & ".vbasync_prev"
+            CopyFileLocal newFrx, oldFrxPath
+            hadOldFrx = True
+        End If
+    End If
+
+    comp.Export fullPath
+    CleanExportedFile fullPath  ' Remove trailing empty lines + collapse .frm blanks
+
+    If comp.Type = vbext_ct_MSForm Then
+        If hadOldFrx Then
+            If FrxSubstantiallyEqual(oldFrxPath, newFrx) Then
+                ' Excel rewrote only a few metadata bytes; restore the
+                ' previous .frx so git sees no change.
+                CopyFileLocal oldFrxPath, newFrx
+            End If
+            On Error Resume Next: Kill oldFrxPath: On Error GoTo 0
+        End If
+        exported(AddSlash(newFrx)) = True
+    End If
+    exported(AddSlash(fullPath)) = True
+End Sub
+
+' Compare two .frx files byte-by-byte and return True if they're close
+' enough to be considered "unchanged". The format is OLE compound storage
+' with several volatile sections (Excel rewrites timestamps and internal
+' IDs on every comp.Export). Threshold: same length, < 2% bytes differ.
+' Real form-layout edits (move a control, add a property) change a much
+' larger fraction; metadata-only churn typically touches < 50 bytes.
+Private Function FrxSubstantiallyEqual(pathA As String, pathB As String) As Boolean
+    On Error GoTo Fail
+    Dim a() As Byte, b() As Byte
+    If Not FileExistsLocal(pathA) Or Not FileExistsLocal(pathB) Then Exit Function
+
+    Dim fnumA As Integer
+    fnumA = FreeFile
+    Open pathA For Binary Access Read As #fnumA
+    Dim sizeA As Long
+    sizeA = LOF(fnumA)
+    If sizeA > 0 Then
+        ReDim a(0 To sizeA - 1)
+        Get #fnumA, , a
+    End If
+    Close #fnumA
+
+    Dim fnumB As Integer
+    fnumB = FreeFile
+    Open pathB For Binary Access Read As #fnumB
+    Dim sizeB As Long
+    sizeB = LOF(fnumB)
+    If sizeB > 0 Then
+        ReDim b(0 To sizeB - 1)
+        Get #fnumB, , b
+    End If
+    Close #fnumB
+
+    If sizeA <> sizeB Then Exit Function
+    If sizeA = 0 Then
+        FrxSubstantiallyEqual = True
+        Exit Function
+    End If
+
+    Dim diff As Long, i As Long
+    For i = 0 To sizeA - 1
+        If a(i) <> b(i) Then diff = diff + 1
+    Next
+    ' < 2% byte-difference at the same length = metadata churn, not real edit.
+    FrxSubstantiallyEqual = (diff * 100 < sizeA * 2)
+    Exit Function
+Fail:
+    FrxSubstantiallyEqual = False
+End Function
+
+Private Function FileExistsLocal(p As String) As Boolean
+    On Error Resume Next
+    FileExistsLocal = (Len(Dir$(p)) > 0)
+    On Error GoTo 0
+End Function
+
+Private Sub CopyFileLocal(src As String, dst As String)
+    On Error Resume Next
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    fso.CopyFile src, dst, True
+    On Error GoTo 0
+End Sub
+
 Private Sub CleanExportedFile(filePath As String)
     On Error GoTo CleanError
-    
+
     Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
     If Not fso.FileExists(filePath) Then Exit Sub
-    
+
     ' Read the file content
     Dim content As String
     content = fso.OpenTextFile(filePath, 1).ReadAll
-    
+
+    ' For .frm files only: collapse runs of 3+ blank lines down to 1. VBA's
+    ' comp.Export writes the form code section with a chunk of blank lines
+    ' between the Attribute block and Option Explicit; comp.Import preserves
+    ' them, and on the next export Excel adds another. The result is one
+    ' extra blank line per round-trip, growing forever. Collapsing 3+ to 1
+    ' is convergent and leaves intentional 1- or 2-blank spacing alone.
+    If LCase$(Right$(filePath, 4)) = ".frm" Then
+        Dim re As Object: Set re = CreateObject("VBScript.RegExp")
+        re.Global = True
+        re.MultiLine = False
+        ' Match 3 or more consecutive vbCrLf -> collapse to 2 (one blank line).
+        re.Pattern = "(\r\n){3,}"
+        content = re.Replace(content, vbCrLf & vbCrLf)
+    End If
+
     ' Remove trailing empty lines (but preserve one final line break)
     Do While Right$(content, 4) = vbCrLf & vbCrLf
         content = Left$(content, Len(content) - 2)
     Loop
-    
+
     ' Ensure file ends with exactly one line break
     If Right$(content, 2) <> vbCrLf And Len(content) > 0 Then
         content = content & vbCrLf
     End If
-    
+
     ' Write back the cleaned content
     Dim ts As Object: Set ts = fso.CreateTextFile(filePath, True)
     ts.Write content
     ts.Close
-    
+
     Exit Sub
 CleanError:
     ' Continue silently if cleanup fails - don't break the export process
