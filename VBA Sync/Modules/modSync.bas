@@ -786,88 +786,200 @@ Private Function CleanCode(src As String) As String
 End Function
 
 ' Remove trailing empty lines from exported VBA files
-' Export one VBA component (.bas/.cls/.frm/.frx) to disk, with an extra
-' "is the new .frx essentially the same as the old one" guard for forms.
-' Excel rewrites a few metadata bytes inside .frx on every comp.Export even
-' when the form hasn't been touched; without this guard, .frx churn pollutes
-' every git diff. See FrxSubstantiallyEqual for the comparison heuristic.
+' Export one VBA component (.bas/.cls/.frm/.frx) to disk, with a stable
+' "did the form actually change" guard for MSForms.
+'
+' Why: Excel rewrites a small amount of metadata inside .frx on every
+' comp.Export even when the form was not touched (per MS-OFORMS the
+' format has unspecified padding bytes between aligned record fields,
+' and MSForms leaks uninitialised heap memory there). A naive byte-
+' comparison ALWAYS sees a difference; a percentage-threshold heuristic
+' is unsafe because real edits can also be small.
+'
+' Reliable approach (used by no other VBA-in-git tool, but recommended
+' after researching MS-OFORMS, MS-OVBA, and Rubberduck/vbaDeveloper/xltrail
+' practice): introspect comp.Designer.Controls to build a deterministic
+' "form fingerprint" string capturing what semantically defines the form,
+' hash it, and store the hash in a `<FormName>.frx.fingerprint` sidecar
+' that gets committed alongside the .frx. On the next export, recompute
+' the fingerprint; if it matches the stored sidecar, the new .frx is
+' guaranteed to represent the same form -- restore the previous .frx so
+' git sees no change. If the fingerprint differs, the form really changed
+' and the new .frx + new sidecar both get written.
+'
+' Edge case: forms with embedded Picture controls won't fingerprint the
+' picture bytes (only Picture.Width/Height/Type), so picture swaps will
+' look identical to the fingerprint. Acceptable scope cut for v1.0;
+' picture-change detection can be added later via OleSavePictureFile.
 Private Sub ExportComponent(comp As Object, fullPath As String, subDir As String, exported As Object)
-    Dim oldFrxPath As String, hadOldFrx As Boolean, newFrx As String
+    Dim oldFrxPath As String, hadOldFrx As Boolean, newFrx As String, fpPath As String
+    Dim oldFingerprint As String
+
     If comp.Type = vbext_ct_MSForm Then
         newFrx = subDir & comp.Name & ".frx"
+        fpPath = subDir & comp.Name & ".frx.fingerprint"
         If FileExistsLocal(newFrx) Then
             oldFrxPath = newFrx & ".vbasync_prev"
             CopyFileLocal newFrx, oldFrxPath
             hadOldFrx = True
         End If
+        If FileExistsLocal(fpPath) Then oldFingerprint = ReadAllText(fpPath)
     End If
 
     comp.Export fullPath
     CleanExportedFile fullPath  ' Remove trailing empty lines + collapse .frm blanks
 
     If comp.Type = vbext_ct_MSForm Then
+        Dim newFingerprint As String: newFingerprint = ComputeFormFingerprint(comp)
+        If hadOldFrx And Len(oldFingerprint) > 0 And newFingerprint = oldFingerprint Then
+            ' Form is semantically unchanged; restore the previous .frx so
+            ' git sees no change. Fingerprint sidecar already correct.
+            CopyFileLocal oldFrxPath, newFrx
+        ElseIf Len(newFingerprint) > 0 Then
+            ' Form changed (or first export). Write the new fingerprint
+            ' alongside the new .frx; both committed together.
+            WriteAllText fpPath, newFingerprint
+            exported(AddSlash(fpPath)) = True
+        End If
         If hadOldFrx Then
-            If FrxSubstantiallyEqual(oldFrxPath, newFrx) Then
-                ' Excel rewrote only a few metadata bytes; restore the
-                ' previous .frx so git sees no change.
-                CopyFileLocal oldFrxPath, newFrx
-            End If
             On Error Resume Next: Kill oldFrxPath: On Error GoTo 0
         End If
+        ' Always count the .frx and .fingerprint as "exported" so PruneStaleFiles
+        ' doesn't sweep them when the fingerprint matched (no new write).
         exported(AddSlash(newFrx)) = True
+        If FileExistsLocal(fpPath) Then exported(AddSlash(fpPath)) = True
     End If
     exported(AddSlash(fullPath)) = True
 End Sub
 
-' Compare two .frx files byte-by-byte and return True if they're close
-' enough to be considered "unchanged". The format is OLE compound storage
-' with several volatile sections (Excel rewrites timestamps and internal
-' IDs on every comp.Export). Threshold: same length, < 2% bytes differ.
-' Real form-layout edits (move a control, add a property) change a much
-' larger fraction; metadata-only churn typically touches < 50 bytes.
-Private Function FrxSubstantiallyEqual(pathA As String, pathB As String) As Boolean
+' Build a deterministic fingerprint of a UserForm's semantic content from
+' the in-memory Designer. Output is a multi-line text blob containing every
+' control's identifying properties, sorted by control name for stability.
+' Hash is the raw text (small forms) -- callers can SHA-256 it later if size
+' becomes a concern. Returns "" if the Designer can't be introspected
+' (typical for forms loaded but not designable in this VBE state).
+Private Function ComputeFormFingerprint(comp As Object) As String
     On Error GoTo Fail
-    Dim a() As Byte, b() As Byte
-    If Not FileExistsLocal(pathA) Or Not FileExistsLocal(pathB) Then Exit Function
+    Dim designer As Object
+    Set designer = comp.designer
+    If designer Is Nothing Then Exit Function
 
-    Dim fnumA As Integer
-    fnumA = FreeFile
-    Open pathA For Binary Access Read As #fnumA
-    Dim sizeA As Long
-    sizeA = LOF(fnumA)
-    If sizeA > 0 Then
-        ReDim a(0 To sizeA - 1)
-        Get #fnumA, , a
-    End If
-    Close #fnumA
+    Dim parts As New Collection
+    parts.Add "FORM|" & comp.Name & _
+              "|caption=" & SafeProp(designer, "Caption") & _
+              "|width=" & SafeProp(designer, "Width") & _
+              "|height=" & SafeProp(designer, "Height")
 
-    Dim fnumB As Integer
-    fnumB = FreeFile
-    Open pathB For Binary Access Read As #fnumB
-    Dim sizeB As Long
-    sizeB = LOF(fnumB)
-    If sizeB > 0 Then
-        ReDim b(0 To sizeB - 1)
-        Get #fnumB, , b
-    End If
-    Close #fnumB
-
-    If sizeA <> sizeB Then Exit Function
-    If sizeA = 0 Then
-        FrxSubstantiallyEqual = True
-        Exit Function
-    End If
-
-    Dim diff As Long, i As Long
-    For i = 0 To sizeA - 1
-        If a(i) <> b(i) Then diff = diff + 1
+    ' Collect control fingerprints, then sort by Name for determinism.
+    Dim ctlFps As New Collection
+    Dim ctl As Object
+    For Each ctl In designer.Controls
+        ctlFps.Add ControlFingerprint(ctl)
     Next
-    ' < 2% byte-difference at the same length = metadata churn, not real edit.
-    FrxSubstantiallyEqual = (diff * 100 < sizeA * 2)
+    Dim sorted() As String: sorted = SortStringCollectionToArray(ctlFps)
+    Dim i As Long
+    For i = LBound(sorted) To UBound(sorted)
+        parts.Add sorted(i)
+    Next
+
+    Dim out As String, p As Variant
+    For Each p In parts
+        out = out & CStr(p) & vbLf
+    Next
+    ComputeFormFingerprint = out
     Exit Function
 Fail:
-    FrxSubstantiallyEqual = False
+    ComputeFormFingerprint = ""
 End Function
+
+Private Function ControlFingerprint(ctl As Object) As String
+    On Error Resume Next
+    ControlFingerprint = "CTL|" & SafeProp(ctl, "Name") & _
+        "|type=" & TypeName(ctl) & _
+        "|top=" & SafeProp(ctl, "Top") & _
+        "|left=" & SafeProp(ctl, "Left") & _
+        "|width=" & SafeProp(ctl, "Width") & _
+        "|height=" & SafeProp(ctl, "Height") & _
+        "|tabIndex=" & SafeProp(ctl, "TabIndex") & _
+        "|caption=" & SafeProp(ctl, "Caption") & _
+        "|value=" & SafeProp(ctl, "Value") & _
+        "|tag=" & SafeProp(ctl, "Tag") & _
+        "|tooltip=" & SafeProp(ctl, "ControlTipText") & _
+        "|enabled=" & SafeProp(ctl, "Enabled") & _
+        "|visible=" & SafeProp(ctl, "Visible") & _
+        "|fontName=" & SafeProp(ctl, "Font.Name") & _
+        "|fontSize=" & SafeProp(ctl, "Font.Size") & _
+        "|fontBold=" & SafeProp(ctl, "Font.Bold")
+    On Error GoTo 0
+End Function
+
+' Read a property by name via late binding; tolerates missing properties.
+' Supports dotted access ("Font.Name") with one level of nesting.
+Private Function SafeProp(obj As Object, propName As String) As String
+    On Error Resume Next
+    Dim dotPos As Long: dotPos = InStr(propName, ".")
+    Dim result As Variant
+    If dotPos > 0 Then
+        Dim outer As String: outer = Left$(propName, dotPos - 1)
+        Dim inner As String: inner = Mid$(propName, dotPos + 1)
+        Dim outerObj As Object
+        Set outerObj = CallByName(obj, outer, VbGet)
+        If Not outerObj Is Nothing Then result = CallByName(outerObj, inner, VbGet)
+    Else
+        result = CallByName(obj, propName, VbGet)
+    End If
+    If IsObject(result) Then
+        SafeProp = "<obj>"
+    ElseIf IsNull(result) Or IsEmpty(result) Then
+        SafeProp = ""
+    Else
+        SafeProp = CStr(result)
+    End If
+    On Error GoTo 0
+End Function
+
+Private Function SortStringCollectionToArray(c As Collection) As String()
+    Dim n As Long: n = c.Count
+    Dim arr() As String
+    If n = 0 Then ReDim arr(0 To 0): arr(0) = "": SortStringCollectionToArray = arr: Exit Function
+    ReDim arr(0 To n - 1)
+    Dim i As Long: i = 0
+    Dim x As Variant
+    For Each x In c: arr(i) = CStr(x): i = i + 1: Next
+    ' Insertion sort -- small N (form control counts).
+    Dim j As Long, key As String
+    For i = 1 To n - 1
+        key = arr(i)
+        j = i - 1
+        Do While j >= 0
+            If arr(j) <= key Then Exit Do
+            arr(j + 1) = arr(j)
+            j = j - 1
+        Loop
+        arr(j + 1) = key
+    Next
+    SortStringCollectionToArray = arr
+End Function
+
+Private Function ReadAllText(path As String) As String
+    On Error GoTo Fail
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FileExists(path) Then Exit Function
+    Dim ts As Object: Set ts = fso.OpenTextFile(path, 1)
+    If Not ts.AtEndOfStream Then ReadAllText = ts.ReadAll
+    ts.Close
+    Exit Function
+Fail:
+    ReadAllText = ""
+End Function
+
+Private Sub WriteAllText(path As String, content As String)
+    On Error Resume Next
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    Dim ts As Object: Set ts = fso.CreateTextFile(path, True)
+    ts.Write content
+    ts.Close
+End Sub
 
 Private Function FileExistsLocal(p As String) As Boolean
     On Error Resume Next

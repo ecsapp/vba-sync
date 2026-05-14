@@ -207,24 +207,33 @@ Public Sub DoExportExcelStructure(wb As Workbook, rootPath As String, exported A
     ' Side-load calc-column formulas from xl/tables/*.xml. The same temp unzip
     ' BuildDrawingImageMap created above is reused. Map is empty if no tables
     ' or if the unzip failed; callers must check.
-    phase = "load-table-calc-formulas"
+    phase = "load-ooxml-side-data"
     Dim tableCalcFormulas As Object: Set tableCalcFormulas = CreateObject("Scripting.Dictionary")
+    Dim sheetValidations As Object: Set sheetValidations = CreateObject("Scripting.Dictionary")
+    Dim sheetViews As Object: Set sheetViews = CreateObject("Scripting.Dictionary")
     If Not drawingMap Is Nothing Then
         If drawingMap.Exists("tempDir") Then
             On Error Resume Next
-            Set tableCalcFormulas = LoadTableCalcFormulas(CStr(drawingMap("tempDir")))
+            Dim tempDirStr As String: tempDirStr = CStr(drawingMap("tempDir"))
+            Set tableCalcFormulas = LoadTableCalcFormulas(tempDirStr)
+            ' Prefer the sheet-name->OOXML-file map BuildDrawingImageMap
+            ' built (when it succeeded). Fall back to a standalone parse
+            ' (LoadWorkbookSheetMap) when it didn't. The OOXML validations +
+            ' sheetView readers need this mapping; without it they no-op
+            ' and the legacy VBA SpecialCells/Window probe paths
+            ' (SaveValidationsJson, SaveMetaJson) take over.
+            Dim sheetMap As Object
+            If drawingMap.Exists("sheetNameToTarget") Then
+                Set sheetMap = drawingMap("sheetNameToTarget")
+            End If
+            If sheetMap Is Nothing Then Set sheetMap = LoadWorkbookSheetMap(tempDirStr)
+            If sheetMap.Count > 0 Then
+                Set sheetValidations = LoadSheetValidations(tempDirStr, sheetMap)
+                Set sheetViews = LoadSheetViews(tempDirStr, sheetMap)
+            End If
             On Error GoTo Fail
         End If
     End If
-    ' NOTE: LoadSheetValidations / LoadSheetViews / LoadWorkbookSheetMap exist
-    ' in this module as v1.1 stubs. They are not wired into the export path
-    ' yet -- BuildDrawingImageMap's Shell.Application unzip wait is fragile
-    ' under COM (the per-sheet OOXML files sometimes haven't appeared by the
-    ' time the loaders run), which would cause validations.json + showGridLines
-    ' to flap silently. v1.0 keeps the existing VBA SpecialCells / Window probe
-    ' paths despite their known issues (SpecialCells often 1004s, and
-    ' Window.DisplayGridlines / Window.FreezePanes only reflect the active
-    ' sheet). Fix in v1.1 with a synchronous extraction primitive.
 
     Dim allTableEntries As Object: Set allTableEntries = New Collection
     Dim sheetCounter As Long: sheetCounter = 0
@@ -244,8 +253,12 @@ Public Sub DoExportExcelStructure(wb As Workbook, rootPath As String, exported A
                 End If
             End If
         End If
+        Dim wsValidations As Object: Set wsValidations = Nothing
+        If sheetValidations.Exists(ws.Name) Then Set wsValidations = sheetValidations(ws.Name)
+        Dim wsView As Object: Set wsView = Nothing
+        If sheetViews.Exists(ws.Name) Then Set wsView = sheetViews(ws.Name)
         g_sheetPhase = "init"
-        Set sheetEntries = ProcessWorksheet(ws, sheetIds(ws.Name), padWidth, worksheetsDir, exported, tableCalcFormulas, sheetDrawing)
+        Set sheetEntries = ProcessWorksheet(ws, sheetIds(ws.Name), padWidth, worksheetsDir, exported, tableCalcFormulas, sheetDrawing, wsValidations, wsView)
         If Err.Number <> 0 Then
             Dim sErr As String
             sErr = "VBA Sync: sheet '" & ws.Name & "' failed in '" & g_sheetPhase & "': " & _
@@ -324,7 +337,9 @@ End Sub
 Private Function ProcessWorksheet(ws As Worksheet, sheetId As Long, padWidth As Long, _
                                   worksheetsDir As String, exported As Object, _
                                   tableCalcFormulas As Object, _
-                                  Optional sheetDrawing As Object) As Object
+                                  Optional sheetDrawing As Object, _
+                                  Optional ooxmlValidations As Object, _
+                                  Optional ooxmlSheetView As Object) As Object
     Dim safeName As String: safeName = SafeFileName(ws.Name)
     Dim padded As String: padded = PadLeft(CStr(sheetId), padWidth, "0")
     Dim sheetFolder As String: sheetFolder = worksheetsDir & padded & " - " & safeName & "\"
@@ -421,11 +436,11 @@ Private Function ProcessWorksheet(ws As Worksheet, sheetId As Long, padWidth As 
     Next
 
     ' --- Write sheet-level files ---
-    g_sheetPhase = "save-meta":          SaveMetaJson sheetFolder & "_meta.json", ws, sheetId, tableRanges, exported
+    g_sheetPhase = "save-meta":          SaveMetaJson sheetFolder & "_meta.json", ws, sheetId, tableRanges, exported, ooxmlSheetView
     g_sheetPhase = "save-data-tsv":      SaveDataTsv sheetFolder & "data.tsv", cellValues, exported
     g_sheetPhase = "save-formulas":      SaveFormulasJson sheetFolder & "formulas.json", cellFormulas, exported
     g_sheetPhase = "save-styles":        SaveStylesJson sheetFolder & "styles.json", cellStyles, exported
-    g_sheetPhase = "save-validations":   SaveValidationsJson sheetFolder & "validations.json", ws, exported
+    g_sheetPhase = "save-validations":   SaveValidationsJson sheetFolder & "validations.json", ws, exported, ooxmlValidations
     g_sheetPhase = "save-cf":            SaveConditionalFormatsJson sheetFolder & "conditional_formats.json", ws, exported
     g_sheetPhase = "save-comments":      SaveCommentsJson sheetFolder & "comments.json", ws, exported
     g_sheetPhase = "save-drawings":      SaveDrawingsJson sheetFolder & "drawings\", ws, exported, sheetDrawing
@@ -960,7 +975,8 @@ Private Sub SaveStylesJson(path As String, cells As Object, exported As Object)
 End Sub
 
 Private Sub SaveMetaJson(path As String, ws As Worksheet, sheetId As Long, _
-                         tableRanges As Object, exported As Object)
+                         tableRanges As Object, exported As Object, _
+                         Optional ooxmlSheetView As Object)
     Dim obj As Object: Set obj = CreateObject("Scripting.Dictionary")
     obj("sheetId") = sheetId
     obj("name") = ws.Name
@@ -969,31 +985,36 @@ Private Sub SaveMetaJson(path As String, ws As Worksheet, sheetId As Long, _
     obj("tabColor") = TabColorHex(ws)
     If IsNull(obj("tabColor")) Then obj("tabColor") = Null   ' explicit JSON null
 
-    ' v1.0 limitation: showGridLines + frozenPanes are read from Window
-    ' properties below, which only reflect the sheet active in some Window
-    ' at export time -- all other sheets get default values. That causes
-    ' those fields to flap between sheets on every round-trip. v1.1 will
-    ' read <sheetView> from the OOXML extract (LoadSheetViews stub already
-    ' exists in this file) for stable per-sheet values.
-    Dim winShowsGridlines As Boolean: winShowsGridlines = True
-    On Error Resume Next
-    Dim w As Window
-    For Each w In ws.Parent.Windows
-        If Not w.ActiveSheet Is Nothing Then
-            If w.ActiveSheet.Name = ws.Name Then
-                winShowsGridlines = w.DisplayGridlines
-                If w.FreezePanes Then
-                    Dim fzObj As Object: Set fzObj = CreateObject("Scripting.Dictionary")
-                    If w.SplitColumn > 0 Then fzObj("xSplit") = w.SplitColumn
-                    If w.SplitRow > 0 Then fzObj("ySplit") = w.SplitRow
-                    If fzObj.Count > 0 Then Set obj("frozenPanes") = fzObj
+    ' Preferred path for showGridLines + frozenPanes: OOXML <sheetView> via
+    ' LoadSheetViews. The fallback below reads from Window.DisplayGridlines /
+    ' Window.FreezePanes, which only reflect the sheet currently active in
+    ' some Window -- everyone else gets default values. That used to cause
+    ' those fields to flap between sheets on every round-trip; OOXML gives
+    ' stable per-sheet values.
+    If Not ooxmlSheetView Is Nothing Then
+        If ooxmlSheetView.Exists("showGridLines") Then obj("showGridLines") = ooxmlSheetView("showGridLines")
+        If ooxmlSheetView.Exists("frozenPanes") Then Set obj("frozenPanes") = ooxmlSheetView("frozenPanes")
+    Else
+        Dim winShowsGridlines As Boolean: winShowsGridlines = True
+        On Error Resume Next
+        Dim w As Window
+        For Each w In ws.Parent.Windows
+            If Not w.ActiveSheet Is Nothing Then
+                If w.ActiveSheet.Name = ws.Name Then
+                    winShowsGridlines = w.DisplayGridlines
+                    If w.FreezePanes Then
+                        Dim fzObj As Object: Set fzObj = CreateObject("Scripting.Dictionary")
+                        If w.SplitColumn > 0 Then fzObj("xSplit") = w.SplitColumn
+                        If w.SplitRow > 0 Then fzObj("ySplit") = w.SplitRow
+                        If fzObj.Count > 0 Then Set obj("frozenPanes") = fzObj
+                    End If
+                    Exit For
                 End If
-                Exit For
             End If
-        End If
-    Next
-    On Error GoTo 0
-    If Not winShowsGridlines Then obj("showGridLines") = False
+        Next
+        On Error GoTo 0
+        If Not winShowsGridlines Then obj("showGridLines") = False
+    End If
 
     ' Columns (custom widths)
     Dim cols As Object: Set cols = New Collection
@@ -1102,15 +1123,25 @@ Private Function MakeColEntry(minCol As Long, maxCol As Long, width As Double, c
     Set MakeColEntry = e
 End Function
 
-Private Sub SaveValidationsJson(path As String, ws As Worksheet, exported As Object)
-    ' v1.0 limitation: SpecialCells(xlCellTypeAllValidation) returns 1004
+Private Sub SaveValidationsJson(path As String, ws As Worksheet, exported As Object, _
+                                Optional ooxmlValidations As Object)
+    ' Preferred path: OOXML-derived entries from LoadSheetValidations. Falls
+    ' back to Range.SpecialCells(xlCellTypeAllValidation) when the OOXML
+    ' map didn't cover this sheet -- SpecialCells is known to return 1004
     ' "no cells found" in some Excel COM contexts even for sheets that
-    ' demonstrably have validations (confirmed via OOXML inspection of the
-    ' workbook). When that happens, validations.json is not written and
-    ' PruneStaleFiles deletes any stale copy from the previous PS-normaliser
-    ' run. v1.1 will read validations from xl/worksheets/sheetN.xml in the
-    ' OOXML extract (LoadSheetValidations stub already exists in this file).
+    ' demonstrably have validations (confirmed via OOXML inspection on PSR
+    ' Template), but it's a useful belt-and-braces for sheets the OOXML
+    ' parse missed.
     On Error GoTo Done
+
+    If Not ooxmlValidations Is Nothing Then
+        If ooxmlValidations.Count > 0 Then
+            Dim ooxObj As Object: Set ooxObj = CreateObject("Scripting.Dictionary")
+            Set ooxObj("validations") = ooxmlValidations
+            WriteIfChanged path, JsonPretty(ooxObj), exported, False
+            Exit Sub
+        End If
+    End If
 
     Dim allV As Range
     On Error Resume Next
@@ -1883,8 +1914,10 @@ Private Function LoadWorkbookSheetMap(tempDir As String) As Object
     Dim wbXmlPath As String: wbXmlPath = tempDir & "\xl\workbook.xml"
     Dim wbRelsPath As String: wbRelsPath = tempDir & "\xl\_rels\workbook.xml.rels"
     ' Poll until both files appear (Shell.Application extraction is async).
+    ' If they don't show up in 5s the extraction probably failed entirely
+    ' and the legacy VBA paths in SaveValidationsJson / SaveMetaJson take over.
     Dim waitIter As Long: waitIter = 0
-    Do While (Not fso.FileExists(wbXmlPath) Or Not fso.FileExists(wbRelsPath)) And waitIter < 300
+    Do While (Not fso.FileExists(wbXmlPath) Or Not fso.FileExists(wbRelsPath)) And waitIter < 50
         DoEvents
         Dim spinT As Double: spinT = Timer
         Do While Timer - spinT < 0.1 And Timer - spinT > -0.1
@@ -1931,16 +1964,6 @@ Private Function LoadWorkbookSheetMap(tempDir As String) As Object
         End If
     Next
 Done:
-    On Error Resume Next
-    Dim dFso As Object: Set dFso = CreateObject("Scripting.FileSystemObject")
-    Dim dTs As Object: Set dTs = dFso.CreateTextFile("C:\Users\ArnaudLavignolle\Dev\zinfra-psr\Excel\.diag_loaders.log", True)
-    dTs.WriteLine "LoadWorkbookSheetMap out.Count=" & out.Count
-    Dim dK As Variant
-    For Each dK In out.Keys
-        dTs.WriteLine "  " & CStr(dK) & " -> " & CStr(out(dK))
-    Next
-    dTs.Close
-    On Error GoTo 0
     Set LoadWorkbookSheetMap = out
 End Function
 
@@ -2213,9 +2236,11 @@ Private Function BuildDrawingImageMap(wb As Workbook) As Object
             Exit For
         End If
     Next
-    ' (sheetNameToTarget no longer exposed on result -- LoadWorkbookSheetMap
-    ' is the standalone reader that the OOXML validations / sheetView path
-    ' uses, since BuildDrawingImageMap's Shell-Application wait is fragile.)
+    ' Expose the sheet-name -> OOXML-file map on the result so the OOXML
+    ' validations / sheetView readers can reuse it without re-parsing
+    ' workbook.xml. May be empty if BuildDrawingImageMap fails late in
+    ' the per-sheet rels loop -- callers must check.
+    Set result("sheetNameToTarget") = sheetNameToTarget
 
     ' --- For each sheet, find its drawing and copy its image rels ---
     Dim mediaSrcDir As String: mediaSrcDir = tempDir & "\xl\media"
