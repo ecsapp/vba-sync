@@ -985,35 +985,14 @@ Private Sub SaveMetaJson(path As String, ws As Worksheet, sheetId As Long, _
     obj("tabColor") = TabColorHex(ws)
     If IsNull(obj("tabColor")) Then obj("tabColor") = Null   ' explicit JSON null
 
-    ' Preferred path for showGridLines + frozenPanes: OOXML <sheetView> via
-    ' LoadSheetViews. The fallback below reads from Window.DisplayGridlines /
-    ' Window.FreezePanes, which only reflect the sheet currently active in
-    ' some Window -- everyone else gets default values. That used to cause
-    ' those fields to flap between sheets on every round-trip; OOXML gives
-    ' stable per-sheet values.
+    ' showGridLines + frozenPanes come from OOXML <sheetView> (LoadSheetViews
+    ' parses xl/worksheets/sheetN.xml in the synchronously-extracted temp dir).
+    ' No Window-probe fallback -- Window.DisplayGridlines / Window.FreezePanes
+    ' only reflect the sheet currently active in some Window, which made
+    ' those fields flap between sheets on every round-trip.
     If Not ooxmlSheetView Is Nothing Then
         If ooxmlSheetView.Exists("showGridLines") Then obj("showGridLines") = ooxmlSheetView("showGridLines")
         If ooxmlSheetView.Exists("frozenPanes") Then Set obj("frozenPanes") = ooxmlSheetView("frozenPanes")
-    Else
-        Dim winShowsGridlines As Boolean: winShowsGridlines = True
-        On Error Resume Next
-        Dim w As Window
-        For Each w In ws.Parent.Windows
-            If Not w.ActiveSheet Is Nothing Then
-                If w.ActiveSheet.Name = ws.Name Then
-                    winShowsGridlines = w.DisplayGridlines
-                    If w.FreezePanes Then
-                        Dim fzObj As Object: Set fzObj = CreateObject("Scripting.Dictionary")
-                        If w.SplitColumn > 0 Then fzObj("xSplit") = w.SplitColumn
-                        If w.SplitRow > 0 Then fzObj("ySplit") = w.SplitRow
-                        If fzObj.Count > 0 Then Set obj("frozenPanes") = fzObj
-                    End If
-                    Exit For
-                End If
-            End If
-        Next
-        On Error GoTo 0
-        If Not winShowsGridlines Then obj("showGridLines") = False
     End If
 
     ' Columns (custom widths)
@@ -1125,101 +1104,17 @@ End Function
 
 Private Sub SaveValidationsJson(path As String, ws As Worksheet, exported As Object, _
                                 Optional ooxmlValidations As Object)
-    ' Preferred path: OOXML-derived entries from LoadSheetValidations. Falls
-    ' back to Range.SpecialCells(xlCellTypeAllValidation) when the OOXML
-    ' map didn't cover this sheet -- SpecialCells is known to return 1004
-    ' "no cells found" in some Excel COM contexts even for sheets that
-    ' demonstrably have validations (confirmed via OOXML inspection on PSR
-    ' Template), but it's a useful belt-and-braces for sheets the OOXML
-    ' parse missed.
+    ' Validations come from OOXML (LoadSheetValidations parses
+    ' xl/worksheets/sheetN.xml in the synchronously-extracted temp dir).
+    ' No VBA SpecialCells fallback -- it returns 1004 in some COM contexts
+    ' even when validations exist, which silently dropped data.
     On Error GoTo Done
+    If ooxmlValidations Is Nothing Then Exit Sub
+    If ooxmlValidations.Count = 0 Then Exit Sub
 
-    If Not ooxmlValidations Is Nothing Then
-        If ooxmlValidations.Count > 0 Then
-            Dim ooxObj As Object: Set ooxObj = CreateObject("Scripting.Dictionary")
-            Set ooxObj("validations") = ooxmlValidations
-            WriteIfChanged path, JsonPretty(ooxObj), exported, False
-            Exit Sub
-        End If
-    End If
-
-    Dim allV As Range
-    On Error Resume Next
-    Set allV = ws.Cells.SpecialCells(xlCellTypeAllValidation)
-    On Error GoTo Done
-    If allV Is Nothing Then Exit Sub
-
-    Dim groups As Object: Set groups = CreateObject("Scripting.Dictionary")  ' key -> dict (entry skeleton + addresses list)
-    Dim area As Range
-    For Each area In allV.Areas
-        Dim firstCell As Range: Set firstCell = area.Cells(1, 1)
-        On Error Resume Next
-        Dim vt As Long: vt = firstCell.Validation.Type
-        Dim vOp As Long: vOp = firstCell.Validation.Operator
-        Dim vF1 As String: vF1 = firstCell.Validation.Formula1
-        Dim vF2 As String: vF2 = firstCell.Validation.Formula2
-        Dim vIgn As Boolean: vIgn = firstCell.Validation.IgnoreBlank
-        Dim vShowInp As Boolean: vShowInp = firstCell.Validation.ShowInput
-        Dim vShowErr As Boolean: vShowErr = firstCell.Validation.ShowError
-        Dim vErrTitle As String: vErrTitle = firstCell.Validation.ErrorTitle
-        Dim vErrMsg As String: vErrMsg = firstCell.Validation.ErrorMessage
-        Dim vPromptTitle As String: vPromptTitle = firstCell.Validation.InputTitle
-        Dim vPromptMsg As String: vPromptMsg = firstCell.Validation.InputMessage
-        On Error GoTo 0
-
-        Dim gkey As String
-        gkey = vt & "|" & vOp & "|" & vF1 & "|" & vF2 & "|" & CStr(vIgn) & "|" & _
-               CStr(vShowInp) & "|" & CStr(vShowErr) & "|" & vErrTitle & "|" & vErrMsg & _
-               "|" & vPromptTitle & "|" & vPromptMsg
-        If Not groups.Exists(gkey) Then
-            Dim grp As Object: Set grp = CreateObject("Scripting.Dictionary")
-            grp("type") = ValidationTypeString(vt)
-            grp("operator") = ValidationOperatorString(vOp)
-            grp("formula1") = vF1
-            grp("formula2") = vF2
-            grp("ignoreBlank") = vIgn
-            grp("showInput") = vShowInp
-            grp("showError") = vShowErr
-            grp("errorTitle") = vErrTitle
-            grp("errorMessage") = vErrMsg
-            grp("promptTitle") = vPromptTitle
-            grp("promptMessage") = vPromptMsg
-            Set grp("addresses") = New Collection
-            Set groups(gkey) = grp
-        End If
-        groups(gkey)("addresses").Add area.Address(False, False)
-    Next
-
-    If groups.Count = 0 Then Exit Sub
-
-    Dim list As Object: Set list = New Collection
-    Dim gk As Variant
-    For Each gk In groups.Keys
-        Dim g As Object: Set g = groups(gk)
-        Dim entry As Object: Set entry = CreateObject("Scripting.Dictionary")
-        ' Build sqref as space-separated address list (OOXML convention)
-        Dim sq As String: sq = JoinCollection(g("addresses"), " ")
-        entry("sqref") = sq
-        If Len(g("type")) > 0 Then entry("type") = g("type")
-        If Len(g("operator")) > 0 Then entry("operator") = g("operator")
-        If g("ignoreBlank") Then entry("allowBlank") = True
-        If g("showInput") Then entry("showInputMessage") = True
-        If g("showError") Then entry("showErrorMessage") = True
-        If Len(g("errorTitle")) > 0 Then entry("errorTitle") = g("errorTitle")
-        If Len(g("errorMessage")) > 0 Then entry("error") = g("errorMessage")
-        If Len(g("promptTitle")) > 0 Then entry("promptTitle") = g("promptTitle")
-        If Len(g("promptMessage")) > 0 Then entry("prompt") = g("promptMessage")
-        If Len(g("formula1")) > 0 Then entry("formula1") = g("formula1")
-        If Len(g("formula2")) > 0 Then entry("formula2") = g("formula2")
-        list.Add entry
-    Next
-
-    ' Sort by sqref
-    SortDictListBySqref list
-
-    Dim obj As Object: Set obj = CreateObject("Scripting.Dictionary")
-    Set obj("validations") = list
-    WriteIfChanged path, JsonPretty(obj), exported, False
+    Dim ooxObj As Object: Set ooxObj = CreateObject("Scripting.Dictionary")
+    Set ooxObj("validations") = ooxmlValidations
+    WriteIfChanged path, JsonPretty(ooxObj), exported, False
 Done:
 End Sub
 
@@ -1913,17 +1808,8 @@ Private Function LoadWorkbookSheetMap(tempDir As String) As Object
     Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
     Dim wbXmlPath As String: wbXmlPath = tempDir & "\xl\workbook.xml"
     Dim wbRelsPath As String: wbRelsPath = tempDir & "\xl\_rels\workbook.xml.rels"
-    ' Poll until both files appear (Shell.Application extraction is async).
-    ' If they don't show up in 5s the extraction probably failed entirely
-    ' and the legacy VBA paths in SaveValidationsJson / SaveMetaJson take over.
-    Dim waitIter As Long: waitIter = 0
-    Do While (Not fso.FileExists(wbXmlPath) Or Not fso.FileExists(wbRelsPath)) And waitIter < 50
-        DoEvents
-        Dim spinT As Double: spinT = Timer
-        Do While Timer - spinT < 0.1 And Timer - spinT > -0.1
-        Loop
-        waitIter = waitIter + 1
-    Loop
+    ' Extraction is synchronous (ExtractZipSynchronously) so files are on disk
+    ' by the time we get here; no polling needed.
     If Not fso.FileExists(wbXmlPath) Or Not fso.FileExists(wbRelsPath) Then GoTo Done
 
     Dim wbXml As Object: Set wbXml = LoadXmlFile(wbXmlPath)
@@ -2081,6 +1967,11 @@ Private Function LoadSheetViews(tempDir As String, sheetNameToTarget As Object) 
         If doc Is Nothing Then GoTo NextSheet
         If doc.parseError.errorCode <> 0 Then GoTo NextSheet
 
+        ' Per-sheet error tolerance: any failure inside the per-sheet block
+        ' should skip that sheet, not abort the whole loader. (Important
+        ' because VBA's And operator doesn't short-circuit, so naive
+        ' Len(s) > 0 And CDbl(s) > 0 raises type-mismatch on empty strings.)
+        On Error Resume Next
         Dim svNode As Object: Set svNode = doc.SelectSingleNode("/s:worksheet/s:sheetViews/s:sheetView")
         If svNode Is Nothing Then GoTo NextSheet
 
@@ -2091,14 +1982,14 @@ Private Function LoadSheetViews(tempDir As String, sheetNameToTarget As Object) 
 
         Dim paneNode As Object: Set paneNode = svNode.SelectSingleNode("s:pane")
         If Not paneNode Is Nothing Then
-            ' OOXML emits state="frozen" for true freezes (state="split" is the
-            ' draggable-split case, which we don't surface)
+            ' OOXML emits state="frozen" for true freezes (state="split" is
+            ' the draggable-split case, which we don't surface).
             If GetAttr(paneNode, "state") = "frozen" Then
                 Dim fz As Object: Set fz = CreateObject("Scripting.Dictionary")
                 Dim xs As String: xs = GetAttr(paneNode, "xSplit")
                 Dim ys As String: ys = GetAttr(paneNode, "ySplit")
-                If Len(xs) > 0 And CDbl(xs) > 0 Then fz("xSplit") = CLng(CDbl(xs))
-                If Len(ys) > 0 And CDbl(ys) > 0 Then fz("ySplit") = CLng(CDbl(ys))
+                If Len(xs) > 0 Then If CDbl(xs) > 0 Then fz("xSplit") = CLng(CDbl(xs))
+                If Len(ys) > 0 Then If CDbl(ys) > 0 Then fz("ySplit") = CLng(CDbl(ys))
                 If fz.Count > 0 Then Set view("frozenPanes") = fz
             End If
         End If
@@ -2107,6 +1998,7 @@ Private Function LoadSheetViews(tempDir As String, sheetNameToTarget As Object) 
 NextSheet:
         Set doc = Nothing
     Next
+    On Error GoTo Done
 Done:
     Set LoadSheetViews = out
 End Function
@@ -2162,27 +2054,16 @@ Private Function BuildDrawingImageMap(wb As Workbook) As Object
     End If
     On Error GoTo Fail
 
-    ' --- Extract via Shell.Application ---
-    Dim shellApp As Object: Set shellApp = CreateObject("Shell.Application")
-    Dim zipNS As Object: Set zipNS = shellApp.Namespace(zipPath)
-    If zipNS Is Nothing Then GoTo Fail
-    Dim destNS As Object: Set destNS = shellApp.Namespace(tempDir)
-    If destNS Is Nothing Then GoTo Fail
-    ' Flags 16 = "Respond with Yes to All", 4 = "Do not display progress"
-    destNS.CopyHere zipNS.Items, 16 + 4
+    ' --- Extract synchronously via PowerShell Expand-Archive ---
+    ' Earlier versions used Shell.Application.CopyHere, which is async --
+    ' the call returned immediately and downstream readers raced against
+    ' partially-extracted files, making validations + sheetView reads
+    ' unreliable. WshShell.Run with WaitOnReturn = True blocks until
+    ' PowerShell finishes; by the time it returns, every file is on disk.
+    ExtractZipSynchronously zipPath, tempDir
 
-    ' --- Parse xl/workbook.xml + xl/_rels/workbook.xml.rels ---
     Dim wbXmlPath As String: wbXmlPath = tempDir & "\xl\workbook.xml"
     Dim wbRelsPath As String: wbRelsPath = tempDir & "\xl\_rels\workbook.xml.rels"
-    ' Shell.Application.CopyHere is async; poll for the specific files we need.
-    Dim waitIter As Long: waitIter = 0
-    Do While (Not fso.FileExists(wbXmlPath) Or Not fso.FileExists(wbRelsPath)) And waitIter < 300
-        DoEvents
-        Dim spinT As Double: spinT = Timer
-        Do While Timer - spinT < 0.1 And Timer - spinT > -0.1
-        Loop
-        waitIter = waitIter + 1
-    Loop
     If Not fso.FileExists(wbXmlPath) Or Not fso.FileExists(wbRelsPath) Then GoTo Fail
 
     Dim wbXml As Object: Set wbXml = LoadXmlFile(wbXmlPath)
@@ -2422,6 +2303,33 @@ Private Function localName(node As Object) As String
     If p > 0 Then bn = Mid$(bn, p + 1)
     localName = bn
 End Function
+
+' Synchronously extract a .zip into a destination folder via PowerShell's
+' Expand-Archive. Used by BuildDrawingImageMap to unzip the workbook's OOXML
+' contents -- earlier versions used Shell.Application.CopyHere, but that's
+' asynchronous and made downstream OOXML reads (validations, sheetView,
+' table calc formulas) race against partially-extracted files. WshShell.Run
+' with WaitOnReturn = True blocks until the extraction completes, so by
+' the time this returns every file is on disk.
+'
+' Raises if PowerShell is missing/blocked OR Expand-Archive fails. The
+' surrounding On Error GoTo Fail handler catches that and the export
+' surfaces the error via .export_error.log + the existing MsgBox path.
+Private Sub ExtractZipSynchronously(zipPath As String, destDir As String)
+    Dim wsh As Object: Set wsh = CreateObject("WScript.Shell")
+    Dim cmd As String
+    cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command " & _
+          """Expand-Archive -LiteralPath '" & zipPath & _
+          "' -DestinationPath '" & destDir & "' -Force"""
+    ' Run hidden, wait for completion. Returns the process exit code.
+    Dim exitCode As Long
+    exitCode = wsh.Run(cmd, 0, True)
+    If exitCode <> 0 Then
+        Err.Raise vbObjectError + 9001, "ExtractZipSynchronously", _
+                  "PowerShell Expand-Archive failed (exit " & exitCode & _
+                  "). Source=" & zipPath & " Dest=" & destDir
+    End If
+End Sub
 
 ' Load a small XML file via MSXML2.DOMDocument. Returns Nothing on parse failure.
 Private Function LoadXmlFile(path As String) As Object
