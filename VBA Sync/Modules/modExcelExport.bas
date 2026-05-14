@@ -1,8 +1,7 @@
 Attribute VB_Name = "modExcelExport"
 Option Explicit
 
-' Win32 Sleep for polling extraction async. Application.Wait does not work
-' reliably under COM-driven Excel (no message pump in headless sessions).
+' Sleep, retained from earlier debug; not currently used.
 #If VBA7 Then
     Public Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
 #Else
@@ -77,12 +76,56 @@ Option Explicit
 ' which sub-step raised, not just the sheet name.
 Private g_sheetPhase As String
 
+' Cumulative per-phase timings (label -> seconds). Reset at start of each
+' DoExportExcelStructure call. Dumped to .export_timing.log on success.
+Private g_Timings As Object
+Private g_TimingsT0 As Double
+
+Private Sub TimingsInit()
+    Set g_Timings = CreateObject("Scripting.Dictionary")
+    g_TimingsT0 = Timer
+End Sub
+Private Sub TimingsAdd(label As String, t0 As Double)
+    If g_Timings Is Nothing Then Exit Sub
+    Dim dur As Double: dur = Timer - t0
+    If dur < 0 Then dur = dur + 86400
+    If g_Timings.Exists(label) Then
+        g_Timings(label) = CDbl(g_Timings(label)) + dur
+    Else
+        g_Timings(label) = dur
+    End If
+End Sub
+Private Sub TimingsDump(path As String)
+    If g_Timings Is Nothing Then Exit Sub
+    On Error Resume Next
+    Dim total As Double: total = Timer - g_TimingsT0
+    If total < 0 Then total = total + 86400
+    Dim keys As Variant: keys = g_Timings.Keys
+    Dim vals As Variant: vals = g_Timings.Items
+    Dim i As Long, j As Long, n As Long: n = g_Timings.Count
+    For i = 0 To n - 2
+        For j = 0 To n - 2 - i
+            If CDbl(vals(j)) < CDbl(vals(j + 1)) Then
+                Dim tk As Variant: tk = keys(j): keys(j) = keys(j + 1): keys(j + 1) = tk
+                Dim tv As Variant: tv = vals(j): vals(j) = vals(j + 1): vals(j + 1) = tv
+            End If
+        Next
+    Next
+    Dim fnum As Integer: fnum = FreeFile
+    Open path For Output As #fnum
+    Print #fnum, "label,seconds"
+    For i = 0 To n - 1: Print #fnum, keys(i) & "," & Format(CDbl(vals(i)), "0.000"): Next
+    Print #fnum, "TOTAL," & Format(total, "0.000")
+    Close #fnum
+End Sub
+
 '====================  PUBLIC ENTRY  =======================
 Public Sub DoExportExcelStructure(wb As Workbook, rootPath As String, exported As Object)
     On Error GoTo Fail
 
     Dim excelDir As String: excelDir = rootPath & "Excel\"
     EnsureFolder excelDir
+    TimingsInit
 
     ' Clear stale logs from any previous run so the end-of-export summary
     ' reflects only this invocation's failures.
@@ -195,6 +238,7 @@ Public Sub DoExportExcelStructure(wb As Workbook, rootPath As String, exported A
     phase = "build-drawing-map"
     Application.StatusBar = "VBA Sync: extracting drawing image map..."
     Dim drawingMap As Object: Set drawingMap = Nothing
+    Dim tBDM As Double: tBDM = Timer
     On Error Resume Next
     Set drawingMap = BuildDrawingImageMap(wb)
     If Err.Number <> 0 Then
@@ -203,6 +247,7 @@ Public Sub DoExportExcelStructure(wb As Workbook, rootPath As String, exported A
         Set drawingMap = Nothing
     End If
     On Error GoTo Fail
+    TimingsAdd "build-drawing-map", tBDM
 
     ' Side-load calc-column formulas from xl/tables/*.xml. The same temp unzip
     ' BuildDrawingImageMap created above is reused. Map is empty if no tables
@@ -215,21 +260,21 @@ Public Sub DoExportExcelStructure(wb As Workbook, rootPath As String, exported A
         If drawingMap.Exists("tempDir") Then
             On Error Resume Next
             Dim tempDirStr As String: tempDirStr = CStr(drawingMap("tempDir"))
+            Dim tCalc As Double: tCalc = Timer
             Set tableCalcFormulas = LoadTableCalcFormulas(tempDirStr)
-            ' Prefer the sheet-name->OOXML-file map BuildDrawingImageMap
-            ' built (when it succeeded). Fall back to a standalone parse
-            ' (LoadWorkbookSheetMap) when it didn't. The OOXML validations +
-            ' sheetView readers need this mapping; without it they no-op
-            ' and the legacy VBA SpecialCells/Window probe paths
-            ' (SaveValidationsJson, SaveMetaJson) take over.
+            TimingsAdd "load-table-calc-formulas", tCalc
             Dim sheetMap As Object
             If drawingMap.Exists("sheetNameToTarget") Then
                 Set sheetMap = drawingMap("sheetNameToTarget")
             End If
             If sheetMap Is Nothing Then Set sheetMap = LoadWorkbookSheetMap(tempDirStr)
             If sheetMap.Count > 0 Then
+                Dim tVal As Double: tVal = Timer
                 Set sheetValidations = LoadSheetValidations(tempDirStr, sheetMap)
+                TimingsAdd "load-sheet-validations", tVal
+                Dim tSV As Double: tSV = Timer
                 Set sheetViews = LoadSheetViews(tempDirStr, sheetMap)
+                TimingsAdd "load-sheet-views", tSV
             End If
             On Error GoTo Fail
         End If
@@ -258,7 +303,9 @@ Public Sub DoExportExcelStructure(wb As Workbook, rootPath As String, exported A
         Dim wsView As Object: Set wsView = Nothing
         If sheetViews.Exists(ws.Name) Then Set wsView = sheetViews(ws.Name)
         g_sheetPhase = "init"
+        Dim tPS As Double: tPS = Timer
         Set sheetEntries = ProcessWorksheet(ws, sheetIds(ws.Name), padWidth, worksheetsDir, exported, tableCalcFormulas, sheetDrawing, wsValidations, wsView)
+        TimingsAdd "per-sheet-loop", tPS
         If Err.Number <> 0 Then
             Dim sErr As String
             sErr = "VBA Sync: sheet '" & ws.Name & "' failed in '" & g_sheetPhase & "': " & _
@@ -296,6 +343,7 @@ Public Sub DoExportExcelStructure(wb As Workbook, rootPath As String, exported A
     ' Write MANIFEST.json LAST (tables array now populated)
     phase = "write-manifest"
     WriteIfChanged excelDir & "MANIFEST.json", JsonPretty(manifest), exported, False
+    TimingsDump excelDir & ".export_timing.log"
 
     ' Post-export sanity check: every per-sheet folder must have _meta.json.
     ' Empty folders mean the sheet was processed but failed to write — either
@@ -436,15 +484,16 @@ Private Function ProcessWorksheet(ws As Worksheet, sheetId As Long, padWidth As 
     Next
 
     ' --- Write sheet-level files ---
-    g_sheetPhase = "save-meta":          SaveMetaJson sheetFolder & "_meta.json", ws, sheetId, tableRanges, exported, ooxmlSheetView
-    g_sheetPhase = "save-data-tsv":      SaveDataTsv sheetFolder & "data.tsv", cellValues, exported
-    g_sheetPhase = "save-formulas":      SaveFormulasJson sheetFolder & "formulas.json", cellFormulas, exported
-    g_sheetPhase = "save-styles":        SaveStylesJson sheetFolder & "styles.json", cellStyles, exported
-    g_sheetPhase = "save-validations":   SaveValidationsJson sheetFolder & "validations.json", ws, exported, ooxmlValidations
-    g_sheetPhase = "save-cf":            SaveConditionalFormatsJson sheetFolder & "conditional_formats.json", ws, exported
-    g_sheetPhase = "save-comments":      SaveCommentsJson sheetFolder & "comments.json", ws, exported
-    g_sheetPhase = "save-drawings":      SaveDrawingsJson sheetFolder & "drawings\", ws, exported, sheetDrawing
-    g_sheetPhase = "export-charts":      ExportCharts sheetFolder & "charts\", ws, exported
+    Dim tW As Double
+    g_sheetPhase = "save-meta": tW = Timer:        SaveMetaJson sheetFolder & "_meta.json", ws, sheetId, tableRanges, exported, ooxmlSheetView: TimingsAdd "ws:save-meta", tW
+    g_sheetPhase = "save-data-tsv": tW = Timer:    SaveDataTsv sheetFolder & "data.tsv", cellValues, exported: TimingsAdd "ws:save-data-tsv", tW
+    g_sheetPhase = "save-formulas": tW = Timer:    SaveFormulasJson sheetFolder & "formulas.json", cellFormulas, exported: TimingsAdd "ws:save-formulas", tW
+    g_sheetPhase = "save-styles": tW = Timer:      SaveStylesJson sheetFolder & "styles.json", cellStyles, exported: TimingsAdd "ws:save-styles", tW
+    g_sheetPhase = "save-validations": tW = Timer: SaveValidationsJson sheetFolder & "validations.json", ws, exported, ooxmlValidations: TimingsAdd "ws:save-validations", tW
+    g_sheetPhase = "save-cf": tW = Timer:          SaveConditionalFormatsJson sheetFolder & "conditional_formats.json", ws, exported: TimingsAdd "ws:save-cf", tW
+    g_sheetPhase = "save-comments": tW = Timer:    SaveCommentsJson sheetFolder & "comments.json", ws, exported: TimingsAdd "ws:save-comments", tW
+    g_sheetPhase = "save-drawings": tW = Timer:    SaveDrawingsJson sheetFolder & "drawings\", ws, exported, sheetDrawing: TimingsAdd "ws:save-drawings", tW
+    g_sheetPhase = "export-charts": tW = Timer:    ExportCharts sheetFolder & "charts\", ws, exported: TimingsAdd "ws:export-charts", tW
 
     g_sheetPhase = "done"
     Set ProcessWorksheet = tableEntries
@@ -1371,19 +1420,14 @@ Private Sub SaveDrawingsJson(drawingsDir As String, ws As Worksheet, exported As
                     Dim dst As String: dst = assetsDir & CStr(mk)
                     On Error Resume Next
                     If fso.FileExists(src) Then
-                        ' Copy if missing or size differs (cheap content check).
                         Dim doCopy As Boolean: doCopy = True
                         If fso.FileExists(dst) Then
                             If fso.GetFile(dst).Size = fso.GetFile(src).Size Then
                                 doCopy = False
                             End If
                         End If
-                        If doCopy Then
-                            fso.CopyFile src, dst, True
-                        End If
-                        If Not exported Is Nothing Then
-                            exported(dst) = True
-                        End If
+                        If doCopy Then fso.CopyFile src, dst, True
+                        If Not exported Is Nothing Then exported(dst) = True
                     End If
                     On Error GoTo 0
                 Next
@@ -2316,18 +2360,23 @@ End Function
 ' surrounding On Error GoTo Fail handler catches that and the export
 ' surfaces the error via .export_error.log + the existing MsgBox path.
 Private Sub ExtractZipSynchronously(zipPath As String, destDir As String)
+    ' tar.exe (bsdtar/libarchive) ships with Windows 10 1803+ and extracts
+    ' .zip archives. Much faster than `powershell -Command Expand-Archive`
+    ' (no .NET CLR cold start; ~150ms instead of ~5-20s). Same shape:
+    ' WshShell.Run with WaitOnReturn = True blocks until tar finishes;
+    ' files are guaranteed on disk when this returns.
+    Dim tEx As Double: tEx = Timer
     Dim wsh As Object: Set wsh = CreateObject("WScript.Shell")
     Dim cmd As String
-    cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command " & _
-          """Expand-Archive -LiteralPath '" & zipPath & _
-          "' -DestinationPath '" & destDir & "' -Force"""
-    ' Run hidden, wait for completion. Returns the process exit code.
+    cmd = "cmd /c tar.exe -xf """ & zipPath & """ -C """ & destDir & """"
     Dim exitCode As Long
     exitCode = wsh.Run(cmd, 0, True)
+    TimingsAdd "extract-zip", tEx
     If exitCode <> 0 Then
         Err.Raise vbObjectError + 9001, "ExtractZipSynchronously", _
-                  "PowerShell Expand-Archive failed (exit " & exitCode & _
-                  "). Source=" & zipPath & " Dest=" & destDir
+                  "tar.exe extract failed (exit " & exitCode & _
+                  "). Source=" & zipPath & " Dest=" & destDir & _
+                  ". Requires Windows 10 1803+."
     End If
 End Sub
 
