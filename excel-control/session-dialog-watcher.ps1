@@ -22,6 +22,8 @@ using System.Runtime.InteropServices;
 using System.Text;
 
 namespace XcDialog {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
   public static class Win32 {
     [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
     [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern int GetWindowTextLength(IntPtr hWnd);
@@ -34,15 +36,19 @@ namespace XcDialog {
     [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")] public static extern int GetDlgCtrlID(IntPtr hwndCtl);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+    [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
     public const uint BM_CLICK = 0x00F5;
     public const uint WM_COMMAND = 0x0111;
     public const uint WM_CLOSE = 0x0010;
     public const uint WM_KEYDOWN = 0x0100;
     public const uint WM_KEYUP = 0x0101;
     public const int VK_RETURN = 0x0D;
+    public const uint PW_RENDERFULLCONTENT = 0x2;
   }
 }
 "@
+  Add-Type -AssemblyName System.Drawing
 }
 
 function Start-SessionDialogWatcher {
@@ -50,6 +56,7 @@ function Start-SessionDialogWatcher {
         [Parameter(Mandatory=$true)] [uint32]$ProcessId,
         [Parameter(Mandatory=$true)] [string]$EventsFile,
         [Parameter(Mandatory=$true)] [string]$CommandsFile,
+        [Parameter(Mandatory=$true)] [string]$CapturesDir,
         [int]$PollMs = 200
     )
 
@@ -58,6 +65,7 @@ function Start-SessionDialogWatcher {
         ProcessId     = $ProcessId
         EventsFile    = $EventsFile
         CommandsFile  = $CommandsFile
+        CapturesDir   = $CapturesDir
         PollMs        = $PollMs
         ActiveDialogs = [hashtable]::Synchronized(@{})
         DialogInfo    = [hashtable]::Synchronized(@{})
@@ -73,13 +81,15 @@ function Start-SessionDialogWatcher {
     $ps.Runspace = $rs
 
     [void]$ps.AddScript({
-        # Re-declare Win32 inside the runspace
+        # Re-declare Win32 inside the runspace (includes capture types)
         if (-not ([System.Management.Automation.PSTypeName]'XcDialog.Win32').Type) {
             Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
 namespace XcDialog {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
   public static class Win32 {
     [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
     [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern int GetWindowTextLength(IntPtr hWnd);
@@ -92,15 +102,37 @@ namespace XcDialog {
     [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
     [DllImport("user32.dll")] public static extern int GetDlgCtrlID(IntPtr hwndCtl);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+    [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
     public const uint BM_CLICK = 0x00F5;
     public const uint WM_COMMAND = 0x0111;
     public const uint WM_CLOSE = 0x0010;
     public const uint WM_KEYDOWN = 0x0100;
     public const uint WM_KEYUP = 0x0101;
     public const int VK_RETURN = 0x0D;
+    public const uint PW_RENDERFULLCONTENT = 0x2;
   }
 }
 "@
+            Add-Type -AssemblyName System.Drawing
+        }
+
+        function Capture-WindowPng([int64]$Hwnd, [string]$Path) {
+            $h = [IntPtr]$Hwnd
+            if (-not [XcDialog.Win32]::IsWindow($h)) { return $null }
+            $rect = New-Object XcDialog.RECT
+            [void][XcDialog.Win32]::GetWindowRect($h, [ref]$rect)
+            $w = $rect.Right - $rect.Left
+            $hgt = $rect.Bottom - $rect.Top
+            if ($w -le 0 -or $hgt -le 0) { return $null }
+            $bmp = New-Object System.Drawing.Bitmap $w, $hgt
+            $g   = [System.Drawing.Graphics]::FromImage($bmp)
+            $hdc = $g.GetHdc()
+            try { [void][XcDialog.Win32]::PrintWindow($h, $hdc, [XcDialog.Win32]::PW_RENDERFULLCONTENT) }
+            finally { $g.ReleaseHdc($hdc); $g.Dispose() }
+            $bmp.Save($Path, [System.Drawing.Imaging.ImageFormat]::Png)
+            $bmp.Dispose()
+            return $Path
         }
 
         function Get-WText([IntPtr]$h) {
@@ -260,14 +292,26 @@ namespace XcDialog {
 
                 $buttonNames = @($payload.Buttons | ForEach-Object { $_.Caption })
                 $eventType = if ($cls -eq 'ThunderDFrame' -or $cls -like 'F3*' -or $cls -like 'bosa*') { 'userform_appeared' } else { 'dialog_appeared' }
-                Append-Event @{
+                # Snapshot the dialog. PrintWindow works even when the
+                # dialog is partially obscured by other windows.
+                $shotPath = $null
+                $shotErr  = $null
+                try {
+                    $shotPath = Join-Path $state.CapturesDir "$id.png"
+                    [void](Capture-WindowPng -Hwnd $hwnd.ToInt64() -Path $shotPath)
+                    if (-not (Test-Path $shotPath)) { $shotPath = $null; $shotErr = 'png not written' }
+                } catch { $shotPath = $null; $shotErr = $_.Exception.Message }
+                $ev = @{
                     t = $eventType
                     id = $id
                     title = $caption
                     text = $payload.Body
                     buttons = $buttonNames
                     class = $cls
+                    screenshot = $shotPath
                 }
+                if ($shotErr) { $ev.screenshot_error = $shotErr }
+                Append-Event $ev
             }
 
             # Externally-closed dialogs

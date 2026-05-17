@@ -94,6 +94,35 @@ Event stream:
 | `dialog_closed_externally` | `id` (dialog id) | A dialog vanished without a `respond_dialog` command (user closed it, macro ended) |
 | `respond_failed` | `id`, `dialog_id`, `reason` | Watcher could not dispatch the click (unknown id, dialog didn't close) |
 
+## `screenshot`
+
+Capture the Excel main window, a specific worksheet, or an open
+dialog/form to PNG.
+
+```json
+{"id":"c5","cmd":"screenshot","target":"window"}
+{"id":"c6","cmd":"screenshot","target":"worksheet:Dashboard"}
+{"id":"c7","cmd":"screenshot","target":"dialog:d7"}
+{"id":"c8","cmd":"screenshot","target":"form:d9"}
+```
+
+Event:
+
+```json
+{"t":"screenshot_captured","id":"c5","target":"window","path":"captures/shot_c5.png","width":1920,"height":1200}
+```
+
+Mechanism: `dialog:` / `form:` targets use Win32 `PrintWindow` which
+captures even when the target is obscured. `window` / `worksheet:`
+targets capture the Excel main window region. Headless sessions
+(`xl.Visible = false`) produce small, mostly-empty captures of the main
+window — set the visibility on by editing `start-session.ps1` if you
+want meaningful worksheet captures.
+
+Every `dialog_appeared` and `userform_appeared` event already carries a
+`screenshot` field pointing to a PNG captured at the moment the dialog
+was reported. No second command needed for those.
+
 ## `respond_dialog`
 
 Click a named button on an open dialog.

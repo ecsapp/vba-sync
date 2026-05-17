@@ -30,6 +30,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 . (Join-Path $PSScriptRoot 'session-dialog-watcher.ps1')
+. (Join-Path $PSScriptRoot 'capture.ps1')
 
 # Win32 declaration to grab Excel's PID from its HWND
 if (-not ([System.Management.Automation.PSTypeName]'XcSession.Win32').Type) {
@@ -164,6 +165,47 @@ function Handle-Command($Xl, $Wb, $cmd) {
                 }
             }
         }
+        'screenshot' {
+            try {
+                $target = $cmd.target
+                if (-not $target) { $target = 'window' }
+                $outPath = Join-Path $script:CapturesDir "shot_$($cmd.id).png"
+                switch -Regex ($target) {
+                    '^window$' {
+                        # Excel main window
+                        $hwnd = [int64]$Xl.Hwnd
+                        Capture-Window -Hwnd $hwnd -Path $outPath | Out-Null
+                    }
+                    '^worksheet:(.+)$' {
+                        $sheetName = $Matches[1]
+                        $sheet = $Wb.Sheets.Item($sheetName)
+                        $sheet.Activate()
+                        Start-Sleep -Milliseconds 200
+                        $hwnd = [int64]$Xl.Hwnd
+                        Capture-Window -Hwnd $hwnd -Path $outPath | Out-Null
+                    }
+                    '^(dialog|form):(.+)$' {
+                        $dlgId = $Matches[2]
+                        $info  = $script:Watcher.State.DialogInfo[$dlgId]
+                        if (-not $info) { throw "Unknown dialog/form id: $dlgId" }
+                        Capture-Window -Hwnd $info.Hwnd -Path $outPath | Out-Null
+                    }
+                    default { throw "Unknown screenshot target: $target" }
+                }
+                $bmp = New-Object System.Drawing.Bitmap $outPath
+                Write-EventLine @{
+                    t = 'screenshot_captured'
+                    id = $cmd.id
+                    target = $target
+                    path = $outPath
+                    width = $bmp.Width
+                    height = $bmp.Height
+                }
+                $bmp.Dispose()
+            } catch {
+                Write-EventLine @{ t = 'screenshot_failed'; id = $cmd.id; target = $cmd.target; error = $_.Exception.Message }
+            }
+        }
         'close' {
             Write-EventLine @{ t = 'closing'; id = $cmd.id }
             $script:Stop = $true
@@ -201,7 +243,10 @@ try {
     $watcher = Start-SessionDialogWatcher `
         -ProcessId    $excelPid `
         -EventsFile   $eventsFile `
-        -CommandsFile $commandsFile
+        -CommandsFile $commandsFile `
+        -CapturesDir  $capturesDir
+    $script:Watcher     = $watcher
+    $script:CapturesDir = $capturesDir
 
     while (-not $script:Stop) {
         $cmds = Read-NewCommands
