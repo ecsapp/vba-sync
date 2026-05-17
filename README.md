@@ -59,11 +59,12 @@ The `Excel/` folder is produced by reading the live Excel object model from VBA:
 
 The result is small, readable diffs even after a "save with no changes". A column added to a table touches one or two files; the raw OOXML would have touched dozens.
 
-The export also writes Git configuration:
+The export also writes config files (created once, never overwritten):
 
 - `.gitattributes` — line endings and encoding rules per file type
 - `.gitignore` — excludes Excel temp files and system cruft
-- `README.md` — created once, never overwritten
+- `.vscode/settings.json` — pins VS Code to your system ANSI codepage so non-ASCII characters (Polish ą/ć/ł, French é/à, €, em-dashes, etc.) render correctly. VBA exports in the system codepage, not UTF-8; this file tells VS Code so. Commit it so collaborators on the same codepage see files correctly out of the box.
+- `README.md` — auto-generated documentation
 
 ## Installation
 
@@ -100,6 +101,26 @@ Excel must be allowed to read its own VBA project:
 - **Smart filtering.** Empty document modules (sheets/`ThisWorkbook`) are skipped; removed components are cleaned up on the next export.
 - **Macro security.** Settings must allow the add-in to run.
 - **Back up first.** Save and back up your workbook before the first export.
+
+## Contributing
+
+The repo holds two coupled artefacts:
+
+- `VBA Sync.xlam` — the live, distributable add-in (binary). Users download this file.
+- `VBA Sync/Modules/*.bas` — the source-of-truth VBA code that lives inside the `.xlam`.
+
+You edit the `.bas` files; Git diffs them. But the `.xlam` is what users install, so the two must be kept in sync.
+
+To ship a code change:
+
+1. Edit the `.bas`/`.cls` files under `VBA Sync/` in your editor.
+2. Open `VBA Sync.xlam` in Excel and press **Alt+F11** for the VBA editor.
+3. Project Explorer → right-click the edited module → **Remove** → **No** when asked to export.
+4. **File → Import File** → select your updated `.bas` from `VBA Sync/Modules/`.
+5. Save the add-in (**Ctrl+S** with the `.xlam` active).
+6. Close Excel to release the file lock.
+7. `git status` should show both the updated `.bas` and the updated `VBA Sync.xlam`.
+8. Commit both together. If you commit only the `.bas`, the published add-in is stale and users won't get the fix.
 
 ## License
 
