@@ -1,16 +1,9 @@
 Attribute VB_Name = "modExcelExport"
 Option Explicit
 
-' Sleep, retained from earlier debug; not currently used.
-#If VBA7 Then
-    Public Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
-#Else
-    Public Declare Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
-#End If
-
 ' MIT License
 '
-' Copyright (c) 2025 Arnaud Lavignolle, Axiom Project Services Pty Ltd
+' Copyright (c) 2025 Arnaud Lavignolle
 
 ' modExcelExport
 ' --------------
@@ -619,16 +612,8 @@ Private Sub WalkUsedRange(ur As Range, ByRef cellValues As Object, _
                     cellFormulas(k) = CStr(f)
                 End If
 
-                ' Per-cell style probing is intentionally NOT done here. The
-                ' earlier implementation called `cell.Style.Name` (3 COM hops)
-                ' on every non-empty cell, then a 28-COM-call ResolveCellStyle
-                ' probe for any non-"Normal" cell — about 600us per cell, 32s
-                ' on the PSR Template workbook (~50k non-empty cells), nearly
-                ' all of which returned empty dicts that we then discarded.
-                ' v1.1 will read xl/styles.xml + xl/worksheets/sheetN.xml from
-                ' the temp OOXML extract (BuildDrawingImageMap already created
-                ' it) to build a per-cell xfid lookup without any per-cell COM.
-                ' cellStyles param remains in the signature for the v1.1 hook.
+                ' cellStyles is populated via OOXML cellXfs lookup (TODO);
+                ' per-cell COM probing is intentionally not done here.
             End If
         Next
     Next
@@ -794,23 +779,11 @@ End Function
 ' { range: "A1:B5", value: <original value> } ordered top-left to bottom-right.
 Private Function CompressCellsToRanges(cells As Object) As Object
     ' Compress a sparse "col,row" -> value Dictionary into a Collection of
-    ' { range:"A1:B3", value:... } entries by detecting adjacent identical
-    ' values (formulas or style dicts) and merging them into rectangles.
-    '
-    ' Performance-critical: this runs once per worksheet for both formulas
-    ' and styles. Earlier versions used a Dictionary for both serialised
-    ' values and a `visited` mask; for sheets with thousands of cells this
-    ' produced O(N*M) hash lookups inside two nested extension loops, and
-    ' came in at ~340s on the PSR Template workbook. 2D arrays drop per-cell
-    ' work to direct memory access — ~100x faster than the Dictionary path.
+    ' { range:"A1:B3", value:... } entries, merging adjacent cells with
+    ' identical values into rectangles.
     Dim out As Object: Set out = New Collection
     If cells.Count = 0 Then Set CompressCellsToRanges = out: Exit Function
 
-    ' Single pass: pull keys+items as parallel Variant arrays (one COM call
-    ' per array), then do bounding-box + grid build in one VBA-only loop.
-    ' Previously this was two For Each over cells.Keys with cells(CStr(k))
-    ' hash lookups in the body. Replacing with positional Variant-array
-    ' access avoids both the second enumeration and the hash lookups.
     Dim keysArr As Variant: keysArr = cells.Keys
     Dim itemsArr As Variant: itemsArr = cells.Items
     Dim nKeys As Long: nKeys = cells.Count
@@ -889,11 +862,9 @@ Private Function CompressCellsToRanges(cells As Object) As Object
                 Next
             Next
 
-            ' Emit (translate back to absolute col,row).
-            ' Each entry is a 2-element Variant array (range, value). We used
-            ' to emit Scripting.Dictionary per entry; at 50k+ entries on a
-            ' heavy workbook the CreateObject churn was significant, and
-            ' downstream callers only access two known fields.
+            ' Emit (translate back to absolute col,row). Each entry is a
+            ' 2-element Variant array (range, value) — cheaper than a
+            ' Scripting.Dictionary when there can be tens of thousands.
             Dim absC As Long: absC = c + minCol
             Dim absR As Long: absR = r + minRow
             Dim absEC As Long: absEC = endCol + minCol
@@ -979,13 +950,9 @@ Private Sub SaveFormulasJson(path As String, cells As Object, exported As Object
     If cells.Count = 0 Then Exit Sub
 
     ' CompressCellsToRanges returns entries in row-major order; no sort needed.
-    ' Earlier versions called SortMergedByTopLeft here, an O(N^2) bubble sort
-    ' that took ~360s on the PSR Template workbook.
     Dim sortedMerged As Object: Set sortedMerged = CompressCellsToRanges(cells)
 
-    ' Entries from CompressCellsToRanges are 2-element Variant arrays:
-    ' (range:String, value:Variant). Reading by index is faster than the
-    ' Dictionary-entry lookup the older shape required.
+    ' Each entry is a 2-element Variant array (range:String, value:Variant).
     Dim ranges As Object: Set ranges = CreateObject("Scripting.Dictionary")
     Dim cellsOnly As Object: Set cellsOnly = CreateObject("Scripting.Dictionary")
     Dim entry As Variant
@@ -1034,11 +1001,10 @@ Private Sub SaveMetaJson(path As String, ws As Worksheet, sheetId As Long, _
     obj("tabColor") = TabColorHex(ws)
     If IsNull(obj("tabColor")) Then obj("tabColor") = Null   ' explicit JSON null
 
-    ' showGridLines + frozenPanes come from OOXML <sheetView> (LoadSheetViews
-    ' parses xl/worksheets/sheetN.xml in the synchronously-extracted temp dir).
-    ' No Window-probe fallback -- Window.DisplayGridlines / Window.FreezePanes
-    ' only reflect the sheet currently active in some Window, which made
-    ' those fields flap between sheets on every round-trip.
+    ' showGridLines + frozenPanes come from OOXML <sheetView> in the
+    ' extracted temp dir. Window.DisplayGridlines / Window.FreezePanes
+    ' only reflect the active sheet, so OOXML is the only reliable
+    ' per-sheet source.
     If Not ooxmlSheetView Is Nothing Then
         If ooxmlSheetView.Exists("showGridLines") Then obj("showGridLines") = ooxmlSheetView("showGridLines")
         If ooxmlSheetView.Exists("frozenPanes") Then Set obj("frozenPanes") = ooxmlSheetView("frozenPanes")
@@ -1455,16 +1421,15 @@ Private Function ShapeToEntry(shp As Shape) As Object
 
     Dim st As Long: st = shp.Type
 
-    ' Numeric MsoShapeType values to avoid VBA name-clash compile errors
-    ' (e.g. `msoConnector` collides with the Connector class on some Excel
-    ' installs, same family as `xlIconSet`). 13=Picture, 11=LinkedPicture,
-    ' 6=Group, 9=Line, 18=Connector (deprecated, treated like Line),
-    ' 5=Freeform.
+    ' Numeric MsoShapeType values — `msoConnector` collides with the
+    ' Connector class on some Excel installs (same family as xlIconSet).
+    ' 13=Picture, 11=LinkedPicture, 6=Group, 9=Line, 18=Connector
+    ' (deprecated, treated like Line), 5=Freeform.
     Select Case st
         Case 13, 11   ' msoPicture, msoLinkedPicture
             entry("type") = "picture"
             entry("name") = shp.Name
-            ' Asset filename placeholder (binary not extracted; scope-cut)
+            ' Asset path; binary is copied to _assets/ by SaveDrawingsJson.
             entry("asset") = "_assets/" & SafePictureBaseName(shp.Name) & ".png"
         Case 6        ' msoGroup
             entry("type") = "group"
@@ -1554,11 +1519,9 @@ End Function
 ' For each embedded ChartObject on the sheet, write <ChartName>.png (via
 ' chartObj.Chart.Export) and <ChartName>.json (structural manifest).
 '
-' JSON schema (minimum -- the PNG is the visual source of truth):
+' JSON schema (PNG is the visual source of truth):
 '   { name, type, title, anchor: {from, to},
 '     series: [{name, formula}], axes: {categoryAxis: {title}, valueAxis: {title}} }
-'
-' Standalone chart sheets (wb.Charts) are NOT handled -- scope-cut.
 Private Sub ExportCharts(chartsDir As String, ws As Worksheet, exported As Object)
     On Error GoTo Done
     If ws.ChartObjects.Count = 0 Then Exit Sub
@@ -1904,10 +1867,9 @@ End Function
 ' emits (sqref, type, operator, allowBlank, showInputMessage,
 ' showErrorMessage, errorTitle, error, promptTitle, prompt, formula1, formula2).
 '
-' Why OOXML and not Range.SpecialCells(xlCellTypeAllValidation): VBA's
-' SpecialCells returns 1004 "no cells found" for sheets that demonstrably
-' have validations when called in some Excel COM contexts. OOXML is the
-' authoritative source and matches what the old PowerShell normaliser saw.
+' OOXML rather than Range.SpecialCells(xlCellTypeAllValidation): the
+' VBA call returns 1004 "no cells found" in some COM contexts even when
+' validations exist. OOXML is authoritative.
 Private Function LoadSheetValidations(tempDir As String, sheetNameToTarget As Object) As Object
     Dim out As Object: Set out = CreateObject("Scripting.Dictionary")
     On Error GoTo Done
@@ -1979,16 +1941,13 @@ Done:
 End Function
 
 '====================  OOXML SHEET VIEW SETTINGS  ============
-' Reads xl/worksheets/sheetN.xml for each sheet, parses the first
-' <sheetView> and any <pane>, returns Dictionary keyed by Worksheet.Name ->
-' Scripting.Dictionary { "showGridLines": Boolean (omitted if true/default),
-'                        "frozenPanes": { "xSplit": N, "ySplit": N } (if any) }.
+' Reads xl/worksheets/sheetN.xml, parses the first <sheetView> + any
+' <pane>, returns Dictionary keyed by Worksheet.Name ->
+'   { "showGridLines": Boolean (omitted unless explicitly false),
+'     "frozenPanes": { "xSplit": N, "ySplit": N } (if any) }
 '
-' Why OOXML and not Window.DisplayGridlines / Window.FreezePanes: those
-' properties live on Excel's Window object, not the Worksheet, and only
-' reflect the sheet currently active in some Window. Per-sheet values for
-' inactive sheets come back wrong, which caused showGridLines and frozen
-' panes to flap between sheets on each round-trip.
+' OOXML rather than Window.DisplayGridlines / Window.FreezePanes because
+' those Window properties only reflect the active sheet.
 Private Function LoadSheetViews(tempDir As String, sheetNameToTarget As Object) As Object
     Dim out As Object: Set out = CreateObject("Scripting.Dictionary")
     On Error GoTo Done
@@ -2098,12 +2057,6 @@ Private Function BuildDrawingImageMap(wb As Workbook) As Object
     End If
     On Error GoTo Fail
 
-    ' --- Extract synchronously via PowerShell Expand-Archive ---
-    ' Earlier versions used Shell.Application.CopyHere, which is async --
-    ' the call returned immediately and downstream readers raced against
-    ' partially-extracted files, making validations + sheetView reads
-    ' unreliable. WshShell.Run with WaitOnReturn = True blocks until
-    ' PowerShell finishes; by the time it returns, every file is on disk.
     ExtractZipSynchronously zipPath, tempDir
 
     Dim wbXmlPath As String: wbXmlPath = tempDir & "\xl\workbook.xml"
@@ -2348,23 +2301,11 @@ Private Function localName(node As Object) As String
     localName = bn
 End Function
 
-' Synchronously extract a .zip into a destination folder via PowerShell's
-' Expand-Archive. Used by BuildDrawingImageMap to unzip the workbook's OOXML
-' contents -- earlier versions used Shell.Application.CopyHere, but that's
-' asynchronous and made downstream OOXML reads (validations, sheetView,
-' table calc formulas) race against partially-extracted files. WshShell.Run
-' with WaitOnReturn = True blocks until the extraction completes, so by
-' the time this returns every file is on disk.
-'
-' Raises if PowerShell is missing/blocked OR Expand-Archive fails. The
-' surrounding On Error GoTo Fail handler catches that and the export
-' surfaces the error via .export_error.log + the existing MsgBox path.
+' Synchronously extract a .zip into destDir via tar.exe (bsdtar, ships
+' with Windows 10 1803+). WshShell.Run with WaitOnReturn=True blocks
+' until extraction completes -- files are on disk when this returns.
+' Raises if tar.exe is missing or extract fails.
 Private Sub ExtractZipSynchronously(zipPath As String, destDir As String)
-    ' tar.exe (bsdtar/libarchive) ships with Windows 10 1803+ and extracts
-    ' .zip archives. Much faster than `powershell -Command Expand-Archive`
-    ' (no .NET CLR cold start; ~150ms instead of ~5-20s). Same shape:
-    ' WshShell.Run with WaitOnReturn = True blocks until tar finishes;
-    ' files are guaranteed on disk when this returns.
     Dim tEx As Double: tEx = Timer
     Dim wsh As Object: Set wsh = CreateObject("WScript.Shell")
     Dim cmd As String

@@ -12,20 +12,8 @@ Attribute VB_Name = "JsonConverter"
 ' @author tim.hall.engr@gmail.com
 ' @license MIT (http://www.opensource.org/licenses/mit-license.php)
 '
-' --- LOCAL MODIFICATIONS for vba-sync ----------------------------------
-' This is a vendored copy of VBA-JSON with one small change relative to the
-' upstream v2.3.1:
-'
-'   ConvertToJson: the array-emitting branch (TypeName = "Collection") now
-'   also accepts "ArrayList" (System.Collections.ArrayList). Same JSON
-'   shape -- emits "[...]". Without this, vba-sync's ArrayList instances
-'   serialise as "{}" (empty object) because ArrayList isn't recognised as
-'   an array-like.
-'
-' To re-sync from upstream: pull the latest JsonConverter.bas from
-' https://github.com/VBA-tools/VBA-JSON, then re-apply the ArrayList branch
-' to the ConvertToJson "vbObject" Case in the function body.
-' -----------------------------------------------------------------------
+' Vendored copy of VBA-JSON v2.3.1 (upstream:
+' https://github.com/VBA-tools/VBA-JSON). No local modifications.
 '' ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ '
 '
 ' Based originally on vba-json (with extensive changes)
@@ -416,9 +404,7 @@ Public Function ConvertToJson(ByVal JsonValue As Variant, Optional ByVal Whitesp
 
             json_BufferAppend json_Buffer, json_Indentation & "}", json_BufferPosition, json_BufferLength
 
-        ' Collection or ArrayList (vba-sync uses System.Collections.ArrayList
-        ' extensively because of its O(1) Add. Same JSON shape as Collection.)
-        ElseIf VBA.TypeName(JsonValue) = "Collection" Or VBA.TypeName(JsonValue) = "ArrayList" Then
+        ElseIf VBA.TypeName(JsonValue) = "Collection" Then
             json_BufferAppend json_Buffer, "[", json_BufferPosition, json_BufferLength
             For Each json_Value In JsonValue
                 If json_IsFirstItem Then

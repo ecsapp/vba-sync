@@ -3,7 +3,7 @@ Option Explicit
 
 ' MIT License
 '
-' Copyright (c) 2025 Arnaud Lavignolle, Axiom Project Services Pty Ltd
+' Copyright (c) 2025 Arnaud Lavignolle
 '
 ' Permission is hereby granted, free of charge, to any person obtaining a copy
 ' of this software and associated documentation files (the "Software"), to deal
@@ -249,12 +249,7 @@ Fail:
     ReadSheetErrors = ""
 End Function
 
-' Extract Excel file structure for version control. v1.1: implementation
-' lives entirely in modExcelExport, reading the live Excel object model
-' rather than unzipping the .xlsm and re-parsing OOXML. No external script
-' dependencies (no PowerShell, no .ps1 alongside the .xlam).
-'
-' v1.1 layout (output format unchanged from v1.0):
+' Writes the Excel/ folder layout:
 '   Excel/
 '   |-- MANIFEST.json                          Workbook structure as JSON
 '   |-- lambdas/<Name>.lambda                  Deduplicated LAMBDA defined names
@@ -352,12 +347,6 @@ Private Sub CreateExcelStructureSummary(wb As Workbook, excelDir As String, expo
     summary = summary & "    - `drawings/{shapes.json, _assets/}` - shapes + pictures + macro refs" & vbCrLf
     summary = summary & vbCrLf
 
-    ' v1.1: password-hash redaction is no longer performed -- the export reads
-    ' the live Excel object model rather than the underlying OOXML. Sheet/
-    ' workbook protections (if any) still live on the .xlsm itself; only the
-    ' on-disk export folder is a clean *view* of the model.
-
-    ' Write the summary via modExcelExport.WriteIfChanged for diff-friendliness
     modExcelExport.WriteIfChanged summaryPath, summary, exported, True
 End Sub
 
@@ -785,32 +774,20 @@ Private Function CleanCode(src As String) As String
     CleanCode = RTrim$(out)
 End Function
 
-' Remove trailing empty lines from exported VBA files
-' Export one VBA component (.bas/.cls/.frm/.frx) to disk, with a stable
-' "did the form actually change" guard for MSForms.
+' Export one VBA component (.bas/.cls/.frm/.frx) to disk.
 '
-' Why: Excel rewrites a small amount of metadata inside .frx on every
-' comp.Export even when the form was not touched (per MS-OFORMS the
-' format has unspecified padding bytes between aligned record fields,
-' and MSForms leaks uninitialised heap memory there). A naive byte-
-' comparison ALWAYS sees a difference; a percentage-threshold heuristic
-' is unsafe because real edits can also be small.
+' For MSForms: Excel rewrites a few metadata bytes inside .frx on every
+' comp.Export even when the form wasn't touched (MS-OFORMS has padding
+' bytes that leak uninitialised heap memory). To avoid noise diffs we
+' build a deterministic fingerprint by introspecting comp.Designer.Controls,
+' hash it, and store it in a `<FormName>.frx.fingerprint` sidecar. On
+' next export, if the fingerprint matches the stored sidecar the new .frx
+' is guaranteed equivalent -- restore the previous .frx so git sees no
+' change. If the fingerprint differs, both .frx + new sidecar are written.
 '
-' Reliable approach (used by no other VBA-in-git tool, but recommended
-' after researching MS-OFORMS, MS-OVBA, and Rubberduck/vbaDeveloper/xltrail
-' practice): introspect comp.Designer.Controls to build a deterministic
-' "form fingerprint" string capturing what semantically defines the form,
-' hash it, and store the hash in a `<FormName>.frx.fingerprint` sidecar
-' that gets committed alongside the .frx. On the next export, recompute
-' the fingerprint; if it matches the stored sidecar, the new .frx is
-' guaranteed to represent the same form -- restore the previous .frx so
-' git sees no change. If the fingerprint differs, the form really changed
-' and the new .frx + new sidecar both get written.
-'
-' Edge case: forms with embedded Picture controls won't fingerprint the
-' picture bytes (only Picture.Width/Height/Type), so picture swaps will
-' look identical to the fingerprint. Acceptable scope cut for v1.0;
-' picture-change detection can be added later via OleSavePictureFile.
+' Known gap: forms with embedded Picture controls fingerprint only
+' Picture.Width/Height/Type, not the picture bytes, so a picture swap on
+' an otherwise-unchanged form looks identical to the fingerprint.
 Private Sub ExportComponent(comp As Object, fullPath As String, subDir As String, exported As Object)
     Dim oldFrxPath As String, hadOldFrx As Boolean, newFrx As String, fpPath As String
     Dim oldFingerprint As String

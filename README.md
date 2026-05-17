@@ -51,16 +51,13 @@ YourWorkbook/
     └── STRUCTURE_SUMMARY.md            # Human-readable overview
 ```
 
-The whole Excel/ folder is produced by a PowerShell normaliser (`Normalize-ExcelXml.ps1`, ships next to the .xlam) that:
+The Excel/ folder is produced by reading the live Excel object model from VBA:
 
-- Resolves OOXML's compact-but-opaque shared-string and dxfId indices into readable inline values
 - Splits each worksheet into per-concern files so a data edit doesn't churn the styles file (and vice versa)
 - Range-merges adjacent cells with identical styles or formulas (a calc column with one formula across 700 rows is one entry, not 700)
-- Honours Excel's shared-formula structure (one master per `si` group)
-- Captures shape macros (`<xdr:sp macro="...">`) so AI agents can trace UI → VBA without opening Excel
-- Strips volatile metadata: revision GUIDs, window positions, build numbers, local filesystem path
-- Redacts password hashes from sheet/workbook protection elements (logged in `STRUCTURE_SUMMARY.md`)
+- Captures shape macros (`OnAction`) so AI agents can trace UI → VBA without opening Excel
 - Deduplicates LAMBDA copies (Excel writes one per sheet that uses it; we collapse to one file)
+- Skips volatile metadata that doesn't survive a no-change save
 
 The result: small, readable diffs even after a "save with no changes". A column added to a table touches one or two files; today it would have touched 25.
 
