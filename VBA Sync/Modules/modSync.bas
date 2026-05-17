@@ -9,7 +9,7 @@ Option Explicit
 
 ' MIT License
 '
-' Copyright (c) 2025 Arnaud Lavignolle, Axiom Project Services Pty Ltd
+' Copyright (c) 2025 Arnaud Lavignolle
 '
 ' Permission is hereby granted, free of charge, to any person obtaining a copy
 ' of this software and associated documentation files (the "Software"), to deal
@@ -87,7 +87,6 @@ Option Explicit
 Const GIT_ATTRIB As String = ".gitattributes"
 Const GIT_IGNORE As String = ".gitignore"
 Const README_FILE As String = "README.md"
-Const WORKSHEET_LINE_LIMIT As Long = 200
 
 '====================  Ribbon wrappers  ====================
 Public Sub ExportProject(control As Object)
@@ -137,12 +136,7 @@ Private Sub DoExportAddin()
         subDir = rootPath & CompFolder(comp.Type) & "\"
         EnsureFolder subDir
         fullPath = subDir & comp.Name & GetExt(comp.Type)
-        comp.Export fullPath
-        CleanExportedFile fullPath  ' Remove trailing empty lines
-        exported(AddSlash(fullPath)) = True
-        If comp.Type = vbext_ct_MSForm Then
-            exported(AddSlash(subDir & comp.Name & ".frx")) = True
-        End If
+        ExportComponent comp, fullPath, subDir, exported
 NextComponent:
     Next
 
@@ -197,12 +191,7 @@ Private Sub DoExportProject()
         subDir = rootPath & CompFolder(comp.Type) & "\"
         EnsureFolder subDir
         fullPath = subDir & comp.Name & GetExt(comp.Type)
-        comp.Export fullPath
-        CleanExportedFile fullPath  ' Remove trailing empty lines
-        exported(AddSlash(fullPath)) = True
-        If comp.Type = vbext_ct_MSForm Then
-            exported(AddSlash(subDir & comp.Name & ".frx")) = True
-        End If
+        ExportComponent comp, fullPath, subDir, exported
 NextComponent:
     Next
 
@@ -220,114 +209,90 @@ NextComponent:
     WriteGitIgnore repoPath
     WriteReadme repoPath, wb
     WriteVSCodeSettings repoPath
-    
-    Debug.Print "VBA Sync: Export completed successfully!"
-    MsgBox "VBA Sync export completed successfully!" & vbCrLf & "Files exported to: " & rootPath, vbInformation, "VBA Sync"
+
+    ' Check for per-sheet failures captured by modExcelExport. If any are
+    ' present, the success MsgBox is replaced with a warning summary so the
+    ' user can't miss that some sheets didn't fully export.
+    Dim sheetErrLog As String: sheetErrLog = rootPath & "Excel\.export_sheet_errors.log"
+    Dim sheetErrText As String: sheetErrText = ReadSheetErrors(sheetErrLog)
+    If Len(sheetErrText) > 0 Then
+        Debug.Print "VBA Sync: Export completed with sheet-level failures."
+        MsgBox "VBA Sync export completed, but some sheets had issues:" & vbCrLf & vbCrLf & _
+               sheetErrText & vbCrLf & _
+               "Full details: " & sheetErrLog, vbExclamation, "VBA Sync"
+    Else
+        Debug.Print "VBA Sync: Export completed successfully!"
+        MsgBox "VBA Sync export completed successfully!" & vbCrLf & "Files exported to: " & rootPath, vbInformation, "VBA Sync"
+    End If
 End Sub
 
-'Extract Excel file structure for version control and collaboration
+' Parse .export_sheet_errors.log into a human-readable summary
+' ("<sheet>: <phase> - <message>" lines). Returns "" if file missing or empty.
+Private Function ReadSheetErrors(path As String) As String
+    On Error GoTo Fail
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FileExists(path) Then ReadSheetErrors = "": Exit Function
+    Dim ts As Object: Set ts = fso.OpenTextFile(path, 1)
+    Dim contents As String
+    If Not ts.AtEndOfStream Then contents = ts.ReadAll
+    ts.Close
+    If Len(contents) = 0 Then ReadSheetErrors = "": Exit Function
+
+    Dim lines() As String: lines = Split(contents, vbCrLf)
+    Dim summary As String, i As Long, count As Long
+    For i = LBound(lines) To UBound(lines)
+        Dim ln As String: ln = Trim$(lines(i))
+        If Len(ln) > 0 Then
+            ' Strip the timestamp + "VBA Sync: " prefix for brevity in the MsgBox
+            Dim p As Long: p = InStr(ln, " VBA Sync: ")
+            If p > 0 Then ln = Mid$(ln, p + 11)
+            summary = summary & "  - " & ln & vbCrLf
+            count = count + 1
+        End If
+    Next
+    If count = 0 Then ReadSheetErrors = "": Exit Function
+    ReadSheetErrors = summary
+    Exit Function
+Fail:
+    ReadSheetErrors = ""
+End Function
+
+' Writes the Excel/ folder layout:
+'   Excel/
+'   |-- MANIFEST.json                          Workbook structure as JSON
+'   |-- lambdas/<Name>.lambda                  Deduplicated LAMBDA defined names
+'   |-- worksheets/<NN> - <SheetName>/
+'   |   |-- data.tsv                           Cell values (resolved inline)
+'   |   |-- formulas.json                      Range-collapsed cell formulas
+'   |   |-- styles.json                        Range-merged resolved styles
+'   |   |-- _meta.json                         Tab colour, panes, columns, etc.
+'   |   |-- validations.json                   (only if any rules)
+'   |   |-- conditional_formats.json           (only if any rules)
+'   |   |-- comments.json                      (only if any comments)
+'   |   |-- tables/<TableName>/
+'   |   |   |-- definition.json                Schema, columns, calc formulas
+'   |   |   `-- data.tsv                       Clean dataset
+'   |   `-- drawings/shapes.json               Shapes, pictures, OnAction macros
+'   `-- STRUCTURE_SUMMARY.md                   Human-readable overview
 Private Sub ExtractExcelStructure(wb As Workbook, rootPath As String, exported As Object)
     On Error GoTo ExcelStructureError
-    
+
     Dim excelDir As String: excelDir = rootPath & "Excel\"
     EnsureFolder excelDir
-    
-    ' Create temporary copy of workbook as ZIP
-    Dim tempZip As String: tempZip = wb.Path & "\" & wb.Name & ".temp.zip"
-    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
-    fso.CopyFile wb.FullName, tempZip
-    Debug.Print "VBA Sync: Creating temporary ZIP copy..."
-    
-    ' Extract Excel structure using Shell
-    Dim tempExtract As String: tempExtract = wb.Path & "\temp_excel_extract"
-    EnsureFolder tempExtract
-    
-    ' Use PowerShell to extract ZIP (more reliable than Shell.Application)
-    Debug.Print "VBA Sync: Extracting Excel XML structure..."
-    Dim psCmd As String
-    psCmd = "powershell -Command ""Expand-Archive -Path '" & Replace(tempZip, "'", "''") & "' -DestinationPath '" & Replace(tempExtract, "'", "''") & "' -Force"""
-    CreateObject("WScript.Shell").Run psCmd, 0, True
-    
-    ' Copy key Excel files to src/Excel/
-    Debug.Print "VBA Sync: Copying workbook structure..."
-    CopyExcelFile tempExtract & "\xl\workbook.xml", excelDir, "workbook.xml", exported
-    
-    ' Copy table definitions
-    Debug.Print "VBA Sync: Copying table definitions..."
-    Dim tablesDir As String: tablesDir = excelDir & "tables\"
-    If fso.FolderExists(tempExtract & "\xl\tables") Then
-        EnsureFolder tablesDir
-        Dim tableFile As Object
-        For Each tableFile In fso.GetFolder(tempExtract & "\xl\tables").Files
-            If LCase(fso.GetExtensionName(tableFile.Name)) = "xml" Then
-                CopyExcelFile tableFile.Path, tablesDir, tableFile.Name, exported
-            End If
-        Next
-    End If
-    
-    ' Copy worksheet structure (limited lines to avoid huge data files)
-    Debug.Print "VBA Sync: Copying worksheet schemas..."
-    Dim worksheetsDir As String: worksheetsDir = excelDir & "worksheets\"
-    If fso.FolderExists(tempExtract & "\xl\worksheets") Then
-        EnsureFolder worksheetsDir
-        Dim wsFile As Object
-        For Each wsFile In fso.GetFolder(tempExtract & "\xl\worksheets").Files
-            If LCase(fso.GetExtensionName(wsFile.Name)) = "xml" And wsFile.Name <> "_rels" Then
-                CopyExcelFileWithLimit wsFile.Path, worksheetsDir, wsFile.Name, exported, WORKSHEET_LINE_LIMIT
-            End If
-        Next
-    End If
-    
-    ' Create Excel structure summary
+
+    Debug.Print "VBA Sync: Extracting Excel structure (live model)..."
+    modExcelExport.DoExportExcelStructure wb, rootPath, exported
+
+    ' Create Excel structure summary (live workbook -> readable .md)
     CreateExcelStructureSummary wb, excelDir, exported
-    
-    ' Cleanup temporary files
-    On Error Resume Next
-    fso.DeleteFile tempZip, True
-    fso.DeleteFolder tempExtract, True
-    On Error GoTo 0
-    
+
     Exit Sub
-    
+
 ExcelStructureError:
-    ' Cleanup on error
-    On Error Resume Next
-    If fso.FileExists(tempZip) Then fso.DeleteFile tempZip, True
-    If fso.FolderExists(tempExtract) Then fso.DeleteFolder tempExtract, True
-    On Error GoTo 0
-    ' Continue without Excel structure if extraction fails
+    Debug.Print "VBA Sync: Excel structure extraction failed: " & Err.Description
+    ' Continue without Excel structure rather than failing the whole VBA export
 End Sub
 
-Private Sub CopyExcelFile(sourcePath As String, destDir As String, fileName As String, exported As Object)
-    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
-    If fso.FileExists(sourcePath) Then
-        Dim destPath As String: destPath = destDir & fileName
-        fso.CopyFile sourcePath, destPath, True
-        exported(AddSlash(destPath)) = True
-    End If
-End Sub
-
-Private Sub CopyExcelFileWithLimit(sourcePath As String, destDir As String, fileName As String, exported As Object, maxLines As Long)
-    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
-    If fso.FileExists(sourcePath) Then
-        Dim sourceText As String
-        sourceText = fso.OpenTextFile(sourcePath, 1).ReadAll
-        
-        ' Limit to first N lines to avoid huge worksheet data files
-        Dim Lines As Variant: Lines = Split(sourceText, vbCrLf)
-        If UBound(Lines) > maxLines Then
-            ReDim Preserve Lines(0 To maxLines)
-            sourceText = Join(Lines, vbCrLf) & vbCrLf & _
-                        "<!-- Truncated at " & maxLines & " lines by VBA Sync to avoid large files -->"
-        End If
-        
-        Dim destPath As String: destPath = destDir & fileName
-        Dim ts As Object: Set ts = fso.CreateTextFile(destPath, True)
-        ts.Write sourceText
-        ts.Close
-        exported(AddSlash(destPath)) = True
-    End If
-End Sub
 
 Private Sub CreateExcelStructureSummary(wb As Workbook, excelDir As String, exported As Object)
     Dim summaryPath As String: summaryPath = excelDir & "STRUCTURE_SUMMARY.md"
@@ -335,7 +300,6 @@ Private Sub CreateExcelStructureSummary(wb As Workbook, excelDir As String, expo
     
     Dim summary As String
     summary = "# Excel File Structure Summary" & vbCrLf & vbCrLf
-    summary = summary & "Generated: " & Format(Now, "yyyy-mm-dd hh:nn:ss") & vbCrLf
     summary = summary & "Workbook: " & wb.Name & vbCrLf & vbCrLf
     
     ' Worksheet summary
@@ -379,14 +343,19 @@ Private Sub CreateExcelStructureSummary(wb As Workbook, excelDir As String, expo
     summary = summary & vbCrLf
     
     summary = summary & "## Files Included" & vbCrLf
-    summary = summary & "- `workbook.xml` - Overall workbook structure" & vbCrLf
-    summary = summary & "- `tables/*.xml` - Excel table definitions" & vbCrLf
-    summary = summary & "- `worksheets/*.xml` - Worksheet schemas (first " & WORKSHEET_LINE_LIMIT & " lines)" & vbCrLf
-    
-    Dim ts As Object: Set ts = fso.CreateTextFile(summaryPath, True)
-    ts.Write summary
-    ts.Close
-    exported(AddSlash(summaryPath)) = True
+    summary = summary & "- `MANIFEST.json` - Workbook structure (sheets, tables, defined names, lambdas, calc settings)" & vbCrLf
+    summary = summary & "- `lambdas/<Name>.lambda` - LAMBDA defined names (deduplicated across sheets)" & vbCrLf
+    summary = summary & "- `worksheets/<NN> - <SheetName>/` - One folder per sheet:" & vbCrLf
+    summary = summary & "    - `data.tsv` (cell values, sst-resolved)" & vbCrLf
+    summary = summary & "    - `formulas.json` (range-collapsed)" & vbCrLf
+    summary = summary & "    - `styles.json` (range-merged, dxf-resolved)" & vbCrLf
+    summary = summary & "    - `_meta.json` (tab colour, panes, columns, hosted tables)" & vbCrLf
+    summary = summary & "    - `validations.json`, `conditional_formats.json`, `comments.json` (only if any)" & vbCrLf
+    summary = summary & "    - `tables/<TableName>/{definition.json, data.tsv}` - Excel tables" & vbCrLf
+    summary = summary & "    - `drawings/{shapes.json, _assets/}` - shapes + pictures + macro refs" & vbCrLf
+    summary = summary & vbCrLf
+
+    modExcelExport.WriteIfChanged summaryPath, summary, exported, True
 End Sub
 
 Private Sub DoImportProject()
@@ -503,14 +472,16 @@ End Sub
 'Delete any .bas/.cls/.frm/.frx/.xml file that wasn't exported this run
 Private Sub PruneStaleFiles(rootPath As String, exported As Object)
     Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+
+    ' VBA component folders -- flat, fixed extensions
     Dim subFolder As Variant, folderPath As String
-    For Each subFolder In Array("Modules", "ClassModules", "Forms", "Objects", "Misc", "Excel", "Excel/tables", "Excel/worksheets")
+    For Each subFolder In Array("Modules", "ClassModules", "Forms", "Objects", "Misc")
         folderPath = rootPath & subFolder & "\"
         If fso.FolderExists(folderPath) Then
             Dim f As Object
             For Each f In fso.GetFolder(folderPath).Files
                 Dim ext As String: ext = LCase$(fso.GetExtensionName(f.Path))
-                If ext = "bas" Or ext = "cls" Or ext = "frm" Or ext = "frx" Or ext = "xml" Or ext = "md" Then
+                If ext = "bas" Or ext = "cls" Or ext = "frm" Or ext = "frx" Then
                     If Not exported.Exists(AddSlash(f.Path)) Then
                         On Error Resume Next
                         f.Delete True
@@ -520,6 +491,74 @@ Private Sub PruneStaleFiles(rootPath As String, exported As Object)
             Next
         End If
     Next
+
+    ' Excel folder -- recursive walk (the v0.2 layout adds lambdas/ and may add
+    ' more subfolders in v0.3). Anything under Excel/ that isn't in the export
+    ' set gets pruned. The .normalize.log is preserved (we don't track it in
+    ' exported, but it's harmless to leave).
+    Dim excelDir As String: excelDir = rootPath & "Excel\"
+    If fso.FolderExists(excelDir) Then
+        PruneFolderRecursive fso.GetFolder(excelDir), exported
+    End If
+End Sub
+
+' Recursively prune stale exported files from the Excel/ subtree.
+' Walks bottom-up so we can detect newly-emptied folders and remove them.
+' Preserves .normalize.log (it's overwritten by the next run anyway).
+'
+' Extensions covered: every output type the normaliser writes -- xml, json,
+' lambda, tsv, md, plus the image assets png/jpg/jpeg/gif/emf/bmp. Adding
+' a new output extension to the normaliser means adding it here too.
+Private Sub PruneFolderRecursive(folder As Object, exported As Object)
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    Dim f As Object, sub_ As Object
+
+    ' Recurse FIRST so child folders get pruned before we check if this one
+    ' is empty. SubFolders enumeration mutates badly if we delete during
+    ' iteration -- collect to a list first.
+    Dim subFolders As Object: Set subFolders = CreateObject("Scripting.Dictionary")
+    For Each sub_ In folder.SubFolders
+        subFolders(sub_.Path) = True
+    Next
+    Dim subPath As Variant
+    For Each subPath In subFolders.Keys
+        On Error Resume Next
+        PruneFolderRecursive fso.GetFolder(CStr(subPath)), exported
+        On Error GoTo 0
+    Next
+
+    ' Files in THIS folder
+    Dim toDelete As Object: Set toDelete = CreateObject("Scripting.Dictionary")
+    For Each f In folder.Files
+        Dim ext As String: ext = LCase$(fso.GetExtensionName(f.Path))
+        ' Preserve the normaliser's log file
+        If LCase$(f.Name) = ".normalize.log" Then
+            ' skip
+        ElseIf ext = "xml" Or ext = "md" Or ext = "json" Or ext = "lambda" Or _
+               ext = "tsv" Or ext = "png" Or ext = "jpg" Or ext = "jpeg" Or _
+               ext = "gif" Or ext = "emf" Or ext = "bmp" Then
+            If Not exported.Exists(AddSlash(f.Path)) Then
+                toDelete(f.Path) = True
+            End If
+        End If
+    Next
+    Dim p As Variant
+    For Each p In toDelete.Keys
+        On Error Resume Next
+        fso.DeleteFile p, True
+        On Error GoTo 0
+    Next
+
+    ' If this folder is now empty AND it's not the root Excel/ folder, remove it.
+    ' (We never delete the root Excel/ -- export creates it fresh.)
+    If LCase$(folder.Name) <> "excel" Then
+        On Error Resume Next
+        Dim refreshed As Object: Set refreshed = fso.GetFolder(folder.Path)
+        If refreshed.Files.Count = 0 And refreshed.SubFolders.Count = 0 Then
+            folder.Delete True
+        End If
+        On Error GoTo 0
+    End If
 End Sub
 
 Private Function AddSlash(p As String) As String
@@ -543,9 +582,12 @@ Private Sub WriteGitAttributes(basePath As String)
           "*.cls text eol=crlf" & vbCrLf & _
           "*.frm text eol=crlf" & vbCrLf & _
           vbCrLf & _
-          "# Excel structure files" & vbCrLf & _
+          "# Excel structure files (XML + Markdown + TSV use CRLF; JSON/lambda use LF)" & vbCrLf & _
           "*.xml text eol=crlf" & vbCrLf & _
           "*.md text eol=crlf" & vbCrLf & _
+          "*.tsv text eol=crlf" & vbCrLf & _
+          "*.json text eol=lf" & vbCrLf & _
+          "*.lambda text eol=lf" & vbCrLf & _
           vbCrLf & _
           "# Binary partner of UserForms" & vbCrLf & _
           "*.frx binary" & vbCrLf & _
@@ -585,7 +627,6 @@ Private Sub WriteGitIgnore(basePath As String)
           vbCrLf & _
           "# VBA Sync temporary files" & vbCrLf & _
           "*.temp.zip" & vbCrLf & _
-          "temp_excel_extract/" & vbCrLf & _
           vbCrLf & _
           "# OS cruft" & vbCrLf & _
           "Thumbs.db" & vbCrLf & _
@@ -638,10 +679,13 @@ Private Sub WriteReadme(basePath As String, wb As Workbook)
           "|-- ClassModules/         # VBA class modules (.cls files)" & vbCrLf & _
           "|-- Forms/                # UserForms (.frm + .frx files)" & vbCrLf & _
           "|-- Objects/              # ThisWorkbook & Sheet code-behind (.cls files)" & vbCrLf & _
-          "|-- Excel/                # Excel structure (for AI & documentation)" & vbCrLf & _
-          "|   |-- workbook.xml      # Workbook metadata & named ranges" & vbCrLf & _
-          "|   |-- tables/           # Excel table definitions" & vbCrLf & _
-          "|   |-- worksheets/       # Worksheet schemas (truncated for size)" & vbCrLf & _
+          "|-- Excel/                # Excel structure split into per-concern files" & vbCrLf & _
+          "|   |-- MANIFEST.json         # Sheets, tables, defined names, lambdas" & vbCrLf & _
+          "|   |-- lambdas/              # Deduplicated LAMBDA defined names" & vbCrLf & _
+          "|   |-- worksheets/<NN>-<Name>/" & vbCrLf & _
+          "|   |       data.tsv, formulas.json, styles.json, _meta.json" & vbCrLf & _
+          "|   |       tables/<TableName>/{definition.json, data.tsv}" & vbCrLf & _
+          "|   |       drawings/{shapes.json, _assets/}" & vbCrLf & _
           "|   `-- STRUCTURE_SUMMARY.md  # Human-readable data model overview" & vbCrLf & _
           "|-- .gitattributes        # Git configuration for VBA files" & vbCrLf & _
           "|-- .gitignore            # Excludes temp files from version control" & vbCrLf & _
@@ -806,32 +850,243 @@ Private Function CleanCode(src As String) As String
     CleanCode = RTrim$(out)
 End Function
 
-' Remove trailing empty lines from exported VBA files
+' Export one VBA component (.bas/.cls/.frm/.frx) to disk.
+'
+' For MSForms: Excel rewrites a few metadata bytes inside .frx on every
+' comp.Export even when the form wasn't touched (MS-OFORMS has padding
+' bytes that leak uninitialised heap memory). To avoid noise diffs we
+' build a deterministic fingerprint by introspecting comp.Designer.Controls,
+' hash it, and store it in a `<FormName>.frx.fingerprint` sidecar. On
+' next export, if the fingerprint matches the stored sidecar the new .frx
+' is guaranteed equivalent -- restore the previous .frx so git sees no
+' change. If the fingerprint differs, both .frx + new sidecar are written.
+'
+' Known gap: forms with embedded Picture controls fingerprint only
+' Picture.Width/Height/Type, not the picture bytes, so a picture swap on
+' an otherwise-unchanged form looks identical to the fingerprint.
+Private Sub ExportComponent(comp As Object, fullPath As String, subDir As String, exported As Object)
+    Dim oldFrxPath As String, hadOldFrx As Boolean, newFrx As String, fpPath As String
+    Dim oldFingerprint As String
+
+    If comp.Type = vbext_ct_MSForm Then
+        newFrx = subDir & comp.Name & ".frx"
+        fpPath = subDir & comp.Name & ".frx.fingerprint"
+        If FileExistsLocal(newFrx) Then
+            oldFrxPath = newFrx & ".vbasync_prev"
+            CopyFileLocal newFrx, oldFrxPath
+            hadOldFrx = True
+        End If
+        If FileExistsLocal(fpPath) Then oldFingerprint = ReadAllText(fpPath)
+    End If
+
+    comp.Export fullPath
+    CleanExportedFile fullPath  ' Remove trailing empty lines + collapse .frm blanks
+
+    If comp.Type = vbext_ct_MSForm Then
+        Dim newFingerprint As String: newFingerprint = ComputeFormFingerprint(comp)
+        If hadOldFrx And Len(oldFingerprint) > 0 And newFingerprint = oldFingerprint Then
+            ' Form is semantically unchanged; restore the previous .frx so
+            ' git sees no change. Fingerprint sidecar already correct.
+            CopyFileLocal oldFrxPath, newFrx
+        ElseIf Len(newFingerprint) > 0 Then
+            ' Form changed (or first export). Write the new fingerprint
+            ' alongside the new .frx; both committed together.
+            WriteAllText fpPath, newFingerprint
+            exported(AddSlash(fpPath)) = True
+        End If
+        If hadOldFrx Then
+            On Error Resume Next: Kill oldFrxPath: On Error GoTo 0
+        End If
+        ' Always count the .frx and .fingerprint as "exported" so PruneStaleFiles
+        ' doesn't sweep them when the fingerprint matched (no new write).
+        exported(AddSlash(newFrx)) = True
+        If FileExistsLocal(fpPath) Then exported(AddSlash(fpPath)) = True
+    End If
+    exported(AddSlash(fullPath)) = True
+End Sub
+
+' Build a deterministic fingerprint of a UserForm's semantic content from
+' the in-memory Designer. Output is a multi-line text blob containing every
+' control's identifying properties, sorted by control name for stability.
+' Hash is the raw text (small forms) -- callers can SHA-256 it later if size
+' becomes a concern. Returns "" if the Designer can't be introspected
+' (typical for forms loaded but not designable in this VBE state).
+Private Function ComputeFormFingerprint(comp As Object) As String
+    On Error GoTo Fail
+    Dim designer As Object
+    Set designer = comp.designer
+    If designer Is Nothing Then Exit Function
+
+    Dim parts As New Collection
+    parts.Add "FORM|" & comp.Name & _
+              "|caption=" & SafeProp(designer, "Caption") & _
+              "|width=" & SafeProp(designer, "Width") & _
+              "|height=" & SafeProp(designer, "Height")
+
+    ' Collect control fingerprints, then sort by Name for determinism.
+    Dim ctlFps As New Collection
+    Dim ctl As Object
+    For Each ctl In designer.Controls
+        ctlFps.Add ControlFingerprint(ctl)
+    Next
+    Dim sorted() As String: sorted = SortStringCollectionToArray(ctlFps)
+    Dim i As Long
+    For i = LBound(sorted) To UBound(sorted)
+        parts.Add sorted(i)
+    Next
+
+    Dim out As String, p As Variant
+    For Each p In parts
+        out = out & CStr(p) & vbLf
+    Next
+    ComputeFormFingerprint = out
+    Exit Function
+Fail:
+    ComputeFormFingerprint = ""
+End Function
+
+Private Function ControlFingerprint(ctl As Object) As String
+    On Error Resume Next
+    ControlFingerprint = "CTL|" & SafeProp(ctl, "Name") & _
+        "|type=" & TypeName(ctl) & _
+        "|top=" & SafeProp(ctl, "Top") & _
+        "|left=" & SafeProp(ctl, "Left") & _
+        "|width=" & SafeProp(ctl, "Width") & _
+        "|height=" & SafeProp(ctl, "Height") & _
+        "|tabIndex=" & SafeProp(ctl, "TabIndex") & _
+        "|caption=" & SafeProp(ctl, "Caption") & _
+        "|value=" & SafeProp(ctl, "Value") & _
+        "|tag=" & SafeProp(ctl, "Tag") & _
+        "|tooltip=" & SafeProp(ctl, "ControlTipText") & _
+        "|enabled=" & SafeProp(ctl, "Enabled") & _
+        "|visible=" & SafeProp(ctl, "Visible") & _
+        "|fontName=" & SafeProp(ctl, "Font.Name") & _
+        "|fontSize=" & SafeProp(ctl, "Font.Size") & _
+        "|fontBold=" & SafeProp(ctl, "Font.Bold")
+    On Error GoTo 0
+End Function
+
+' Read a property by name via late binding; tolerates missing properties.
+' Supports dotted access ("Font.Name") with one level of nesting.
+Private Function SafeProp(obj As Object, propName As String) As String
+    On Error Resume Next
+    Dim dotPos As Long: dotPos = InStr(propName, ".")
+    Dim result As Variant
+    If dotPos > 0 Then
+        Dim outer As String: outer = Left$(propName, dotPos - 1)
+        Dim inner As String: inner = Mid$(propName, dotPos + 1)
+        Dim outerObj As Object
+        Set outerObj = CallByName(obj, outer, VbGet)
+        If Not outerObj Is Nothing Then result = CallByName(outerObj, inner, VbGet)
+    Else
+        result = CallByName(obj, propName, VbGet)
+    End If
+    If IsObject(result) Then
+        SafeProp = "<obj>"
+    ElseIf IsNull(result) Or IsEmpty(result) Then
+        SafeProp = ""
+    Else
+        SafeProp = CStr(result)
+    End If
+    On Error GoTo 0
+End Function
+
+Private Function SortStringCollectionToArray(c As Collection) As String()
+    Dim n As Long: n = c.Count
+    Dim arr() As String
+    If n = 0 Then ReDim arr(0 To 0): arr(0) = "": SortStringCollectionToArray = arr: Exit Function
+    ReDim arr(0 To n - 1)
+    Dim i As Long: i = 0
+    Dim x As Variant
+    For Each x In c: arr(i) = CStr(x): i = i + 1: Next
+    ' Insertion sort -- small N (form control counts).
+    Dim j As Long, key As String
+    For i = 1 To n - 1
+        key = arr(i)
+        j = i - 1
+        Do While j >= 0
+            If arr(j) <= key Then Exit Do
+            arr(j + 1) = arr(j)
+            j = j - 1
+        Loop
+        arr(j + 1) = key
+    Next
+    SortStringCollectionToArray = arr
+End Function
+
+Private Function ReadAllText(path As String) As String
+    On Error GoTo Fail
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    If Not fso.FileExists(path) Then Exit Function
+    Dim ts As Object: Set ts = fso.OpenTextFile(path, 1)
+    If Not ts.AtEndOfStream Then ReadAllText = ts.ReadAll
+    ts.Close
+    Exit Function
+Fail:
+    ReadAllText = ""
+End Function
+
+Private Sub WriteAllText(path As String, content As String)
+    On Error Resume Next
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    Dim ts As Object: Set ts = fso.CreateTextFile(path, True)
+    ts.Write content
+    ts.Close
+End Sub
+
+Private Function FileExistsLocal(p As String) As Boolean
+    On Error Resume Next
+    FileExistsLocal = (Len(Dir$(p)) > 0)
+    On Error GoTo 0
+End Function
+
+Private Sub CopyFileLocal(src As String, dst As String)
+    On Error Resume Next
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    fso.CopyFile src, dst, True
+    On Error GoTo 0
+End Sub
+
 Private Sub CleanExportedFile(filePath As String)
     On Error GoTo CleanError
-    
+
     Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
     If Not fso.FileExists(filePath) Then Exit Sub
-    
+
     ' Read the file content
     Dim content As String
     content = fso.OpenTextFile(filePath, 1).ReadAll
-    
+
+    ' For .frm files only: collapse runs of 3+ blank lines down to 1. VBA's
+    ' comp.Export writes the form code section with a chunk of blank lines
+    ' between the Attribute block and Option Explicit; comp.Import preserves
+    ' them, and on the next export Excel adds another. The result is one
+    ' extra blank line per round-trip, growing forever. Collapsing 3+ to 1
+    ' is convergent and leaves intentional 1- or 2-blank spacing alone.
+    If LCase$(Right$(filePath, 4)) = ".frm" Then
+        Dim re As Object: Set re = CreateObject("VBScript.RegExp")
+        re.Global = True
+        re.MultiLine = False
+        ' Match 3 or more consecutive vbCrLf -> collapse to 2 (one blank line).
+        re.Pattern = "(\r\n){3,}"
+        content = re.Replace(content, vbCrLf & vbCrLf)
+    End If
+
     ' Remove trailing empty lines (but preserve one final line break)
     Do While Right$(content, 4) = vbCrLf & vbCrLf
         content = Left$(content, Len(content) - 2)
     Loop
-    
+
     ' Ensure file ends with exactly one line break
     If Right$(content, 2) <> vbCrLf And Len(content) > 0 Then
         content = content & vbCrLf
     End If
-    
+
     ' Write back the cleaned content
     Dim ts As Object: Set ts = fso.CreateTextFile(filePath, True)
     ts.Write content
     ts.Close
-    
+
     Exit Sub
 CleanError:
     ' Continue silently if cleanup fails - don't break the export process
