@@ -1,21 +1,29 @@
-# excel-control — scoping doc
+# excel-control — scoping
 
-Working scoping doc for the `excel-control` branch. Captures the
-decisions made so far, what's locked, what's open. Update as we go.
+## What this is
+
+A PowerShell-based session interface that lets an AI agent drive any
+Excel workbook end-to-end. Reads/writes cells, runs macros, captures
+every dialog and UserForm Excel pops as a structured event with a
+screenshot, handles runtime errors with module:line, refreshes data
+connections, takes screenshots on demand. Works on macro-heavy
+workbooks and pure-spreadsheet ones equally.
+
+Bundled into every workbook exported by vba-sync (lives in `tools/`).
+Standalone install is supported but vba-sync's Export is the primary
+distribution channel.
 
 ## Vision
 
-Excel is the most-used software development surface on Earth — VBA is a
-real language, workbooks are programs, macros are functions, ranges are
-state, COM is the runtime. But it's opaque to AI on the **execute** side.
-Existing integrations (Office MCP, Copilot) operate at the surface: read a
-cell, write a cell. They can't refactor VBA, can't run-observe-iterate,
-can't actually *operate* a workbook through its real workflow — including
-the dialogs, forms, and prompts a real user encounters.
+Excel is the most-used software-development surface on Earth. Workbooks
+are programs, ranges are state, COM is the runtime. But it's opaque to
+AI on the *execute* side — existing integrations operate at the
+surface (read a cell, write a cell). They can't run-observe-iterate or
+operate a workbook through its real workflow including the dialogs,
+forms, and prompts a real user encounters.
 
-`excel-control` is the **execute-and-observe** half of the AI-Excel loop.
-
-Combined with vba-sync's read-and-edit half, an AI agent gets the full
+excel-control is the **execute-and-observe** half of the AI-Excel loop.
+Combined with vba-sync's read-and-edit half, an agent gets the full
 development cycle on any Excel workbook:
 
 ```
@@ -23,319 +31,253 @@ read source → reason → edit → execute → observe → iterate → commit
 [vba-sync]                    [excel-control]              [git]
 ```
 
-## The core abstraction: a session, not a CLI
+## Architecture
 
-Initial framing was "one-shot verb scripts: run-macro, compile-check,
-run-tests". That's too narrow. Real Excel workflows have **dialogs,
-UserForms, runtime errors, save-changes prompts, connection-credential
-prompts**. A one-shot script either has to dismiss all of those blindly
-(losing information and breaking the workflow) or wait for user input
-(impossible headless). Neither matches what an AI agent actually needs.
-
-The correct abstraction is a **session**: a long-running PowerShell
-process that holds an Excel instance open and exchanges events with the
-agent over an append-only log. Verb scripts (`run-macro.ps1`,
-`compile-check.ps1`, `run-tests.ps1`) become thin convenience wrappers
-that spin up a one-shot session for simple cases. The real interface is
-the session itself.
-
-## Bidirectional event flow
-
-The session is a true two-way channel:
-
-**Agent → Excel (commands):** run a macro, set a property, compile-check,
-close the workbook, respond to an open dialog/form.
-
-**Excel → Agent (events):** macro completed (with result), runtime error
-raised (with line + description), a dialog appeared (with title, text,
-buttons, screenshot), a UserForm opened (with name, control list,
-screenshot), a status-bar message changed.
-
-**Agent → Excel (responses to events):** click a specific button on the
-dialog Excel just popped, fill a UserForm field with a value, abort the
-running macro, retry.
-
-This means **every dialog Excel shows is now an interface to the AI**,
-not an obstacle. The Win32 dialog watcher's role flips from "dismiss
-everything" to "report everything; act only on explicit response from the
-agent". The same shift applies to UserForms — currently invisible to
-automation, soon a first-class event the agent can introspect and fill.
-
-## Screenshots are first-class
-
-Text introspection of dialogs and forms (window class, control labels,
-button captions) is necessary but not sufficient. The AI needs visual
-context to handle:
-
-- Custom controls that don't expose readable text via Win32
-- Charts visible in the Excel window
-- Conditional formatting and layout cues
-- Dialogs whose text is the same but visual state differs
-- Confirmation that what the agent *thinks* is on screen actually is
-
-So every dialog event, every UserForm event, and the Excel main window
-itself ships with a **screenshot saved to a PNG**. The event JSON
-includes the path. Agent reads text + looks at image via its vision
-model.
-
-Mechanism: PowerShell + `System.Drawing.Graphics.CopyFromScreen` for the
-Excel main window; Win32 `PrintWindow` API for individual dialog/form
-HWNDs (works even when the window is partially obscured). Screenshots
-land in `sessions/<id>/captures/` with predictable names.
-
-## Session protocol (file-based JSONL)
-
-A session lives in a folder. Both sides poll append-only files. Universal
-across agent tools — works with Claude Code Monitor, Cursor, OpenClaw, or
-any script that can read/write a file.
+A **session** is a long-running PowerShell process that holds an Excel
+instance open and exchanges events with the agent over append-only
+JSONL files. The agent can be Claude Code (using Bash + Monitor +
+Write), plain bash + tail, or anything that can read/write files.
 
 ```
-sessions/abc123/
-├── state.json          (pid, workbook path, started-at, status)
-├── commands.jsonl      (agent appends; harness consumes in order)
-├── events.jsonl        (harness appends; agent watches via Monitor)
-└── captures/           (PNG screenshots referenced by events)
+sessions/<id>/
+├── state.json          pid, workbook path, started-at, status
+├── commands.jsonl      agent appends; harness consumes in order
+├── events.jsonl        harness appends; agent watches
+└── captures/           PNG screenshots referenced by events
 ```
 
-### Command shapes (agent → Excel)
+**Harness reads commands.jsonl** via `FileSystemWatcher` (near-zero
+latency on append) with a 2s polling backstop (covers the rare miss).
+Tracks last consumed byte offset in `state.json` for resume.
 
-```json
-{"id": "c1", "cmd": "run_macro", "name": "DoStuff", "args": [42]}
-{"id": "c2", "cmd": "compile_check"}
-{"id": "c3", "cmd": "respond_dialog", "dialog_id": "d7", "button": "OK"}
-{"id": "c4", "cmd": "respond_form", "form_id": "d9",
- "fill": {"Username": "arnaud", "Password": "***"}, "submit": "OK"}
-{"id": "c5", "cmd": "screenshot", "target": "window"}
-{"id": "c6", "cmd": "abort"}
-{"id": "c7", "cmd": "close"}
-```
+**Agent reads events.jsonl** however its toolchain supports — for
+Claude Code that's the `Monitor` tool (push notifications, no polling
+on the agent side).
 
-### Event shapes (Excel → agent)
+**Dialog handling** is the "reporter, not dismisser" model. Every
+modal Excel pops (#32770 or UserForm) becomes a `dialog_appeared` or
+`userform_appeared` event with text, buttons, and a screenshot. The
+agent decides which button via `respond_dialog` / `respond_form`. The
+watcher dispatches the click via WM_COMMAND → BM_CLICK → VK_RETURN →
+WM_CLOSE fallback chain with verify-close polling.
 
-```json
-{"t": "started", "pid": 12345, "workbook": "X.xlsm"}
-{"t": "command_ack", "id": "c1"}
-{"t": "dialog_appeared", "id": "d7", "title": "Microsoft Excel",
- "text": "Save changes?", "buttons": ["Yes", "No", "Cancel"],
- "screenshot": "captures/d7.png"}
-{"t": "userform_appeared", "id": "d9", "name": "LoginForm",
- "fields": [{"name": "Username", "type": "TextBox"},
-            {"name": "Password", "type": "TextBox", "password": true}],
- "buttons": ["OK", "Cancel"],
- "screenshot": "captures/d9.png"}
-{"t": "runtime_error", "id": "c1", "number": 9,
- "description": "Subscript out of range", "module": "modSales", "line": 47,
- "screenshot": "captures/err_c1.png"}
-{"t": "macro_completed", "id": "c1", "result": "OK", "duration_ms": 1340}
-{"t": "status_changed", "text": "Processing 50000 rows..."}
-{"t": "window_screenshot", "id": "c5", "path": "captures/w_c5.png"}
-{"t": "closed"}
-```
+**Screenshots:** `PrintWindow` for individual dialog/form HWNDs (works
+when obscured); `CopyFromScreen` for the Excel main window.
 
-Every event that involves visible state includes a `screenshot` field
-pointing to a PNG. The agent can choose to read it or skip it.
+**No MCP wrapper, no Skill packaging.** Documentation
+(`tools/INTERFACE.md`, regenerated on every Export) is the discovery
+mechanism. Any agent that can append to a file and tail another file
+can drive this.
 
-## Scope: what's IN
+## Features
 
-| Capability                          | Why it's here                       |
-|-------------------------------------|--------------------------------------|
-| Session start/stop                  | The core abstraction                 |
-| Run a named macro                   | Execute VBA from outside             |
-| Compile-check the VBA project       | Quick gate before running anything   |
-| Report dialogs as events            | The bidirectional channel            |
-| Report UserForms as events          | Same — extended to custom forms      |
-| Respond to dialogs/forms            | Closes the loop                      |
-| Screenshot dialogs / forms / window | Visual context for vision models     |
-| Capture runtime errors with context | Error-aware iteration                |
-| Test runner                         | Define + run test suites end-to-end  |
+### Any workbook (no VBA required)
 
-Convenience wrappers (verb scripts on top of the session):
-- `run-macro.ps1` — open session, run one macro, return result, close
-- `compile-check.ps1` — open session, compile, surface errors, close
-- `run-tests.ps1` — open session, run a test suite, report, close
+| Command | Purpose |
+|---------|---------|
+| `run_macro` | Execute a Sub/Function, get result + event stream |
+| `read_range` | Read cell values/formulas from a range |
+| `write_range` | Write values to a range |
+| `screenshot` | Capture dialog / form / Excel window / specific sheet |
+| `respond_dialog` | Click a named button on an open modal |
+| `respond_form` | Fill UserForm fields and submit |
+| `save_workbook` / `save_as` | Explicit save control |
+| `calculate` / `refresh_all` | Application.Calculate / Workbook.RefreshAll |
+| `refresh_connection` | Refresh a specific data connection; capture errors |
+| `list_sheets` | Sheet name, index, used range, tables, hidden, protected |
+| `get_workbook_info` | Size, sheet count, has-vba, has-pivots, has-connections, etc. |
+| `open_workbook` / `close_workbook` | Multi-workbook sessions |
+| `create_workbook` | New workbook from scratch |
+| `abort` / `close` | Cancel running macro / end session |
 
-The verb scripts cover the simple cases; agents that want interactive
-control speak to the session directly.
+### Spontaneous events (any workbook)
 
-## Scope: what's OUT
+Excel can surface things the agent didn't ask for:
 
-**Read/write/eval of cell data is intentionally out of scope.** VBA inside
-the workbook already does this. If an agent needs to read a range, it
-should call a macro that returns the data. We don't duplicate VBA's job
-from outside.
+| Event | When |
+|-------|------|
+| `dialog_appeared` | Unsolicited modal (link update prompt, etc.) |
+| `userform_appeared` | A macro showed a UserForm |
+| `connection_failed` | A data refresh failed |
+| `workbook_closed` | User closed Excel manually |
+| `status_changed` | `Application.StatusBar` updated |
 
-Also out:
+### With VBA (additional commands)
 
-- UI interaction beyond dialogs/forms (no clicking ribbon, no menu navigation)
-- Replacement for the vba-sync addin (humans still click "Export" in Excel)
-- Abstraction layer over the Excel object model (no DSL)
-- Parsing OOXML directly (we drive live Excel via COM)
-- macOS support (Windows COM only)
-- A general-purpose Office automation framework (Word, PowerPoint, etc.)
-- Recording / replaying user macros — separate problem space
+| Command | Purpose |
+|---------|---------|
+| `compile_check` | VBE compile, returns pass or module:line:message |
+| `sync_vba` | Strip + re-import .bas/.cls/.frm from disk (no .xlam dep) |
+| `run_tests` | Discover + run `Test_*` Subs, per-test pass/fail/error |
+| `list_macros` | All public Subs/Functions across modules with signatures |
 
-## Distribution
+### With VBA (additional events)
 
-Two channels, in order:
+| Event | When |
+|-------|------|
+| `runtime_error` | Macro raised an error; includes number, description, module, line, screenshot |
+| `debug_print` | `Debug.Print` output drained from the VBE Immediate window |
 
-1. **Bundled in every vba-sync export.** When a user clicks "Export
-   VBA", the resulting workbook repo gets a `tools/` folder containing
-   the excel-control scripts. Zero install, ships with the source.
-2. **Standalone (later).** Cloneable / installable independently for use
-   against any .xlsm without vba-sync involvement.
+## Distribution and dependencies
 
-## Primary user
+**Bundled via vba-sync.** When the user clicks **Export**, `modSync.WriteHarness`
+copies `excel-control/*.ps1` into `<exported workbook>/tools/`, alongside
+the regenerated `tools/INTERFACE.md`. Zero setup for downstream agents.
 
-- **AI agents** (Claude Code, GPT, Cursor, OpenClaw, etc.) operating on
-  a workbook repo end-to-end
-- Secondary: humans writing CI / regression pipelines for Excel workbooks
-- Tertiary: humans debugging a macro interactively from a terminal
+**Standalone install supported** — clone the repo, run scripts directly
+against any workbook. No vba-sync dependency.
 
-## Success criteria
+**No `VBA Sync.xlam` dependency at runtime.** The `sync_vba` command
+reimplements the strip-and-import logic directly via COM in PowerShell
+(~20 lines) rather than shelling out to `'VBA Sync.xlam'!modSync.ImportProject`.
 
-- An AI agent given a workbook repo can: open a session, run a macro,
-  see the dialog the macro pops, decide based on its text and
-  screenshot, click the right button, observe the result, fix a compile
-  error, re-run, run a test suite — all from one session, with zero
-  manual intervention.
-- Every dialog the workbook can produce becomes a reportable event
-  before the agent has to know about it. No "I didn't see that dialog"
-  surprises.
-- Screenshot capture works on dialogs whether visible or fully obscured
-  (PrintWindow handles the offscreen case).
-- Reliable every time on Windows 10+ / Office 365 — no flaky 1004s, no
-  race conditions, no manual dismissal.
-- Each verb script is a thin (~100-line) wrapper over the session;
-  session itself is the substantive code (estimated ~800 lines).
+**Conventions shared with vba-sync** (no formal contract, just a
+sensible folder layout):
+- `Modules/*.bas` — standard modules
+- `ClassModules/*.cls` — class modules
+- `Forms/*.frm` (+ `.frx`) — UserForms
 
-## Claude Code integration patterns
+This is where vba-sync exports VBA source, and where excel-control
+imports it back from. Same folder shape, no spec doc needed.
 
-Specifically how a Claude Code session uses this:
+## Documentation model
 
-1. **Start session in background:**
-   `Bash` with `run_in_background=true` invokes
-   `tools/start-session.ps1 -Workbook X.xlsm -SessionId abc123`.
-   The process stays alive; Claude Code returns immediately with the
-   session id.
+- **Repo `README.md`** — mentions excel-control as a feature of vba-sync's Export.
+- **Workbook `README.md`** (the one `modSync.WriteReadme` already generates per
+  export) — written once, never overwritten. References `tools/INTERFACE.md`
+  for the agent-facing harness docs.
+- **`tools/INTERFACE.md`** — full agent-facing command + event reference.
+  Overwritten on every Export so it always reflects the bundled harness
+  version. This is what the agent reads to learn the interface.
+- **`tools/.claude/settings.json`** — pre-approved permissions so Claude
+  Code doesn't prompt for every Bash/Read/Write/Monitor call against
+  the session files.
 
-2. **Watch events via `Monitor`:** Monitor tails
-   `tools/sessions/abc123/events.jsonl`. Each new line is a notification
-   to the agent. The agent reads `t` to dispatch on event type, reads
-   `screenshot` path if visual context is needed.
+## Build plan
 
-3. **Send commands via `Write`/`Edit`:** the agent appends to
-   `tools/sessions/abc123/commands.jsonl`. The harness's own polling
-   loop picks them up.
+One feature per PR. Each phase delivers a working command, a fixture
+test, and an INTERFACE.md update.
 
-4. **End the session:** append `{"cmd": "close"}` and unmonitor.
+| # | Feature | Effort |
+|---|---------|--------|
+| 1 | Test fixture workbooks | 1-2h |
+| 2 | Session host + `run_macro` (JSONL + FileSystemWatcher + polling backstop) | 4-6h |
+| 3 | `respond_dialog` + dialog reporter | 3-4h |
+| 4 | Screenshots (PrintWindow + CopyFromScreen) | 3-4h |
+| 5 | `runtime_error` capture | 2-3h |
+| 6 | `compile_check` + `sync_vba` (PS-native, no .xlam) | 3h |
+| 6.5 | `read_range` + `write_range` | 1-2h |
+| 6.7 | `Debug.Print` capture | 2h |
+| 6.8 | `list_macros` + `list_sheets` + `get_workbook_info` | 2h |
+| 7 | `run_tests` + `clsAssert.cls` | 3-4h |
+| 7.5 | `save_workbook` + `calculate` + `refresh_all` + `refresh_connection` | 2-3h |
+| 8 | `respond_form` + UserForm introspection | 4-5h |
+| 8.5 | `open_workbook` + `close_workbook` | 1-2h |
+| 8.7 | `create_workbook` | 1h |
+| 9 | `WriteHarness` in `modSync.bas` + `INTERFACE.md` + `.claude/settings.json` + bundling | 2-3h |
 
-This is symmetric file-polling. No special pipes, no IPC libraries, no
-Excel-specific protocols on the agent side. Anything that can read and
-write files can drive this.
+Total: ~34-44h.
 
-## Architecture decisions (locked)
+## Test strategy
 
+`excel-control/tests/fixtures/` — 6 generated `.xlsm` files exercising
+the dialog/form/error/lock cases. Built reproducibly by a generator
+script.
+
+`excel-control/tests/test-*.ps1` — one ps1 per scenario. Self-contained
+(spawns its own Excel PID, asserts via throw on failure, kills orphan
+EXCEL.EXE on teardown).
+
+`excel-control/tests/run-all.ps1` — discovers and runs all `test-*.ps1`
+serially (Excel COM doesn't parallelise well). Per-test timeout. Exit
+code = fail count.
+
+No CI initially — local-run only. GitHub Actions Windows runner is
+viable later but flaky-Excel-in-CI is a known pain.
+
+## Decisions locked in
+
+- **Session-based**, not one-shot CLI commands. The dialog/form flow
+  requires a long-running channel.
+- **File-based JSONL append-only protocol.** Universal across agent
+  toolchains. No MCP, no Skill metadata, no special IPC libraries.
+- **`FileSystemWatcher` + 2s polling backstop** for command reads on
+  the harness side.
+- **`PrintWindow` for dialog/form capture**, `CopyFromScreen` for the
+  main window.
+- **Reporter, not dismisser.** The watcher reports every modal as an
+  event and only acts on explicit `respond_*` commands.
+- **One session = one spawned Excel PID.** No attaching to existing
+  Excel instances. Multiple workbooks in one session = yes.
+- **Hard fail on missing dependencies** — PowerShell, tar.exe,
+  System.Drawing not present → exit visibly, no silent degradation.
 - **PowerShell scripts**, not a compiled binary. Lowest install
-  friction; PS5+ ships on every Windows 10+ box.
-- **Session is primary; verb scripts are wrappers.** Don't design the
-  scripts first and bolt on a session — the other way around.
-- **File-based JSONL append-only protocol** for the bidirectional
-  channel. Universal across agent toolchains.
-- **One screenshot per visible-state event.** PNG, lossless, in
-  `sessions/<id>/captures/`. Path included in the event JSON.
-- **Win32 PrintWindow for dialog/form capture** — works even when the
-  target is fully obscured. CopyFromScreen for the main Excel window.
-- **Synchronous extraction primitive** (already proven in vba-sync via
-  `tar.exe`) for any zip work — no race conditions.
-- **Hard fail on missing dependencies.** If PowerShell, tar.exe, or
-  System.Drawing is missing/blocked, fail visibly. No silent
-  degradation.
-- **Win32 dialog watcher = bidirectional event source.** Not a
-  "dismisser". It reports everything and only acts when told.
+  friction; ships on every Windows 10+ box.
+- **`sync_vba` reimplements import in pure PowerShell** — no
+  `VBA Sync.xlam` runtime dependency.
+- **Same repo as vba-sync**, two directories, one top-level README.
+
+## Out of scope
+
+- MCP server wrapper (documented interface + file IPC is sufficient)
+- Claude Code Skill metadata (same)
+- Read/write of cell formatting (fill, font, borders) — belongs in
+  VBA; out-of-VBA cell IO is for values + formulas only
+- Breakpoints / step debugging in VBE — too much surface area
+- UI interaction beyond dialogs/forms (no ribbon clicks, no menu drive)
+- macOS support (Windows COM only)
+- General Office automation (Word, PowerPoint, etc.)
+- Recording / replaying interactive sessions
+- Pivot tables / Power Query / DAX automation (use sbroenne/mcp-server-excel
+  if you need that; excel-control is for session-based workbook driving)
 
 ## Open questions
 
-- **Session lifetime.** One session per workbook open, or can one
-  session host multiple workbooks?
-- **Concurrent sessions.** Can two sessions run against the same Excel
-  instance? Likely no (Excel is single-threaded). Different instances?
-- **Screenshot redaction.** UserForms may contain passwords or
-  sensitive data. Should we offer a `redact_text` flag, or rely on the
-  agent to decide?
-- **Test runner shape.** What does a test look like? A VBA `Sub` with a
-  naming convention (`Test_*`)? A separate `.tests.bas`? A test
-  manifest? Need to design.
-- **Standalone install path.** When (not if) we support standalone,
-  where? `%APPDATA%`? `~/.excel-control/`? `Program Files`?
-- **Versioning.** Independent of vba-sync, or aligned? Probably
-  independent.
-- **MCP wrapper (later).** Wrap the session protocol as MCP tools so
-  any MCP-capable client (Claude desktop, Cursor) can call it natively.
-- **Auth/credentials handling.** Connection prompts will ask for
-  passwords. Pass through? Vault integration? Out of scope?
+- **Session lifetime on workbook close.** If the user closes the workbook
+  in Excel directly, session should emit `workbook_closed` and stay
+  alive or auto-shut down?
+- **Concurrent commands.** Block while one command is running, or queue
+  with command_ack ordering? Probably block — Excel COM doesn't like
+  reentry.
+- **Screenshot redaction.** Opt-in `redact_text` flag (default off) or
+  always rely on agent discretion? Probably the flag — useful for known
+  password fields.
+- **Events.jsonl rotation.** Defer until it actually bites; document
+  10MB as a soft cap.
 
-## Current state
+## Current state (as of this commit)
 
-The folder contains two layers:
+Three working PowerShell scripts on the `excel-control` branch:
 
-**Prototype (vba-sync-development inner loop)**
+- `bidirectional-dialog-watcher.ps1` — the v2 "reporter" watcher.
+  Single ModalFile/ActionFile IPC. Will be subsumed by the JSONL
+  session protocol in Phase 3 (the single-file IPC goes away
+  entirely — no backward compat).
+- `unlock-vba-project.ps1` — drives the VBE Tools menu (control id
+  2578) to surface the VBAProject Password dialog, fills via
+  WM_SETTEXT + WM_COMMAND IDOK. Generic utility, kept.
+- `sync-vba-to-workbook.ps1` — composed flow that opens a workbook,
+  optionally unlocks VBA, runs vba-sync's `ImportProject` via COM,
+  saves, closes. Will be rewritten in Phase 6 as the `sync_vba`
+  session command (no `.xlam` dependency).
 
-`harness.ps1`, `dialog-watcher.ps1`, `find-compile-error.ps1` were built
-during vba-sync's `excel-export-rewrite` work to drive vba-sync from
-CLI. The watcher there is the **dismiss** variant (single capture, auto
-WM_COMMAND IDCANCEL). Good for the vba-sync inner loop where any modal
-is a known failure to surface. See `PROTOTYPE_README.md`.
+Prototype scripts (`harness.ps1`, `dialog-watcher.ps1`,
+`find-compile-error.ps1`) remain for the vba-sync inner-loop work.
+They sit alongside but are independent of the session protocol.
 
-**Generic utilities (workbook-driving)**
+## Next: Phase 1
 
-Added from a workbook-driving session that exercised every fundamental
-modal-handling case (success MsgBox, validation error, runtime error,
-custom UserForm, password dialog). These advance the prototype toward
-the session model in this doc without yet implementing the full JSONL
-protocol — they ship the "reporter, not dismisser" decision and the
-generic Open + ImportProject + Save flow.
+Build the test fixture workbooks. Six `.xlsm` files generated by one
+reproducible PowerShell script:
 
-- `bidirectional-dialog-watcher.ps1` — the v2 "reporter" watcher. Writes
-  modal JSON to a file, blocks on an agent-written action file, then
-  clicks the chosen button via the WM_COMMAND -> BM_CLICK -> VK_RETURN
-  -> WM_CLOSE chain with verify-close polling. IPC file shape is
-  compatible with the future JSONL session protocol (single event per
-  file -> append-only events.jsonl is a layer change, not a rewrite).
-- `unlock-vba-project.ps1` — `Unlock-VbaProject -Xl -Password`. Drives
-  the VBE "VBAProject Properties..." command (control id 2578) and
-  fills the password dialog via WM_SETTEXT + IDOK. No SendKeys, no
-  foreground focus required.
-- `sync-vba-to-workbook.ps1` — open a workbook, run vba-sync
-  `ImportProject` via COM, save, close. Passes
-  `IgnoreReadOnlyRecommended = True` so workbooks with that flag set
-  internally don't open read-only. Auto-dismisses vba-sync's known
-  "Import completed" success modal so the flow is one CLI invocation.
+- `empty.xlsm` — baseline
+- `msgbox.xlsm` — Sub that pops MsgBox vbOKCancel
+- `userform.xlsm` — UserForm with Username/Password/RememberMe + OK/Cancel
+- `runtime-error.xlsm` — Sub that raises Err 9
+- `password-locked.xlsm` — same as msgbox but with VBProject password = "test"
+- `obscured.xlsm` — same as msgbox; "obscured" condition is created at test
+  time by the driver opening another window over Excel
 
-These together provide the agent-driving substrate the session protocol
-will sit on top of. The work this branch still owes is the session
-abstraction itself, screenshots, UserForm introspection, the test
-runner, and the `WriteHarness` step in `modSync.bas`.
-
-The productization work this branch will do:
-
-1. **Design the session protocol fully** (JSONL schema, error paths,
-   timeout behaviour, file rotation if events.jsonl grows large)
-2. **Implement `start-session.ps1`** — the core long-running process
-3. **Add screenshot capture** for dialogs, UserForms, Excel main window
-4. **Extend dialog watcher** from dismisser to reporter; add
-   form-introspection (enumerate UserForm controls)
-5. **Build verb wrappers** `run-macro.ps1`, `compile-check.ps1`,
-   `run-tests.ps1` on top of the session
-6. **Design and implement the test runner**
-7. **Add `WriteHarness` to vba-sync's `modSync.bas`** so the export
-   emits `tools/` into every workbook repo
-8. **Documentation**: per-script user docs, agent-integration guide
-
-## Out of scope for THIS branch
-
-- MCP server wrapper (v2)
-- PS module packaging (v2)
-- Standalone install path (later)
-- macOS support (never)
-- General Office automation (never)
-- Recording / replaying interactive sessions for replay testing
+Generator: `excel-control/tests/fixtures/build-fixtures.ps1`. Commits
+both the generator and the resulting `.xlsm` files. Re-runnable to
+regenerate.
