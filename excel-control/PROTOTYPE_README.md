@@ -6,11 +6,13 @@ and runtime failures inside `modExcelExport.DoExportExcelStructure`.
 
 ## Files
 
+### Prototype (vba-sync inner loop)
+
 - `dialog-watcher.ps1` — Win32 modal-dialog watcher in a separate PS runspace.
   Polls for `#32770` dialogs owned by our Excel PID, captures their static-text
-  content, then dismisses via `WM_COMMAND IDCANCEL` (= "End" for VBA error
-  dialogs, "Cancel" for system prompts). Sourced from
-  `~/Dev/vba-dataset/tools/dialog-watcher.ps1` — keep in sync if you tweak it.
+  content, then **dismisses** via `WM_COMMAND IDCANCEL`. The "dismisser"
+  model. For workbook-driving where modals carry decisions the agent must
+  act on, use `bidirectional-dialog-watcher.ps1` (below) instead.
 
 - `harness.ps1` — main runner. Rebuilds `VBA Sync.xlam` by stripping +
   re-importing all `.bas/.cls/.frm` from `VBA Sync/`, opens a target workbook
@@ -25,14 +27,48 @@ and runtime failures inside `modExcelExport.DoExportExcelStructure`.
   line + source context. Use when the harness reports a captured "Compile
   error" dialog but you need to know WHICH line.
 
+### Generic utilities (any workbook)
+
+- `bidirectional-dialog-watcher.ps1` — the v2 "reporter" watcher. Writes
+  every modal it sees as JSON to `$ModalFile`, blocks until the agent
+  writes a button label to `$ActionFile`, then dispatches the click via
+  WM_COMMAND -> BM_CLICK -> VK_RETURN -> WM_CLOSE with verify-close
+  polling. The file IPC is the bridge to any agent toolchain (Claude
+  Code, MCP, plain bash). Will be subsumed by the JSONL session protocol
+  in `SCOPING.md` — current file shape is a single-event precursor.
+
+- `unlock-vba-project.ps1` — `Unlock-VbaProject -Xl -Password`. Drives
+  the VBE Tools menu (control id 2578) to surface the modal "VBAProject
+  Password" dialog, then fills + submits via Win32 messages. Works
+  without focus; needed before `ImportProject` on any password-protected
+  project.
+
+- `sync-vba-to-workbook.ps1` — open + vba-sync `ImportProject` + save +
+  close. Handles `ReadOnlyRecommended` correctly (the default Open
+  behaviour silently opens read-only and trips Save), unlocks the VBA
+  project if needed, and auto-OKs vba-sync's success modal. Useful one-
+  shot for "bake the committed source into the .xlsm before client push".
+
 ## Usage
 
 ```powershell
-# Pinpoint a compile error after editing .bas:
-& .\.scratch\find-compile-error.ps1
+# Pinpoint a compile error after editing .bas (prototype):
+& .\find-compile-error.ps1
 
-# End-to-end run against a target workbook:
-& .\.scratch\harness.ps1 -Target 'C:\path\to\Whatever.xlsm'
+# End-to-end vba-sync export run against a target workbook (prototype):
+& .\harness.ps1 -Target 'C:\path\to\Whatever.xlsm'
+
+# Bake the committed VBA source into a workbook binary (generic):
+& .\sync-vba-to-workbook.ps1 -WorkbookPath 'C:\path\to\Workbook.xlsm' -VbaPassword 'secret' -Trace
+
+# Run a macro while letting an agent decide every modal (generic, foundation
+# for the future session protocol):
+. .\bidirectional-dialog-watcher.ps1
+$watcher = Start-DialogWatcher -ProcessId $xlPid
+try { $xl.Run("'Workbook.xlsm'!SomeMacro") }
+finally { Stop-DialogWatcher $watcher }
+# Agent reads c:\tmp\excel-control-modal.json, writes button label to
+# c:\tmp\excel-control-action.txt for each modal.
 ```
 
 ## Why these matter

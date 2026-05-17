@@ -276,16 +276,45 @@ write files can drive this.
 
 ## Current state
 
-`harness.ps1`, `dialog-watcher.ps1`, `find-compile-error.ps1` in this
-folder are the **prototype** built during vba-sync's
-`excel-export-rewrite` work. They were built to drive vba-sync
-development from CLI; they happen to demonstrate every fundamental
-capability listed above except screenshots, session protocol, and
-form-response.
+The folder contains two layers:
 
-`PROTOTYPE_README.md` is the original developer-facing README for the
-prototype. Kept as reference; will be superseded by per-script + session
-docs.
+**Prototype (vba-sync-development inner loop)**
+
+`harness.ps1`, `dialog-watcher.ps1`, `find-compile-error.ps1` were built
+during vba-sync's `excel-export-rewrite` work to drive vba-sync from
+CLI. The watcher there is the **dismiss** variant (single capture, auto
+WM_COMMAND IDCANCEL). Good for the vba-sync inner loop where any modal
+is a known failure to surface. See `PROTOTYPE_README.md`.
+
+**Generic utilities (workbook-driving)**
+
+Added from a workbook-driving session that exercised every fundamental
+modal-handling case (success MsgBox, validation error, runtime error,
+custom UserForm, password dialog). These advance the prototype toward
+the session model in this doc without yet implementing the full JSONL
+protocol — they ship the "reporter, not dismisser" decision and the
+generic Open + ImportProject + Save flow.
+
+- `bidirectional-dialog-watcher.ps1` — the v2 "reporter" watcher. Writes
+  modal JSON to a file, blocks on an agent-written action file, then
+  clicks the chosen button via the WM_COMMAND -> BM_CLICK -> VK_RETURN
+  -> WM_CLOSE chain with verify-close polling. IPC file shape is
+  compatible with the future JSONL session protocol (single event per
+  file -> append-only events.jsonl is a layer change, not a rewrite).
+- `unlock-vba-project.ps1` — `Unlock-VbaProject -Xl -Password`. Drives
+  the VBE "VBAProject Properties..." command (control id 2578) and
+  fills the password dialog via WM_SETTEXT + IDOK. No SendKeys, no
+  foreground focus required.
+- `sync-vba-to-workbook.ps1` — open a workbook, run vba-sync
+  `ImportProject` via COM, save, close. Passes
+  `IgnoreReadOnlyRecommended = True` so workbooks with that flag set
+  internally don't open read-only. Auto-dismisses vba-sync's known
+  "Import completed" success modal so the flow is one CLI invocation.
+
+These together provide the agent-driving substrate the session protocol
+will sit on top of. The work this branch still owes is the session
+abstraction itself, screenshots, UserForm introspection, the test
+runner, and the `WriteHarness` step in `modSync.bas`.
 
 The productization work this branch will do:
 
