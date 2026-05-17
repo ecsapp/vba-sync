@@ -129,6 +129,7 @@ function Invoke-Macro($Xl, [string]$MacroName, [object[]]$Args) {
         $null, $Xl, $all)
 }
 
+
 function Handle-Command($Xl, $Wb, $cmd) {
     switch ($cmd.cmd) {
         'respond_dialog' {
@@ -140,28 +141,39 @@ function Handle-Command($Xl, $Wb, $cmd) {
         'run_macro' {
             $start = [DateTime]::UtcNow
             try {
-                $args = @()
-                if ($null -ne $cmd.args) { $args = @($cmd.args) }
-                # Qualify with workbook name to avoid "macro not available"
-                # when multiple workbooks are open or modules don't resolve
-                # globally. Excel.Application.Run accepts "'wbname'!Macro".
+                $macroArgs = @()
+                if ($null -ne $cmd.args) { $macroArgs = @($cmd.args) }
                 $macroRef = "'$($Wb.Name)'!$($cmd.name)"
-                $result = Invoke-Macro -Xl $Xl -MacroName $macroRef -Args $args
-                $duration = [int]([DateTime]::UtcNow - $start).TotalMilliseconds
+                if ($macroArgs.Count -eq 0) {
+                    $result = $Xl.Run($macroRef)
+                } else {
+                    $result = Invoke-Macro -Xl $Xl -MacroName $macroRef -Args $macroArgs
+                }
                 Write-EventLine @{
                     t = 'macro_completed'
                     id = $cmd.id
                     name = $cmd.name
                     result = $result
-                    duration_ms = $duration
+                    duration_ms = [int]([DateTime]::UtcNow - $start).TotalMilliseconds
                 }
             } catch {
+                # If the dialog watcher already emitted a runtime_error
+                # for this macro, that's the structured signal. The
+                # COMException here is the same error coming back through
+                # COM after the watcher auto-clicked End. We still emit
+                # macro_failed for completeness (the agent can correlate
+                # by id).
+                $ex = $_.Exception
+                $msg = $ex.Message
+                $cur = $ex
+                while ($cur.InnerException) { $cur = $cur.InnerException; if ($cur.Message) { $msg = $cur.Message } }
                 Write-EventLine @{
                     t = 'macro_failed'
                     id = $cmd.id
                     name = $cmd.name
-                    error = $_.Exception.Message
-                    error_type = $_.Exception.GetType().FullName
+                    error = $msg
+                    error_type = $ex.GetType().FullName
+                    hresult = $ex.HResult
                 }
             }
         }
@@ -247,6 +259,7 @@ try {
         -CapturesDir  $capturesDir
     $script:Watcher     = $watcher
     $script:CapturesDir = $capturesDir
+    $script:SessionDir  = $sessionDir
 
     while (-not $script:Stop) {
         $cmds = Read-NewCommands

@@ -291,9 +291,18 @@ namespace XcDialog {
                 }
 
                 $buttonNames = @($payload.Buttons | ForEach-Object { $_.Caption })
-                $eventType = if ($cls -eq 'ThunderDFrame' -or $cls -like 'F3*' -or $cls -like 'bosa*') { 'userform_appeared' } else { 'dialog_appeared' }
-                # Snapshot the dialog. PrintWindow works even when the
-                # dialog is partially obscured by other windows.
+                # Classify the dialog. VBA's "Microsoft Visual Basic"
+                # runtime-error dialog has a distinctive body
+                # "Run-time error 'N':\n\n<description>" and buttons
+                # &Continue / &End / &Debug / &Help. We turn that into a
+                # structured `runtime_error` event AND auto-dispatch End
+                # (the macro is unrecoverable from outside).
+                $isRtError = ($caption -eq 'Microsoft Visual Basic' -and $payload.Body -match "Run-time error '(\d+)'\s*[:\.]?\s*(.*)$")
+                $eventType =
+                    if ($isRtError) { 'runtime_error' }
+                    elseif ($cls -eq 'ThunderDFrame' -or $cls -like 'F3*' -or $cls -like 'bosa*') { 'userform_appeared' }
+                    else { 'dialog_appeared' }
+
                 $shotPath = $null
                 $shotErr  = $null
                 try {
@@ -301,6 +310,7 @@ namespace XcDialog {
                     [void](Capture-WindowPng -Hwnd $hwnd.ToInt64() -Path $shotPath)
                     if (-not (Test-Path $shotPath)) { $shotPath = $null; $shotErr = 'png not written' }
                 } catch { $shotPath = $null; $shotErr = $_.Exception.Message }
+
                 $ev = @{
                     t = $eventType
                     id = $id
@@ -311,7 +321,21 @@ namespace XcDialog {
                     screenshot = $shotPath
                 }
                 if ($shotErr) { $ev.screenshot_error = $shotErr }
+                if ($isRtError) {
+                    $ev.number = [int]$Matches[1]
+                    $ev.description = $Matches[2].Trim()
+                }
                 Append-Event $ev
+
+                # For runtime errors, immediately dispatch End so the macro
+                # returns to COM and PowerShell unblocks. The agent can't
+                # respond to a runtime-error mid-macro anyway.
+                if ($isRtError) {
+                    $info = $state.DialogInfo[$id]
+                    $null = Dispatch-Click -dialogInfo $info -buttonLabel '&End'
+                    [void]$state.ActiveDialogs.Remove($key)
+                    [void]$state.DialogInfo.Remove($id)
+                }
             }
 
             # Externally-closed dialogs

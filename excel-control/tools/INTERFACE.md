@@ -93,6 +93,7 @@ Event stream:
 | `dialog_dismissed` | `id` (command id), `dialog_id`, `button` | The dialog watcher clicked your chosen button and the dialog closed |
 | `dialog_closed_externally` | `id` (dialog id) | A dialog vanished without a `respond_dialog` command (user closed it, macro ended) |
 | `respond_failed` | `id`, `dialog_id`, `reason` | Watcher could not dispatch the click (unknown id, dialog didn't close) |
+| `runtime_error` | `id` (dialog id), `number`, `description`, `title`, `text`, `screenshot` | The VBA "Microsoft Visual Basic" runtime-error dialog appeared. Watcher parses Err number + description from body and auto-clicks End so PowerShell unblocks. Correlate to the macro via ordering — this event sits between `command_ack` and `macro_failed` for the same `run_macro` |
 
 ## `screenshot`
 
