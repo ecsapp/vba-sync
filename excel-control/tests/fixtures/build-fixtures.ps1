@@ -47,7 +47,12 @@ function Save-Macro-Workbook($wb, [string]$Path) {
 function Add-StdModule($wb, [string]$Name, [string]$Code) {
     $comp = $wb.VBProject.VBComponents.Add($VBEXT_CT_STDMODULE)
     $comp.Name = $Name
-    $comp.CodeModule.AddFromString($Code)
+    # VBE may auto-insert "Option Explicit" depending on the user's editor
+    # settings ("Require Variable Declaration"). Strip any pre-existing
+    # lines so AddFromString's content is the whole module.
+    $cm = $comp.CodeModule
+    if ($cm.CountOfLines -gt 0) { $cm.DeleteLines(1, $cm.CountOfLines) }
+    $cm.AddFromString($Code)
 }
 
 # ---------- fixtures ----------
@@ -151,7 +156,9 @@ Private Sub cmdCancel_Click()
     Me.Hide
 End Sub
 '@
-        $form.CodeModule.AddFromString($formCode)
+        $fcm = $form.CodeModule
+        if ($fcm.CountOfLines -gt 0) { $fcm.DeleteLines(1, $fcm.CountOfLines) }
+        $fcm.AddFromString($formCode)
 
         $stdCode = @'
 Option Explicit

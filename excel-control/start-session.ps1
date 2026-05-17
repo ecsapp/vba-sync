@@ -29,6 +29,21 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+. (Join-Path $PSScriptRoot 'session-dialog-watcher.ps1')
+
+# Win32 declaration to grab Excel's PID from its HWND
+if (-not ([System.Management.Automation.PSTypeName]'XcSession.Win32').Type) {
+    Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+namespace XcSession {
+  public static class Win32 {
+    [DllImport("user32.dll", SetLastError = true)] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+  }
+}
+"@
+}
+
 $sessionDir   = Join-Path $SessionsRoot $SessionId
 $capturesDir  = Join-Path $sessionDir 'captures'
 $stateFile    = Join-Path $sessionDir 'state.json'
@@ -115,12 +130,22 @@ function Invoke-Macro($Xl, [string]$MacroName, [object[]]$Args) {
 
 function Handle-Command($Xl, $Wb, $cmd) {
     switch ($cmd.cmd) {
+        'respond_dialog' {
+            # Owned by the dialog watcher (separate runspace). Main loop
+            # already skipped these — this branch is here as a safety net
+            # in case the dispatch routing changes.
+            return
+        }
         'run_macro' {
             $start = [DateTime]::UtcNow
             try {
                 $args = @()
                 if ($null -ne $cmd.args) { $args = @($cmd.args) }
-                $result = Invoke-Macro -Xl $Xl -MacroName $cmd.name -Args $args
+                # Qualify with workbook name to avoid "macro not available"
+                # when multiple workbooks are open or modules don't resolve
+                # globally. Excel.Application.Run accepts "'wbname'!Macro".
+                $macroRef = "'$($Wb.Name)'!$($cmd.name)"
+                $result = Invoke-Macro -Xl $Xl -MacroName $macroRef -Args $args
                 $duration = [int]([DateTime]::UtcNow - $start).TotalMilliseconds
                 Write-EventLine @{
                     t = 'macro_completed'
@@ -156,6 +181,8 @@ $xl = New-Object -ComObject Excel.Application
 $xl.Visible = $false
 $xl.DisplayAlerts = $false
 $xl.AskToUpdateLinks = $false
+# Low = let macros run (default ForceDisable would block xl.Run)
+$xl.AutomationSecurity = 1
 $wb = $null
 
 try {
@@ -167,10 +194,21 @@ try {
     Write-EventLine @{ t = 'started'; pid = $PID; workbook = $resolvedWb; session_id = $SessionId }
     Write-Host "Session $SessionId started (pid=$PID, workbook=$resolvedWb)" -ForegroundColor Cyan
 
+    # Determine Excel's PID (not our $PID) so the watcher targets the right process
+    $excelPid = [uint32]0
+    [XcSession.Win32]::GetWindowThreadProcessId([IntPtr]$xl.Hwnd, [ref]$excelPid) | Out-Null
+
+    $watcher = Start-SessionDialogWatcher `
+        -ProcessId    $excelPid `
+        -EventsFile   $eventsFile `
+        -CommandsFile $commandsFile
+
     while (-not $script:Stop) {
         $cmds = Read-NewCommands
         foreach ($entry in $cmds) {
             $cmd = $entry.obj
+            # respond_dialog is owned by the watcher runspace — skip in main
+            if ($cmd.cmd -eq 'respond_dialog') { continue }
             Write-EventLine @{ t = 'command_ack'; id = $cmd.id; cmd = $cmd.cmd }
             Save-State 'busy'
             Handle-Command -Xl $xl -Wb $wb -cmd $cmd
@@ -187,6 +225,7 @@ catch {
     Write-Host "Session $SessionId crashed: $($_.Exception.Message)" -ForegroundColor Red
 }
 finally {
+    if ($watcher) { try { Stop-SessionDialogWatcher $watcher } catch {} }
     try { if ($wb) { $wb.Close($false) } } catch {}
     try { $xl.Quit() } catch {}
     try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($xl) | Out-Null } catch {}
