@@ -292,12 +292,22 @@ namespace XcDialog {
 
                 $buttonNames = @($payload.Buttons | ForEach-Object { $_.Caption })
                 # Classify the dialog. VBA's "Microsoft Visual Basic"
-                # runtime-error dialog has a distinctive body
-                # "Run-time error 'N':\n\n<description>" and buttons
-                # &Continue / &End / &Debug / &Help. We turn that into a
-                # structured `runtime_error` event AND auto-dispatch End
-                # (the macro is unrecoverable from outside).
-                $isRtError = ($caption -eq 'Microsoft Visual Basic' -and $payload.Body -match "Run-time error '(\d+)'\s*[:\.]?\s*(.*)$")
+                # runtime-error dialog has buttons &Continue / &End /
+                # &Debug / &Help. We turn it into a structured
+                # `runtime_error` event AND auto-dispatch End (the macro
+                # is unrecoverable from outside).
+                #
+                # Detection: caption == "Microsoft Visual Basic" is the
+                # strong signal — works for any error format including
+                # negative codes (vbObjectError-based) and the
+                # "N (hexcode)" rendering of those.
+                $isRtError = ($caption -eq 'Microsoft Visual Basic')
+                $rtNum  = 0
+                $rtDesc = $payload.Body
+                if ($isRtError -and $payload.Body -match "Run-time error '(-?\d+)(?:\s*\([0-9A-Fa-f]+\))?'\s*[:\.]?\s*(.*)$") {
+                    $rtNum  = [int64]$Matches[1]
+                    $rtDesc = $Matches[2].Trim()
+                }
                 $eventType =
                     if ($isRtError) { 'runtime_error' }
                     elseif ($cls -eq 'ThunderDFrame' -or $cls -like 'F3*' -or $cls -like 'bosa*') { 'userform_appeared' }
@@ -322,8 +332,8 @@ namespace XcDialog {
                 }
                 if ($shotErr) { $ev.screenshot_error = $shotErr }
                 if ($isRtError) {
-                    $ev.number = [int]$Matches[1]
-                    $ev.description = $Matches[2].Trim()
+                    $ev.number = $rtNum
+                    $ev.description = $rtDesc
                 }
                 Append-Event $ev
 

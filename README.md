@@ -94,6 +94,28 @@ Excel must be allowed to read its own VBA project:
 - **Data integration** — manage API connections, queries, and ETL in Git
 - **Automation** — full change history on Excel automation scripts
 
+## Agent harness (excel-control)
+
+Every Export also drops a `tools/` folder next to the workbook
+containing **excel-control**, a PowerShell-based session protocol that
+lets an AI agent drive the workbook end-to-end:
+
+- run macros and capture their results
+- read/write cell ranges
+- respond to dialogs and UserForms as they appear (the watcher reports
+  every modal as a structured event with text, buttons, and a PNG
+  screenshot — the agent decides which button)
+- capture VBA runtime errors with module + line + screenshot
+- run a discovered `Test_*` suite end-to-end
+
+The protocol is append-only JSONL files (`commands.jsonl` /
+`events.jsonl`) so anything that can read and write files can drive it
+(Claude Code, MCP clients, bash, CI scripts).
+
+See `tools/INTERFACE.md` (generated into every exported workbook) for
+the full command + event reference, and `excel-control/` in this repo
+for the source.
+
 ## Notes and limitations
 
 - **Local files only.** Open workbooks from a local or synced folder, not from a SharePoint URL.

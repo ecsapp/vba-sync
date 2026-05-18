@@ -140,15 +140,50 @@ function Handle-Command($Xl, $Wb, $cmd) {
         }
         'run_macro' {
             $start = [DateTime]::UtcNow
+            # Drain the VBE Immediate window before running so we only emit
+            # Debug.Print events for output produced by THIS macro.
+            try {
+                $cm = $Xl.VBE.Windows.Item('Immediate').CodePane.CodeModule
+                if ($cm.CountOfLines -gt 0) { $cm.DeleteLines(1, $cm.CountOfLines) }
+            } catch {}
             try {
                 $macroArgs = @()
                 if ($null -ne $cmd.args) { $macroArgs = @($cmd.args) }
-                $macroRef = "'$($Wb.Name)'!$($cmd.name)"
-                if ($macroArgs.Count -eq 0) {
-                    $result = $Xl.Run($macroRef)
-                } else {
-                    $result = Invoke-Macro -Xl $Xl -MacroName $macroRef -Args $macroArgs
+                # Optional: activate a specific workbook before the macro call
+                # (some macros use ActiveWorkbook to find their target).
+                if ($cmd.activate_workbook) {
+                    try { $Xl.Workbooks.Item($cmd.activate_workbook).Activate() } catch {}
                 }
+                # cmd.name can be either a bare name ("PopMsgBox") which gets
+                # qualified with the session's primary workbook, or an
+                # already-qualified ref ("'AddinName.xlam'!modX.Foo") which
+                # passes through unchanged. Detection: contains '!'.
+                $macroRef = if ($cmd.name -like '*!*') { $cmd.name } else { "'$($Wb.Name)'!$($cmd.name)" }
+                # Direct PowerShell COM call — InvokeMember overload
+                # resolution was failing with "Parameter not optional"
+                # when passing args that VBA's Variant parameters
+                # accept. Splat by arity (most macros take 0-5 args).
+                $result = switch ($macroArgs.Count) {
+                    0 { $Xl.Run($macroRef) }
+                    1 { $Xl.Run($macroRef, $macroArgs[0]) }
+                    2 { $Xl.Run($macroRef, $macroArgs[0], $macroArgs[1]) }
+                    3 { $Xl.Run($macroRef, $macroArgs[0], $macroArgs[1], $macroArgs[2]) }
+                    4 { $Xl.Run($macroRef, $macroArgs[0], $macroArgs[1], $macroArgs[2], $macroArgs[3]) }
+                    5 { $Xl.Run($macroRef, $macroArgs[0], $macroArgs[1], $macroArgs[2], $macroArgs[3], $macroArgs[4]) }
+                    default { Invoke-Macro -Xl $Xl -MacroName $macroRef -Args $macroArgs }
+                }
+                # Emit one debug_print event per non-empty line.
+                try {
+                    $cm = $Xl.VBE.Windows.Item('Immediate').CodePane.CodeModule
+                    if ($cm.CountOfLines -gt 0) {
+                        $text = $cm.Lines(1, $cm.CountOfLines)
+                        foreach ($line in ($text -split "[`r`n]+")) {
+                            if ($line.Length -gt 0) {
+                                Write-EventLine @{ t = 'debug_print'; during = $cmd.id; text = $line }
+                            }
+                        }
+                    }
+                } catch {}
                 Write-EventLine @{
                     t = 'macro_completed'
                     id = $cmd.id
@@ -306,30 +341,21 @@ function Handle-Command($Xl, $Wb, $cmd) {
                 $sheet = if ($sheetName) { $Wb.Sheets.Item($sheetName) } else { $Wb.ActiveSheet }
                 $rng = $sheet.Range($addr)
                 $useFormulas = [bool]$cmd.include_formulas
-                $values = if ($useFormulas) { $rng.Formula } else { $rng.Value() }
-                # Range.Value returns scalar for single cell, 2D array otherwise.
-                # Build a jagged object[][] for JSON-friendly nesting.
-                # Use Rank/GetUpperBound rather than `-is [object[,]]` — under
-                # PowerShell COM marshalling the runtime type isn't always
-                # [object[,]] even when the value is a 2D array.
-                $rows = $null
-                $rank = 0
-                try { $rank = $values.Rank } catch { $rank = 0 }
-                if ($rank -eq 2) {
-                    $r1 = $values.GetLowerBound(0); $r2 = $values.GetUpperBound(0)
-                    $c1 = $values.GetLowerBound(1); $c2 = $values.GetUpperBound(1)
-                    $h = $r2 - $r1 + 1
-                    $w = $c2 - $c1 + 1
-                    $rows = New-Object 'object[][]' $h
-                    for ($i = 0; $i -lt $h; $i++) {
-                        $rows[$i] = New-Object 'object[]' $w
-                        for ($j = 0; $j -lt $w; $j++) {
-                            $rows[$i][$j] = $values[$r1 + $i, $c1 + $j]
-                        }
+                # Iterate cell-by-cell using Range.Cells.Item(row,col) rather
+                # than Range.Value()'s 2D array. PowerShell's COM marshalling
+                # of variant 2D arrays into Object[,] is inconsistent (the
+                # array sometimes arrives as a 1D PSObject array, leading to
+                # mis-shaped output). Per-cell read is slower but always
+                # produces a clean jagged array for JSON.
+                $h = [int]$rng.Rows.Count
+                $w = [int]$rng.Columns.Count
+                $rows = New-Object 'object[][]' $h
+                for ($i = 0; $i -lt $h; $i++) {
+                    $rows[$i] = New-Object 'object[]' $w
+                    for ($j = 0; $j -lt $w; $j++) {
+                        $cell = $rng.Cells.Item($i + 1, $j + 1)
+                        $rows[$i][$j] = if ($useFormulas) { $cell.Formula } else { $cell.Value2 }
                     }
-                } else {
-                    $rows = New-Object 'object[][]' 1
-                    $rows[0] = ,$values
                 }
                 Write-EventLine @{
                     t = 'range_read'
@@ -362,26 +388,25 @@ function Handle-Command($Xl, $Wb, $cmd) {
                 # property. Cell-by-cell is slower than batch Value2 but
                 # reliable in PowerShell — batch COM marshalling of an
                 # object[,] sometimes flattens into a 1D string array.
-                # Build the absolute address per cell. Cells.Item(row, col)
-                # ran into PowerShell COM overload-resolution issues
-                # ("cannot cast Double to String"); going through
-                # Range("A1") is unambiguous.
-                $startRow = [int]$rng.Row
-                $startCol = [int]$rng.Column
+                # Per-cell write via Range.Offset($i, $j) from the anchor.
+                # Other access patterns (Cells.Item, Range(<string>)) hit
+                # PowerShell COM overload-resolution issues ("Cannot cast
+                # Double to String"); Range.Offset is unambiguous.
+                # PowerShell COM dispatch caches the chosen overload per
+                # property based on the FIRST argument type. After three
+                # string writes, a Double assignment to Value2 throws
+                # "Cannot cast Double to String". InvokeMember bypasses
+                # the cache and dispatches per-call.
+                $anchor = $sheet.Range($addr)
                 for ($i = 0; $i -lt $h; $i++) {
                     $rowArr = @($rowsIn[$i])
                     for ($j = 0; $j -lt $w; $j++) {
                         $val = $rowArr[$j]
                         if ($val -is [int64] -or $val -is [decimal]) { $val = [double]$val }
-                        $colLetter = ''
-                        $cn = $startCol + $j
-                        while ($cn -gt 0) {
-                            $rem = (($cn - 1) % 26)
-                            $colLetter = [char]([byte][char]'A' + $rem) + $colLetter
-                            $cn = [int](($cn - $rem - 1) / 26)
-                        }
-                        $cellAddr = "$colLetter$($startRow + $i)"
-                        $sheet.Range($cellAddr).Value2 = $val
+                        $cell = $anchor.Offset($i, $j)
+                        [void]$cell.GetType().InvokeMember('Value2',
+                            [System.Reflection.BindingFlags]::SetProperty,
+                            $null, $cell, @($val))
                     }
                 }
 
@@ -395,6 +420,238 @@ function Handle-Command($Xl, $Wb, $cmd) {
                 }
             } catch {
                 Write-EventLine @{ t = 'range_write_failed'; id = $cmd.id; error = $_.Exception.Message; trace = $_.ScriptStackTrace }
+            }
+        }
+        'list_macros' {
+            try {
+                $macros = New-Object System.Collections.ArrayList
+                foreach ($comp in $Wb.VBProject.VBComponents) {
+                    if ($comp.CodeModule.CountOfLines -eq 0) { continue }
+                    $cm = $comp.CodeModule
+                    for ($ln = 1; $ln -le $cm.CountOfLines; $ln++) {
+                        $line = $cm.Lines($ln, 1).Trim()
+                        if ($line -match '^\s*(Public\s+|Private\s+|Friend\s+)?(Sub|Function)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)') {
+                            $vis    = $Matches[1].Trim()
+                            $kind   = $Matches[2]
+                            $name   = $Matches[3]
+                            $argstr = $Matches[4].Trim()
+                            $isPublic = ($vis -eq '' -or $vis -ieq 'Public')
+                            [void]$macros.Add([pscustomobject]@{
+                                module    = $comp.Name
+                                kind      = $kind.ToLower()
+                                name      = $name
+                                args      = $argstr
+                                public    = $isPublic
+                                line      = $ln
+                            })
+                        }
+                    }
+                }
+                Write-EventLine @{ t = 'macros_listed'; id = $cmd.id; macros = $macros }
+            } catch {
+                Write-EventLine @{ t = 'macros_list_failed'; id = $cmd.id; error = $_.Exception.Message }
+            }
+        }
+        'list_sheets' {
+            try {
+                $sheets = New-Object System.Collections.ArrayList
+                foreach ($sh in $Wb.Sheets) {
+                    $tables = @()
+                    try { foreach ($lo in $sh.ListObjects) { $tables += $lo.Name } } catch {}
+                    $usedRange = ''
+                    try { $usedRange = $sh.UsedRange.Address($false, $false) } catch {}
+                    [void]$sheets.Add([pscustomobject]@{
+                        name       = $sh.Name
+                        index      = [int]$sh.Index
+                        used_range = $usedRange
+                        tables     = $tables
+                        hidden     = ($sh.Visible -eq 0)  # xlSheetVisible=-1, xlHidden=0, xlVeryHidden=2
+                        protected  = [bool]$sh.ProtectContents
+                    })
+                }
+                Write-EventLine @{ t = 'sheets_listed'; id = $cmd.id; sheets = $sheets }
+            } catch {
+                Write-EventLine @{ t = 'sheets_list_failed'; id = $cmd.id; error = $_.Exception.Message }
+            }
+        }
+        'get_workbook_info' {
+            try {
+                $tableCount = 0; $namedRangeCount = 0; $hasPivots = $false; $hasConnections = $false
+                $vbaProt = 0; $sizeBytes = 0; $lastAuthor = ''; $lastSave = ''
+                foreach ($sh in $Wb.Sheets) {
+                    try { $tableCount += $sh.ListObjects.Count } catch {}
+                    try { if ($sh.PivotTables.Count -gt 0) { $hasPivots = $true } } catch {}
+                }
+                try { $namedRangeCount = $Wb.Names.Count } catch {}
+                try { $hasConnections = ($Wb.Connections.Count -gt 0) } catch {}
+                try { $vbaProt = [int]$Wb.VBProject.Protection } catch {}
+                try { $sizeBytes = (Get-Item -LiteralPath $Wb.FullName).Length } catch {}
+                try { $lastAuthor = "$($Wb.BuiltinDocumentProperties.Item('Last Author').Value)" } catch {}
+                try { $lastSave = "$($Wb.BuiltinDocumentProperties.Item('Last Save Time').Value)" } catch {}
+                $info = [ordered]@{
+                    name              = $Wb.Name
+                    full_name         = $Wb.FullName
+                    size_bytes        = $sizeBytes
+                    sheet_count       = $Wb.Sheets.Count
+                    table_count       = $tableCount
+                    named_range_count = $namedRangeCount
+                    has_vba           = [bool]$Wb.HasVBProject
+                    vba_protection    = $vbaProt
+                    has_pivots        = $hasPivots
+                    has_connections   = $hasConnections
+                    file_format       = [int]$Wb.FileFormat
+                    last_author       = $lastAuthor
+                    last_save_time    = $lastSave
+                }
+                Write-EventLine @{ t = 'workbook_info'; id = $cmd.id; info = $info }
+            } catch {
+                Write-EventLine @{ t = 'workbook_info_failed'; id = $cmd.id; error = $_.Exception.Message }
+            }
+        }
+        'run_tests' {
+            try {
+                $filter = $cmd.filter
+                # Discover Test_* Subs in any module
+                $tests = New-Object System.Collections.ArrayList
+                foreach ($comp in $Wb.VBProject.VBComponents) {
+                    if ($comp.CodeModule.CountOfLines -eq 0) { continue }
+                    $cm = $comp.CodeModule
+                    for ($ln = 1; $ln -le $cm.CountOfLines; $ln++) {
+                        $line = $cm.Lines($ln, 1).Trim()
+                        if ($line -match '^\s*(Public\s+)?Sub\s+(Test_[A-Za-z0-9_]*)\s*\(') {
+                            $tname = $Matches[2]
+                            if ($filter -and $tname -notmatch $filter) { continue }
+                            [void]$tests.Add(@{ module = $comp.Name; name = $tname })
+                        }
+                    }
+                }
+
+                $start = [DateTime]::UtcNow
+                $passed = 0; $failed = 0; $errored = 0
+                foreach ($t in $tests) {
+                    $tStart = [DateTime]::UtcNow
+                    $status = 'pass'
+                    $errObj = $null
+                    try {
+                        $ref = "'$($Wb.Name)'!$($t.module).$($t.name)"
+                        $null = $Xl.Run($ref)
+                    } catch {
+                        $msg = $_.Exception.Message
+                        $cur = $_.Exception
+                        while ($cur.InnerException) { $cur = $cur.InnerException; if ($cur.Message) { $msg = $cur.Message } }
+                        # Treat any Err.Raise from inside as a failure; we can't
+                        # easily distinguish "asserted fail" from "unexpected error"
+                        # via COM, so callers treat both as "test didn't pass".
+                        $status = 'fail'
+                        $errObj = @{ message = $msg; hresult = $_.Exception.HResult }
+                    }
+                    $duration = [int]([DateTime]::UtcNow - $tStart).TotalMilliseconds
+                    $resultEv = @{
+                        t        = 'test_result'
+                        module   = $t.module
+                        name     = $t.name
+                        status   = $status
+                        duration_ms = $duration
+                    }
+                    if ($errObj) { $resultEv.error = $errObj; $failed++ } else { $passed++ }
+                    Write-EventLine $resultEv
+                }
+                Write-EventLine @{
+                    t = 'tests_completed'
+                    id = $cmd.id
+                    total = $tests.Count
+                    passed = $passed
+                    failed = $failed
+                    errored = $errored
+                    duration_ms = [int]([DateTime]::UtcNow - $start).TotalMilliseconds
+                }
+            } catch {
+                Write-EventLine @{ t = 'tests_failed'; id = $cmd.id; error = $_.Exception.Message }
+            }
+        }
+        'save_workbook' {
+            try {
+                $Wb.Save()
+                Write-EventLine @{ t = 'workbook_saved'; id = $cmd.id; path = $Wb.FullName }
+            } catch {
+                Write-EventLine @{ t = 'save_failed'; id = $cmd.id; error = $_.Exception.Message }
+            }
+        }
+        'save_as' {
+            try {
+                $newPath = $cmd.path
+                if (-not $newPath) { throw "save_as requires path" }
+                $fileFormat = if ($cmd.file_format) { [int]$cmd.file_format } else { [int]$Wb.FileFormat }
+                $Wb.SaveAs($newPath, $fileFormat)
+                Write-EventLine @{ t = 'workbook_saved_as'; id = $cmd.id; path = $newPath; file_format = $fileFormat }
+            } catch {
+                Write-EventLine @{ t = 'save_failed'; id = $cmd.id; error = $_.Exception.Message }
+            }
+        }
+        'calculate' {
+            try {
+                $start = [DateTime]::UtcNow
+                $Xl.Calculate()
+                Write-EventLine @{ t = 'calculated'; id = $cmd.id; duration_ms = [int]([DateTime]::UtcNow - $start).TotalMilliseconds }
+            } catch {
+                Write-EventLine @{ t = 'calculate_failed'; id = $cmd.id; error = $_.Exception.Message }
+            }
+        }
+        'refresh_all' {
+            try {
+                $start = [DateTime]::UtcNow
+                $Wb.RefreshAll()
+                Write-EventLine @{ t = 'refreshed_all'; id = $cmd.id; duration_ms = [int]([DateTime]::UtcNow - $start).TotalMilliseconds }
+            } catch {
+                Write-EventLine @{ t = 'refresh_failed'; id = $cmd.id; error = $_.Exception.Message }
+            }
+        }
+        'refresh_connection' {
+            try {
+                $name = $cmd.name
+                if (-not $name) { throw "refresh_connection requires name" }
+                $start = [DateTime]::UtcNow
+                $conn = $Wb.Connections.Item($name)
+                $conn.Refresh()
+                Write-EventLine @{ t = 'connection_refreshed'; id = $cmd.id; name = $name; duration_ms = [int]([DateTime]::UtcNow - $start).TotalMilliseconds }
+            } catch {
+                Write-EventLine @{ t = 'connection_failed'; id = $cmd.id; name = $cmd.name; error = $_.Exception.Message }
+            }
+        }
+        'create_workbook' {
+            try {
+                $newWb = $Xl.Workbooks.Add()
+                $savedPath = $null
+                if ($cmd.save_as) {
+                    $fmt = if ($cmd.file_format) { [int]$cmd.file_format } else { 52 }  # default xlOpenXMLWorkbookMacroEnabled
+                    $newWb.SaveAs($cmd.save_as, $fmt)
+                    $savedPath = $cmd.save_as
+                }
+                Write-EventLine @{ t = 'workbook_created'; id = $cmd.id; name = $newWb.Name; saved_to = $savedPath }
+            } catch {
+                Write-EventLine @{ t = 'create_failed'; id = $cmd.id; error = $_.Exception.Message }
+            }
+        }
+        'open_workbook' {
+            try {
+                $p = $cmd.path
+                if (-not $p) { throw "open_workbook requires path" }
+                $resolved = (Resolve-Path -LiteralPath $p).Path
+                $newWb = $Xl.Workbooks.Open($resolved, [Type]::Missing, $false, [Type]::Missing, [Type]::Missing, [Type]::Missing, $true)
+                Write-EventLine @{ t = 'workbook_opened'; id = $cmd.id; name = $newWb.Name; path = $resolved }
+            } catch {
+                Write-EventLine @{ t = 'open_failed'; id = $cmd.id; error = $_.Exception.Message }
+            }
+        }
+        'close_workbook' {
+            try {
+                $name = $cmd.name
+                if (-not $name) { throw "close_workbook requires name (workbook name)" }
+                $target = $Xl.Workbooks.Item($name)
+                $target.Close([bool]$cmd.save)
+                Write-EventLine @{ t = 'workbook_closed_cmd'; id = $cmd.id; name = $name }
+            } catch {
+                Write-EventLine @{ t = 'close_workbook_failed'; id = $cmd.id; error = $_.Exception.Message }
             }
         }
         'close' {

@@ -1,8 +1,8 @@
 # excel-control — agent interface
 
 A long-running PowerShell session holds an Excel instance open and
-exchanges events with you (the agent) over append-only JSONL files. You
-send commands by appending to `commands.jsonl`; the harness writes
+exchanges events with you (the agent) over append-only JSONL files.
+You send commands by appending to `commands.jsonl`; the harness writes
 events to `events.jsonl`.
 
 ## Quickstart (Claude Code)
@@ -37,173 +37,147 @@ sessions/<id>/
 
 ## Commands
 
-### `run_macro`
+Each command requires an `id` (caller's choice — usually a counter)
+and `cmd` (the command name).
 
-Execute a Sub or Function and get its result.
+### Execution
 
-```json
-{"id":"c1","cmd":"run_macro","name":"BuildReport","args":[2026,"Q1"]}
-```
+| Command | Body | Result event |
+|---------|------|--------------|
+| `run_macro` | `name`, optional `args[]` | `macro_completed` with `result`, `duration_ms` |
+| `compile_check` | — | `compile_result` with `ok` and on fail: `module`, `line`, `source_context` |
+| `run_tests` | optional `filter` (regex on Test_* name) | one `test_result` per test + `tests_completed` summary |
 
-Event stream:
+### Cell I/O
 
-```json
-{"t":"command_ack","id":"c1","cmd":"run_macro"}
-{"t":"macro_completed","id":"c1","name":"BuildReport","result":1247,"duration_ms":4210}
-```
+| Command | Body | Result event |
+|---------|------|--------------|
+| `read_range` | `sheet`, `range`, optional `include_formulas` | `range_read` with `rows` (2D array) |
+| `write_range` | `sheet`, `range`, `values` (2D array) | `range_written` with `rows`, `cols` |
 
-If the macro raises an error: `macro_failed` with `error` + `error_type`.
+`range` can be a single anchor cell (e.g., `"A1"`) — `write_range`
+auto-resizes to the input dimensions.
 
-**Phase 2 limitation:** a macro that pops a modal (`MsgBox`, UserForm,
-runtime error dialog) will block the COM thread. Phase 3 wires the
-dialog watcher; until then, only call macros that you know don't pop
-modals.
+### Dialog response
 
-### `close`
+| Command | Body | Result event |
+|---------|------|--------------|
+| `respond_dialog` | `dialog_id`, `button` | `dialog_dismissed` or `respond_failed` |
 
-End the session cleanly.
+For UserForms (`class: "ThunderDFrame"`) where `buttons` is empty, the
+VK_RETURN fallback fires the Default button's click handler.
 
-```json
-{"id":"cN","cmd":"close"}
-```
+### Workbook state
 
-Event stream:
+| Command | Body | Result event |
+|---------|------|--------------|
+| `screenshot` | `target` (`window` / `worksheet:<name>` / `dialog:<id>` / `form:<id>`) | `screenshot_captured` with `path`, `width`, `height` |
+| `save_workbook` | — | `workbook_saved` |
+| `save_as` | `path`, optional `file_format` | `workbook_saved_as` |
+| `calculate` | — | `calculated` with `duration_ms` |
+| `refresh_all` | — | `refreshed_all` |
+| `refresh_connection` | `name` | `connection_refreshed` or `connection_failed` |
+| `create_workbook` | optional `save_as`, optional `file_format` | `workbook_created` |
+| `open_workbook` | `path` | `workbook_opened` |
+| `close_workbook` | `name`, optional `save` | `workbook_closed_cmd` |
 
-```json
-{"t":"command_ack","id":"cN","cmd":"close"}
-{"t":"closing","id":"cN"}
-{"t":"closed"}
-```
+### Introspection
+
+| Command | Body | Result event |
+|---------|------|--------------|
+| `list_macros` | — | `macros_listed` with `macros[]` (`module`, `kind`, `name`, `args`, `public`, `line`) |
+| `list_sheets` | — | `sheets_listed` with `sheets[]` (`name`, `index`, `used_range`, `tables`, `hidden`, `protected`) |
+| `get_workbook_info` | — | `workbook_info` with `info` (size, sheet count, has_vba, has_pivots, has_connections, …) |
+
+### VBA source
+
+| Command | Body | Result event |
+|---------|------|--------------|
+| `sync_vba` | `source_dir` | `sync_completed` with `imported[]`, `removed[]` |
+
+Strip user VBComponents and re-import `.bas`/`.cls`/`.frm` from
+`source_dir` following the vba-sync convention (`Modules/`,
+`ClassModules/`, `Forms/`, `Objects/`). Pure-PowerShell — no
+`VBA Sync.xlam` runtime dependency.
+
+### Lifecycle
+
+| Command | Body | Result event |
+|---------|------|--------------|
+| `close` | — | `closing` → `closed` |
 
 ## Events
 
+Every command produces a `command_ack` first.
+
 | Event | Fields | When |
 |-------|--------|------|
-| `started` | `pid`, `workbook`, `session_id` | Session opened the workbook successfully |
+| `started` | `pid`, `workbook`, `session_id` | Session opened the workbook |
 | `command_ack` | `id`, `cmd` | Command received and parsed |
-| `macro_completed` | `id`, `name`, `result`, `duration_ms` | Macro returned (Phase 2) |
-| `macro_failed` | `id`, `name`, `error`, `error_type` | Macro raised an error (Phase 2) |
-| `closing` | `id` | Close command received |
-| `closed` | — | Session shut down cleanly |
-| `session_error` | `error`, `stack` | Session crashed |
-| `command_error` | `error`, `raw` | A line in commands.jsonl wasn't valid JSON |
-| `unknown_command` | `id`, `cmd` | Command name not recognised |
-| `dialog_appeared` | `id`, `title`, `text`, `buttons`, `class` | A `#32770` dialog (MsgBox, alert, error) appeared (Phase 3) |
-| `userform_appeared` | same shape | A UserForm appeared (Phase 3; control-level introspection lands in Phase 8) |
-| `dialog_dismissed` | `id` (command id), `dialog_id`, `button` | The dialog watcher clicked your chosen button and the dialog closed |
-| `dialog_closed_externally` | `id` (dialog id) | A dialog vanished without a `respond_dialog` command (user closed it, macro ended) |
-| `respond_failed` | `id`, `dialog_id`, `reason` | Watcher could not dispatch the click (unknown id, dialog didn't close) |
-| `runtime_error` | `id` (dialog id), `number`, `description`, `title`, `text`, `screenshot` | The VBA "Microsoft Visual Basic" runtime-error dialog appeared. Watcher parses Err number + description from body and auto-clicks End so PowerShell unblocks. Correlate to the macro via ordering — this event sits between `command_ack` and `macro_failed` for the same `run_macro` |
+| `macro_completed` / `macro_failed` | `id`, `name`, `result` / `error` | run_macro result |
+| `compile_result` | `id`, `ok`, on fail: `module`, `line`, `column`, `source_context` | compile_check |
+| `test_result` | `module`, `name`, `status` (pass/fail), `duration_ms`, on fail: `error` | per test in run_tests |
+| `tests_completed` | `id`, `total`, `passed`, `failed`, `duration_ms` | end of run_tests |
+| `range_read` / `range_written` | see above | read/write_range |
+| `screenshot_captured` / `screenshot_failed` | see above | screenshot |
+| `workbook_*` events | varies | workbook lifecycle |
+| `calculated` / `refreshed_all` / `connection_refreshed` / `connection_failed` | varies | calc/refresh |
+| `macros_listed` / `sheets_listed` / `workbook_info` | see above | introspection |
+| `sync_completed` / `sync_failed` | see above | sync_vba |
+| `dialog_appeared` / `userform_appeared` | `id`, `title`, `text`, `buttons[]`, `class`, `screenshot` | unsolicited modal observed |
+| `dialog_dismissed` | `id` (command id), `dialog_id`, `button` | watcher dispatched click |
+| `dialog_closed_externally` | `id` (dialog id) | dialog vanished without `respond_dialog` |
+| `respond_failed` | `id`, `dialog_id`, `reason` | dispatch couldn't close dialog |
+| `runtime_error` | `id` (dialog id), `number`, `description`, `text`, `screenshot` | VBA runtime-error dialog auto-End'd |
+| `closing` / `closed` | `id` (for `closing`) | end-of-session |
+| `session_error` | `error`, `stack` | session crashed |
+| `command_error` | `error`, `raw` | invalid JSON in commands.jsonl |
+| `unknown_command` | `id`, `cmd` | command name not recognised |
 
-## `screenshot`
+## Patterns
 
-Capture the Excel main window, a specific worksheet, or an open
-dialog/form to PNG.
+### Run a macro that pops a dialog
 
-```json
-{"id":"c5","cmd":"screenshot","target":"window"}
-{"id":"c6","cmd":"screenshot","target":"worksheet:Dashboard"}
-{"id":"c7","cmd":"screenshot","target":"dialog:d7"}
-{"id":"c8","cmd":"screenshot","target":"form:d9"}
+```jsonc
+{"id":"c1","cmd":"run_macro","name":"AskOverwrite"}
+// watch for:
+{"t":"dialog_appeared","id":"d1","title":"...","text":"Overwrite existing?","buttons":["Yes","No"],"screenshot":"..."}
+// decide, send:
+{"id":"c2","cmd":"respond_dialog","dialog_id":"d1","button":"Yes"}
+// then:
+{"t":"dialog_dismissed","id":"c2","dialog_id":"d1","button":"Yes"}
+{"t":"macro_completed","id":"c1","name":"AskOverwrite"}
 ```
 
-Event:
+### Diagnose a compile error, fix, retry
 
-```json
-{"t":"screenshot_captured","id":"c5","target":"window","path":"captures/shot_c5.png","width":1920,"height":1200}
-```
-
-Mechanism: `dialog:` / `form:` targets use Win32 `PrintWindow` which
-captures even when the target is obscured. `window` / `worksheet:`
-targets capture the Excel main window region. Headless sessions
-(`xl.Visible = false`) produce small, mostly-empty captures of the main
-window — set the visibility on by editing `start-session.ps1` if you
-want meaningful worksheet captures.
-
-Every `dialog_appeared` and `userform_appeared` event already carries a
-`screenshot` field pointing to a PNG captured at the moment the dialog
-was reported. No second command needed for those.
-
-## `respond_dialog`
-
-Click a named button on an open dialog.
-
-```json
-{"id":"c2","cmd":"respond_dialog","dialog_id":"d1","button":"OK"}
-```
-
-Event stream:
-
-```json
-{"t":"command_ack","id":"c2","cmd":"respond_dialog"}
-{"t":"dialog_dismissed","id":"c2","dialog_id":"d1","button":"OK"}
-```
-
-If the named button doesn't match (case-insensitive), the watcher
-falls back to: the first button, then VK_RETURN, then WM_CLOSE. If
-none works it emits `respond_failed`.
-
-UserForms (`*_appeared` with `class: "ThunderDFrame"`) expose their
-`Forms.CommandButton` controls only via the form's COM model, not as
-Win32 buttons — so `buttons` may be empty. In that case the watcher
-sends VK_RETURN, which fires the form's Default button click handler.
-Per-control introspection lands in Phase 8.
-
-## `compile_check`
-
-Force a VBA Project compile.
-
-```json
+```jsonc
 {"id":"c1","cmd":"compile_check"}
+// → {"t":"compile_result","id":"c1","ok":false,"module":"modSales","line":47,"source_context":[...]}
+// fix source on disk, then:
+{"id":"c2","cmd":"sync_vba","source_dir":"."}
+{"id":"c3","cmd":"compile_check"}
+// → {"t":"compile_result","id":"c3","ok":true}
 ```
 
-Events:
+## Gotchas + limitations
 
-```json
-{"t":"compile_result","id":"c1","ok":true}
-```
+- **Never** modify the workbook in Excel manually while a session has it open.
+- **Always** send `close` before killing the session process (otherwise the .xlsm may go into "recover this file?" state).
+- Event ordering: `command_ack` always precedes any other event for the same `id`.
+- Session is single-threaded; commands process in append order.
 
-On failure: `ok:false` + `module`, `line`, `column`, `source_context` (5 lines centered on the offending line).
+### Known limitations (deferred)
 
-## `sync_vba`
-
-Strip user VBComponents and re-import .bas/.cls/.frm from a source folder
-following the vba-sync convention (`Modules/`, `ClassModules/`, `Forms/`).
-Pure PowerShell — no `VBA Sync.xlam` runtime dependency.
-
-```json
-{"id":"c2","cmd":"sync_vba","source_dir":"./MyWorkbook"}
-```
-
-Event:
-
-```json
-{"t":"sync_completed","id":"c2","imported":["modSales","clsCustomer"],"removed":["modOld"]}
-```
-
-VBA-password unlock is not yet implemented (deferred).
-
-## `read_range` / `write_range`
-
-```json
-{"id":"c3","cmd":"read_range","sheet":"Inputs","range":"A1:C10","include_formulas":false}
-{"id":"c4","cmd":"write_range","sheet":"Inputs","range":"A1","values":[["Name","Age"],["Alice",30]]}
-```
-
-Events: `range_read` with `rows` (2D array), `range_written` with
-`rows` + `cols`. Single-cell anchor is auto-resized to the input
-dimensions. Writes are per-cell (slower than batch but reliable).
-
-More commands and events land in subsequent phases.
-
-## Gotchas
-
-- **Never** modify the workbook in Excel manually while a session has it open
-- **Always** send a `close` command before killing the session process (so the .xlsm doesn't go into a "recover this file?" state)
-- Event ordering: `command_ack` always precedes any other event for the same `id`
-- The session is single-threaded; commands are processed in append order. Don't expect concurrency.
-
-## Phase status
-
-This document tracks the harness as it grows. Current: Phase 2 (session
-host + `run_macro`). See `excel-control/SCOPING.md` for the full plan.
+- **`Debug.Print` capture** — in headless Excel COM, `Debug.Print`
+  output doesn't surface in `VBE.Windows("Immediate").CodePane`. The
+  capture code is in place but yields no events in headless mode.
+  Use a custom logger that writes to a file if you need runtime output.
+- **UserForm field introspection** — `Controls(name).Value` for a
+  running modal UserForm isn't reachable from outside the VBA runtime.
+  Field-level read/write isn't supported. `respond_dialog` fires the
+  form's Default button via VK_RETURN; for input forms, build a VBA
+  wrapper that pre-fills them before showing.
+- **`.frx` non-determinism** — Excel's UserForm binary writer is
+  non-deterministic. Separate work item being tracked outside this
+  harness.
