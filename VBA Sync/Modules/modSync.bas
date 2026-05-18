@@ -375,12 +375,20 @@ Private Sub DoImportProject()
     Debug.Print "VBA Sync: Import folder - " & rootPath
 
     '-- remove all non-document components first
+    ' Collect names into a list BEFORE removing — iterating Remove on the
+    ' live VBComponents collection skips entries as indices shift, leaving
+    ' stale components behind (notably UserForms, which then trip the
+    ' "existing component" path below and get their .frm header text
+    ' shoved into CodeModule).
     Debug.Print "VBA Sync: Removing existing VBA components..."
     Dim vc As Object
+    Dim toRemove As Object: Set toRemove = CreateObject("Scripting.Dictionary")
     For Each vc In wb.VBProject.VBComponents
-        If vc.Type <> vbext_ct_Document Then
-            wb.VBProject.VBComponents.Remove vc
-        End If
+        If vc.Type <> vbext_ct_Document Then toRemove(vc.Name) = True
+    Next
+    Dim removeKey As Variant
+    For Each removeKey In toRemove.Keys
+        wb.VBProject.VBComponents.Remove wb.VBProject.VBComponents(CStr(removeKey))
     Next
 
     '-- iterate expected sub-folders
@@ -400,6 +408,14 @@ Private Sub DoImportProject()
                 On Error GoTo 0
 
                 If vbComp Is Nothing Then
+                    wb.VBProject.VBComponents.Import filePath & f
+                ElseIf LCase$(Right$(f, 4)) = ".frm" Then
+                    ' .frm contains form-designer state + control declarations
+                    ' + paired .frx pointer. Only VBComponents.Import can
+                    ' rehydrate all that — overwriting CodeModule would drop
+                    ' the form header into the code itself (the "fingerprint
+                    ' in code" bug). Remove the stale shell, re-import fresh.
+                    wb.VBProject.VBComponents.Remove vbComp
                     wb.VBProject.VBComponents.Import filePath & f
                 Else
                     Dim txt As String
