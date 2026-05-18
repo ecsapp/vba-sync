@@ -399,7 +399,16 @@ Private Sub DoImportProject()
         If Dir(filePath, vbDirectory) <> "" Then
             f = Dir(filePath & "*.*")
             Do While Len(f) > 0
-                If LCase$(Right$(f, 4)) = ".frx" Then GoSub SkipFile 'ignore binary partner
+                ' Process only VBA source files. Skip:
+                '   .frx                 — binary partner of .frm (auto-loaded by Import)
+                '   .frx.fingerprint     — vba-sync sidecar for .frx churn suppression
+                '   anything else        — future sidecars, stray files
+                ' Without this guard, e.g. .frx.fingerprint matches the base
+                ' name of an existing form and falls through to the "replace
+                ' CodeModule" branch, stuffing the fingerprint text into the
+                ' form's code section.
+                Dim ext As String: ext = LCase$(Right$(f, 4))
+                If ext <> ".bas" And ext <> ".cls" And ext <> ".frm" Then GoSub SkipFile
 
                 Dim tgtName As String: tgtName = Split(f, ".")(0)
                 Set vbComp = Nothing
