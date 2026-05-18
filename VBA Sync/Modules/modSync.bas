@@ -714,6 +714,12 @@ Private Sub WriteReadme(basePath As String, wb As Workbook)
           "|   |       tables/<TableName>/{definition.json, data.tsv}" & vbCrLf & _
           "|   |       drawings/{shapes.json, _assets/}" & vbCrLf & _
           "|   `-- STRUCTURE_SUMMARY.md  # Human-readable data model overview" & vbCrLf & _
+          "|-- tools/                # excel-control: PowerShell agent harness" & vbCrLf & _
+          "|   |-- start-session.ps1     # Spawn a long-running Excel session" & vbCrLf & _
+          "|   |-- INTERFACE.md          # Full command + event reference for agents" & vbCrLf & _
+          "|   `-- clsAssert.cls         # Optional assertion lib for run_tests" & vbCrLf & _
+          "|-- .claude/" & vbCrLf & _
+          "|   `-- skills/excel-control/SKILL.md  # Claude Code auto-discovery" & vbCrLf & _
           "|-- .gitattributes        # Git configuration for VBA files" & vbCrLf & _
           "|-- .gitignore            # Excludes temp files from version control" & vbCrLf & _
           "`-- README.md             # This file" & vbCrLf
@@ -725,6 +731,13 @@ Private Sub WriteReadme(basePath As String, wb As Workbook)
           "- **Git**: Use branches (`git checkout -b feature-name`) for development" & vbCrLf
     
     txt = txt & vbCrLf & _
+          "## AGENT HARNESS (tools/)" & vbCrLf & _
+          "An AI agent (Claude Code, MCP client, bash script) can drive this" & vbCrLf & _
+          "workbook end-to-end via the bundled PowerShell session harness:" & vbCrLf & _
+          "run macros, read/write cells, respond to dialogs, capture runtime" & vbCrLf & _
+          "errors, run a discovered Test_* suite. See ``tools/INTERFACE.md`` for" & vbCrLf & _
+          "the full reference, and ``.claude/skills/excel-control/SKILL.md`` for" & vbCrLf & _
+          "agent-facing usage patterns (Claude Code auto-discovers it)." & vbCrLf & vbCrLf & _
           "## NOTES" & vbCrLf & _
           "- Edit code files directly, then import back to Excel" & vbCrLf & _
           "- Form design must be done in Excel (only code imports)" & vbCrLf & _
@@ -831,13 +844,26 @@ Private Sub WriteHarness(basePath As String)
             Dim d2 As String: d2 = toolsDir & toolFiles(i)
             If fso.FileExists(s2) Then fso.CopyFile s2, d2, True
         Next
-        ' .claude/settings.json under tools/
+        ' .claude/settings.json under tools/ (scoped permissions for
+        ' the session files agents will be poking at)
         Dim claudeSrc As String: claudeSrc = toolsSrc & ".claude\settings.json"
         If fso.FileExists(claudeSrc) Then
             Dim claudeDir As String: claudeDir = toolsDir & ".claude\"
             EnsureFolder claudeDir
             fso.CopyFile claudeSrc, claudeDir & "settings.json", True
         End If
+    End If
+
+    ' Claude Code skill at <repo>/.claude/skills/excel-control/SKILL.md so
+    ' the agent auto-discovers the harness when opening this workbook
+    ' repo. Source lives at excel-control/skill/SKILL.md.
+    Dim skillSrc As String: skillSrc = srcRoot & "skill\SKILL.md"
+    If fso.FileExists(skillSrc) Then
+        Dim skillDstDir As String: skillDstDir = basePath & ".claude\skills\excel-control\"
+        EnsureFolder basePath & ".claude\"
+        EnsureFolder basePath & ".claude\skills\"
+        EnsureFolder skillDstDir
+        fso.CopyFile skillSrc, skillDstDir & "SKILL.md", True
     End If
 End Sub
 

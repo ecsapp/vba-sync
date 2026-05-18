@@ -133,6 +133,11 @@ End Sub
         if (-not (Test-Path -LiteralPath $p)) { throw "missing in bundle: tools/$rel" }
         Write-Host "  bundled: tools/$rel  ($((Get-Item -LiteralPath $p).Length) bytes)" -ForegroundColor Green
     }
+
+    # Also verify Claude Code skill at <repo>/.claude/skills/excel-control/SKILL.md
+    $skillPath = Join-Path $workDir '.claude\skills\excel-control\SKILL.md'
+    if (-not (Test-Path -LiteralPath $skillPath)) { throw "missing in bundle: .claude/skills/excel-control/SKILL.md" }
+    Write-Host "  bundled: .claude/skills/excel-control/SKILL.md  ($((Get-Item -LiteralPath $skillPath).Length) bytes)" -ForegroundColor Green
     Remove-Item -Recurse -Force $workDir
 
     Write-Host "PASS test-bundle" -ForegroundColor Green

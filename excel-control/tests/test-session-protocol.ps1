@@ -79,9 +79,11 @@ try {
     }
     Write-Host "  event ordering: $($types -join ' -> ')" -ForegroundColor Green
 
-    # Wait for the host process to actually exit
-    $proc.WaitForExit(5000) | Out-Null
-    if (-not $proc.HasExited) { throw "Session host process did not exit within 5s of 'closed' event" }
+    # Wait for the host process to actually exit. Excel COM cleanup
+    # can take 10+ seconds when prior tests in a run-all sweep left
+    # COM handles around — give it room.
+    $proc.WaitForExit(20000) | Out-Null
+    if (-not $proc.HasExited) { throw "Session host process did not exit within 20s of 'closed' event" }
     Write-Host "  host process exited cleanly" -ForegroundColor Green
 
     Write-Host "PASS test-session-protocol" -ForegroundColor Green

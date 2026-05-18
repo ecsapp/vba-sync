@@ -16,6 +16,10 @@ foreach ($t in $tests) {
     & $t.FullName | Out-Host
     $status = if ($LASTEXITCODE -eq 0) { 'PASS' } else { 'FAIL' }
     $results += [pscustomobject]@{ Test = $t.Name; Status = $status; Exit = $LASTEXITCODE }
+    # Cooldown — Excel COM cleanup needs a moment between back-to-back
+    # sessions or subsequent ones get cleanup hangs.
+    Get-Process EXCEL -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 800
 }
 
 Write-Host ""
