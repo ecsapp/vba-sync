@@ -21,32 +21,43 @@ Excel files are binary blobs. That makes the VBA code, table schemas, formulas, 
 
 ## What gets exported
 
+Two folders land next to your `.xlsm`: `<WorkbookName>/` (the per-workbook
+content tree) and `tools/` (the bundled agent harness, plus a Claude Code
+skill manifest at `.claude/skills/excel-control/SKILL.md` at the repo root).
+
 ```
-YourWorkbook/
-├── Modules/                            # Standard VBA modules (.bas)
-├── ClassModules/                       # VBA class modules (.cls)
-├── Forms/                              # UserForms (.frm + .frx)
-├── Objects/                            # ThisWorkbook & Sheet modules (.cls)
-└── Excel/
-    ├── MANIFEST.json                   # Workbook structure: sheets, tables, defined names, lambdas, calc
-    ├── lambdas/                        # LAMBDA defined names, one .lambda file per unique body
-    │   └── AppendRange.lambda
-    ├── worksheets/
-    │   └── <NN> - <SheetName>/         # One folder per sheet (sheetId-prefixed for stable sort)
-    │       ├── data.tsv                # Cell values, with shared strings resolved inline
-    │       ├── formulas.json           # Cell formulas, range-collapsed (B2:B100 = "=...")
-    │       ├── styles.json             # Resolved cell styles (fill/font/border/numFmt), range-merged
-    │       ├── _meta.json              # Tab colour, frozen panes, column widths, hosted tables
-    │       ├── validations.json        # Data validation rules (if any)
-    │       ├── conditional_formats.json
-    │       ├── comments.json           # Cell comments + author
-    │       ├── tables/<TableName>/
-    │       │   ├── definition.json     # Schema, columns, calc formulas, overrides
-    │       │   └── data.tsv            # Clean dataset (headers row 1, data rows below)
-    │       └── drawings/
-    │           ├── shapes.json         # Shapes, pictures, with OnAction macro names
-    │           └── _assets/            # Embedded images
-    └── STRUCTURE_SUMMARY.md            # Human-readable overview
+YourWorkbookRepo/
+├── YourWorkbook/                       # Per-workbook content tree
+│   ├── Modules/                            # Standard VBA modules (.bas)
+│   ├── ClassModules/                       # VBA class modules (.cls)
+│   ├── Forms/                              # UserForms (.frm + .frx)
+│   ├── Objects/                            # ThisWorkbook & Sheet modules (.cls)
+│   └── Excel/
+│       ├── MANIFEST.json                   # Workbook structure: sheets, tables, defined names, lambdas, calc
+│       ├── lambdas/                        # LAMBDA defined names, one .lambda file per unique body
+│       ├── worksheets/<NN> - <SheetName>/
+│       │       data.tsv                    # Cell values, with shared strings resolved inline
+│       │       formulas.json               # Cell formulas, range-collapsed (B2:B100 = "=...")
+│       │       styles.json                 # Resolved cell styles (fill/font/border/numFmt), range-merged
+│       │       _meta.json                  # Tab colour, frozen panes, column widths, hosted tables
+│       │       validations.json            # Data validation rules (if any)
+│       │       conditional_formats.json
+│       │       comments.json               # Cell comments + author
+│       │       tables/<TableName>/{definition.json, data.tsv}
+│       │       drawings/{shapes.json, _assets/}
+│       └── STRUCTURE_SUMMARY.md            # Human-readable overview
+├── tools/                              # excel-control agent harness (bundled per Export)
+│   ├── start-session.ps1                   # Long-running PowerShell session over an Excel COM instance
+│   ├── session-dialog-watcher.ps1          # Win32 modal watcher (reporter pattern)
+│   ├── capture.ps1                         # Screenshot helpers (PrintWindow + CopyFromScreen)
+│   ├── INTERFACE.md                        # Full agent command/event reference
+│   ├── clsAssert.cls                       # Optional assertion library for run_tests
+│   └── .claude/settings.json               # Pre-approved permissions for session files
+├── .claude/skills/excel-control/SKILL.md   # Claude Code skill auto-discovery
+├── .gitattributes                      # Line endings + encoding per file type
+├── .gitignore                          # Excludes Excel temp files
+├── .vscode/settings.json               # System ANSI codepage for VS Code (created once)
+└── README.md                           # Auto-generated, written once
 ```
 
 The `Excel/` folder is produced by reading the live Excel object model from VBA:
@@ -65,6 +76,13 @@ The export also writes config files (created once, never overwritten):
 - `.gitignore` — excludes Excel temp files and system cruft
 - `.vscode/settings.json` — pins VS Code to your system ANSI codepage so non-ASCII characters (Polish ą/ć/ł, French é/à, €, em-dashes, etc.) render correctly. VBA exports in the system codepage, not UTF-8; this file tells VS Code so. Commit it so collaborators on the same codepage see files correctly out of the box.
 - `README.md` — auto-generated documentation
+
+And on every export (overwritten each run, so always current with the
+installed addin version):
+
+- `tools/INTERFACE.md` — agent command + event reference
+- `tools/*.ps1`, `tools/clsAssert.cls` — the harness scripts
+- `.claude/skills/excel-control/SKILL.md` — Claude Code skill manifest
 
 ## Installation
 
@@ -96,25 +114,26 @@ Excel must be allowed to read its own VBA project:
 
 ## Agent harness (excel-control)
 
-Every Export also drops a `tools/` folder next to the workbook
-containing **excel-control**, a PowerShell-based session protocol that
-lets an AI agent drive the workbook end-to-end:
+The `tools/` folder bundled into every Export is **excel-control** — a
+PowerShell-based session protocol that lets an AI agent drive the
+workbook end-to-end: run macros, read/write cells, respond to dialogs
+and UserForms as they appear, capture VBA runtime errors with module
+and line, run a discovered `Test_*` suite.
 
-- run macros and capture their results
-- read/write cell ranges
-- respond to dialogs and UserForms as they appear (the watcher reports
-  every modal as a structured event with text, buttons, and a PNG
-  screenshot — the agent decides which button)
-- capture VBA runtime errors with module + line + screenshot
-- run a discovered `Test_*` suite end-to-end
+Architecture: long-running PowerShell process holds an Excel COM
+instance open; agent appends commands to `commands.jsonl` and watches
+events on `events.jsonl`. Any tool that can read and write files can
+drive it — Claude Code (with the auto-discovered SKILL), MCP clients,
+bash, CI scripts. Source lives in [`excel-control/`](excel-control/);
+full reference is generated into each exported workbook at
+[`tools/INTERFACE.md`](excel-control/tools/INTERFACE.md).
 
-The protocol is append-only JSONL files (`commands.jsonl` /
-`events.jsonl`) so anything that can read and write files can drive it
-(Claude Code, MCP clients, bash, CI scripts).
+Two modes via `-Visible` switch on `start-session.ps1`:
 
-See `tools/INTERFACE.md` (generated into every exported workbook) for
-the full command + event reference, and `excel-control/` in this repo
-for the source.
+- **Headless** (default) — Excel runs invisible; safe to leave your own
+  Excel session open alongside (separate PIDs)
+- **Visible** — Excel on the desktop; watch the agent work, get
+  meaningful worksheet screenshots
 
 ## Notes and limitations
 
