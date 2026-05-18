@@ -76,8 +76,8 @@ if (Test-Path $stateFile) {
     } catch {}
 }
 
-function Write-EventLine([hashtable]$Event) {
-    $line = ConvertTo-Json -Compress -Depth 10 -InputObject $Event
+function Write-EventLine([hashtable]$EventObj) {
+    $line = ConvertTo-Json -Compress -Depth 10 -InputObject $EventObj
     Add-Content -LiteralPath $eventsFile -Value $line -Encoding UTF8
 }
 
@@ -128,8 +128,8 @@ function Read-NewCommands {
 
 # Invokes Excel.Application.Run with variable args. Uses InvokeMember so
 # the macro name and args can be passed as a single array.
-function Invoke-Macro($Xl, [string]$MacroName, [object[]]$Args) {
-    $all = ,$MacroName + ($Args | ForEach-Object { $_ })
+function Invoke-Macro($Xl, [string]$MacroName, [object[]]$MacroArgsArr) {
+    $all = ,$MacroName + ($MacroArgsArr | ForEach-Object { $_ })
     return $Xl.GetType().InvokeMember(
         'Run',
         [System.Reflection.BindingFlags]::InvokeMethod,
@@ -137,7 +137,7 @@ function Invoke-Macro($Xl, [string]$MacroName, [object[]]$Args) {
 }
 
 
-function Handle-Command($Xl, $Wb, $cmd) {
+function Invoke-SessionCommand($Xl, $Wb, $cmd) {
     switch ($cmd.cmd) {
         'respond_dialog' {
             # Owned by the dialog watcher (separate runspace). Main loop
@@ -228,7 +228,7 @@ function Handle-Command($Xl, $Wb, $cmd) {
                     '^window$' {
                         # Excel main window
                         $hwnd = [int64]$Xl.Hwnd
-                        Capture-Window -Hwnd $hwnd -Path $outPath | Out-Null
+                        Save-WindowImage -Hwnd $hwnd -Path $outPath | Out-Null
                     }
                     '^worksheet:(.+)$' {
                         $sheetName = $Matches[1]
@@ -236,13 +236,13 @@ function Handle-Command($Xl, $Wb, $cmd) {
                         $sheet.Activate()
                         Start-Sleep -Milliseconds 200
                         $hwnd = [int64]$Xl.Hwnd
-                        Capture-Window -Hwnd $hwnd -Path $outPath | Out-Null
+                        Save-WindowImage -Hwnd $hwnd -Path $outPath | Out-Null
                     }
                     '^(dialog|form):(.+)$' {
                         $dlgId = $Matches[2]
                         $info  = $script:Watcher.State.DialogInfo[$dlgId]
                         if (-not $info) { throw "Unknown dialog/form id: $dlgId" }
-                        Capture-Window -Hwnd $info.Hwnd -Path $outPath | Out-Null
+                        Save-WindowImage -Hwnd $info.Hwnd -Path $outPath | Out-Null
                     }
                     default { throw "Unknown screenshot target: $target" }
                 }
@@ -716,7 +716,7 @@ try {
             if ($cmd.cmd -eq 'respond_dialog') { continue }
             Write-EventLine @{ t = 'command_ack'; id = $cmd.id; cmd = $cmd.cmd }
             Save-State 'busy'
-            Handle-Command -Xl $xl -Wb $wb -cmd $cmd
+            Invoke-SessionCommand -Xl $xl -Wb $wb -cmd $cmd
             Save-State 'ready'
             if ($script:Stop) { break }
         }

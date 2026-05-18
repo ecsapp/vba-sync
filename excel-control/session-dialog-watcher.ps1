@@ -117,7 +117,7 @@ namespace XcDialog {
             Add-Type -AssemblyName System.Drawing
         }
 
-        function Capture-WindowPng([int64]$Hwnd, [string]$Path) {
+        function Save-DialogPng([int64]$Hwnd, [string]$Path) {
             $h = [IntPtr]$Hwnd
             if (-not [XcDialog.Win32]::IsWindow($h)) { return $null }
             $rect = New-Object XcDialog.RECT
@@ -200,7 +200,7 @@ namespace XcDialog {
             return $false
         }
 
-        function Append-Event([hashtable]$ev) {
+        function Write-SessionEvent([hashtable]$ev) {
             $line = $ev | ConvertTo-Json -Compress -Depth 10
             for ($i = 0; $i -lt 5; $i++) {
                 try { Add-Content -LiteralPath $state.EventsFile -Value $line -Encoding UTF8; return }
@@ -234,7 +234,7 @@ namespace XcDialog {
             return $out
         }
 
-        function Dispatch-Click($dialogInfo, [string]$buttonLabel) {
+        function Send-DialogClick($dialogInfo, [string]$buttonLabel) {
             $hwnd = [IntPtr]$dialogInfo.Hwnd
             $target = $null
             foreach ($b in $dialogInfo.Buttons) {
@@ -317,7 +317,7 @@ namespace XcDialog {
                 $shotErr  = $null
                 try {
                     $shotPath = Join-Path $state.CapturesDir "$id.png"
-                    [void](Capture-WindowPng -Hwnd $hwnd.ToInt64() -Path $shotPath)
+                    [void](Save-DialogPng -Hwnd $hwnd.ToInt64() -Path $shotPath)
                     if (-not (Test-Path $shotPath)) { $shotPath = $null; $shotErr = 'png not written' }
                 } catch { $shotPath = $null; $shotErr = $_.Exception.Message }
 
@@ -335,14 +335,14 @@ namespace XcDialog {
                     $ev.number = $rtNum
                     $ev.description = $rtDesc
                 }
-                Append-Event $ev
+                Write-SessionEvent $ev
 
                 # For runtime errors, immediately dispatch End so the macro
                 # returns to COM and PowerShell unblocks. The agent can't
                 # respond to a runtime-error mid-macro anyway.
                 if ($isRtError) {
                     $info = $state.DialogInfo[$id]
-                    $null = Dispatch-Click -dialogInfo $info -buttonLabel '&End'
+                    $null = Send-DialogClick -dialogInfo $info -buttonLabel '&End'
                     [void]$state.ActiveDialogs.Remove($key)
                     [void]$state.DialogInfo.Remove($id)
                 }
@@ -357,26 +357,26 @@ namespace XcDialog {
                 $id = $state.ActiveDialogs[$key]
                 [void]$state.ActiveDialogs.Remove($key)
                 [void]$state.DialogInfo.Remove($id)
-                Append-Event @{ t = 'dialog_closed_externally'; id = $id }
+                Write-SessionEvent @{ t = 'dialog_closed_externally'; id = $id }
             }
 
             # respond_dialog commands
             $cmds = Read-RespondCommands
             foreach ($cmd in $cmds) {
-                Append-Event @{ t = 'command_ack'; id = $cmd.id; cmd = 'respond_dialog' }
+                Write-SessionEvent @{ t = 'command_ack'; id = $cmd.id; cmd = 'respond_dialog' }
                 $dialogId = $cmd.dialog_id
                 $info = $state.DialogInfo[$dialogId]
                 if (-not $info) {
-                    Append-Event @{ t = 'respond_failed'; id = $cmd.id; dialog_id = $dialogId; reason = 'unknown_or_closed_dialog' }
+                    Write-SessionEvent @{ t = 'respond_failed'; id = $cmd.id; dialog_id = $dialogId; reason = 'unknown_or_closed_dialog' }
                     continue
                 }
-                $closed = Dispatch-Click -dialogInfo $info -buttonLabel $cmd.button
+                $closed = Send-DialogClick -dialogInfo $info -buttonLabel $cmd.button
                 if ($closed) {
-                    Append-Event @{ t = 'dialog_dismissed'; id = $cmd.id; dialog_id = $dialogId; button = $cmd.button }
+                    Write-SessionEvent @{ t = 'dialog_dismissed'; id = $cmd.id; dialog_id = $dialogId; button = $cmd.button }
                     [void]$state.ActiveDialogs.Remove([int64]$info.Hwnd)
                     [void]$state.DialogInfo.Remove($dialogId)
                 } else {
-                    Append-Event @{ t = 'respond_failed'; id = $cmd.id; dialog_id = $dialogId; reason = 'dialog_did_not_close' }
+                    Write-SessionEvent @{ t = 'respond_failed'; id = $cmd.id; dialog_id = $dialogId; reason = 'dialog_did_not_close' }
                 }
             }
 
