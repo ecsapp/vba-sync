@@ -68,14 +68,25 @@ Private mPadStackTop    As Long
 '-- Error flag
 Private mParseError     As Boolean
 Private mParseErrorMsg  As String
+Private mStage          As String
 
 
 '======================================================================
 '  PUBLIC ENTRY POINT
 '======================================================================
+Public Function CanonicalizeFrxLastError() As String
+    CanonicalizeFrxLastError = mParseErrorMsg
+End Function
+
 Public Function CanonicalizeFrx(ByVal FrxPath As String) As Long
     On Error GoTo Fail
+    mParseErrorMsg = ""
+    mParseError = False
+    mPadStackTop = 0
+    mPaddingActive = False
+    mPadStart = 0
 
+    mStage = "LoadFile"
     If Not LoadFile(FrxPath) Then
         CanonicalizeFrx = -1
         Exit Function
@@ -85,20 +96,25 @@ Public Function CanonicalizeFrx(ByVal FrxPath As String) As Long
     ReDim mPadMask(0 To mBytesLen - 1)
 
     ' --- Locate CFBF magic (typical .frx wraps it at offset 24) ---
+    mStage = "LocateCfbfStart"
     If Not LocateCfbfStart() Then
         CanonicalizeFrx = -1
         Exit Function
     End If
 
     ' --- Parse CFBF header + FAT + miniFAT ---
+    mStage = "ReadCfbfHeader"
     If Not ReadCfbfHeader() Then GoTo Fail
+    mStage = "ReadFat"
     If Not ReadFat() Then GoTo Fail
+    mStage = "ReadMiniFat"
     If Not ReadMiniFat() Then GoTo Fail
 
     ' --- Walk directory, find Root Entry (mini-stream chain), f, o ---
     Dim fStartSec As Long, fSize As Long
     Dim oStartSec As Long, oSize As Long
     Dim foundF As Boolean, foundO As Boolean
+    mStage = "WalkDirectory"
     If Not WalkDirectory(fStartSec, fSize, foundF, oStartSec, oSize, foundO) Then GoTo Fail
 
     If Not foundF Then
@@ -113,11 +129,15 @@ Public Function CanonicalizeFrx(ByVal FrxPath As String) As Long
     ' --- Walk the 'f' stream (FormControl + OleSiteConcreteControl array) ---
     Dim siteClsids() As Long
     Dim siteCount As Long
+    mStage = "LoadStream(f)"
     If Not LoadStream(fStartSec, fSize) Then GoTo Fail
+    mStage = "ParseFormControlStream"
     If Not ParseFormControlStream(siteClsids, siteCount) Then GoTo Fail
 
     ' --- Walk the 'o' stream (ObjectStreamRecord array, one per site) ---
+    mStage = "LoadStream(o)"
     If Not LoadStream(oStartSec, oSize) Then GoTo Fail
+    mStage = "ParseObjectStream"
     If Not ParseObjectStream(siteClsids, siteCount) Then GoTo Fail
 
     ' --- Zero out flagged bytes and write file back ---
@@ -129,7 +149,13 @@ Public Function CanonicalizeFrx(ByVal FrxPath As String) As Long
     Exit Function
 
 Fail:
-    If Len(mParseErrorMsg) = 0 Then mParseErrorMsg = "VBA error #" & Err.Number & ": " & Err.Description
+    If Err.Number <> 0 Then
+        mParseErrorMsg = "VBA error #" & Err.Number & ": " & Err.Description & " (stage=" & mStage & ", streamPos=" & mStreamPos & "/" & mStreamLen & ")"
+    ElseIf Len(mParseErrorMsg) = 0 Then
+        mParseErrorMsg = "Unknown error (stage=" & mStage & ", streamPos=" & mStreamPos & "/" & mStreamLen & ")"
+    Else
+        mParseErrorMsg = mParseErrorMsg & " (stage=" & mStage & ", streamPos=" & mStreamPos & "/" & mStreamLen & ")"
+    End If
     Debug.Print "CanonicalizeFrx error: " & mParseErrorMsg
     CanonicalizeFrx = -1
 End Function
@@ -607,9 +633,14 @@ End Function
 '  to the i-th entry in the propmask's name list.
 Private Function MaskBit(ByVal mask As Double, ByVal bit As Long) As Long
     ' Returns 0 or 1.  mask is Double to hold unsigned 32-bit.
+    ' Avoid CLng (overflows for mask >= 2^31): use mod-2 on a Double.
     Dim shifted As Double
     shifted = Int(mask / (2 ^ bit))
-    MaskBit = CLng(shifted) And 1
+    If (shifted - Int(shifted / 2) * 2) >= 1 Then
+        MaskBit = 1
+    Else
+        MaskBit = 0
+    End If
 End Function
 
 ' Consume a list of (bitIndex, size) pairs from the propmask.  Each entry
