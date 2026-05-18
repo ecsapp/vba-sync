@@ -925,29 +925,20 @@ Private Function ConsumeOleSiteConcreteControl(ByRef outClsidCacheIndex As Long)
     ConsumeOleSiteConcreteControl = True
 End Function
 
-'-- TextProps: [MS-OFORMS] 2.3.1 ---------------------------------------
-' Excel-written TextProps body (empirical, mask=0x35, cb=24):
-'   [PropMask 4] [Count 4] [Field 4] [Field 4] [FaceName 6] [pad 2] = 24
-'
-' We can't trust the per-bit field sizes without a definitive MS-OFORMS
-' spec, BUT we know:
-'   - PropMask is 4 bytes.
-'   - If a FaceName is present, it ends right at (cb - trailing-pad)
-'     where the trailing pad is whatever's needed to make the string-end
-'     reach a 4-byte boundary from startPos.
-'   - FaceName length is encoded as a CountWithCompressionFlag DWORD
-'     somewhere in the binary-props area.
-'
-' Strategy: skip past PropMask, scan forward looking for a
-' CountWithCompressionFlag DWORD whose `count` value (low 31 bits)
-' equals (cb - currentPos - count_padToEnd).  In practice the count
-' is always the very first DWORD after PropMask when fFontName is set
-' (mask bit 0 in the layout below), so just probe that.
-'
-' If we find a valid count, the FaceName lives at the end of cb,
-' aligned to 4.  We pad-fill anything between the count's position+4
-' and the string start as opaque (binary props -- left alone), and
-' flag only the trailing alignment pad as padding.
+'-- TextProps: [MS-OFORMS] 2.3.1 + TextPropsPropMask 2.3.7 ------------
+' Authoritative bit layout (verified against the MS-OFORMS spec):
+'   bit 0: fFontName              -- CountWithCompressionFlag (4) + ExtraData
+'   bit 1: fFontEffects           -- 4
+'   bit 2: fFontHeight            -- 4
+'   bit 3: UnusedBits1            -- 0
+'   bit 4: fFontCharSet           -- 1
+'   bit 5: fFontPitchAndFamily    -- 1
+'   bit 6: fParagraphAlign        -- 1
+'   bit 7: fFontWeight            -- 2
+'   bits 8-31: UnusedBits2        -- 0
+' DataBlock fields are packed inside padded_struct (each field aligned
+' to its own size via PadIfNeeded).  ExtraDataBlock = FontName text.
+' Trailing alignment pad fills cbTextProps.
 Private Function ConsumeTextProps() As Boolean
     Dim ver0 As Long, ver1 As Long
     ver0 = ReadByte(): ver1 = ReadByte()
@@ -958,50 +949,22 @@ Private Function ConsumeTextProps() As Boolean
     If cb <= 0 Then ConsumeTextProps = True: Exit Function
 
     Dim mask As Double
-    mask = ReadDword()      ' 4 bytes
+    mask = ReadDword()
     Dim faceNameLen As Long: faceNameLen = 0
-    If MaskBit(mask, 0) Then
-        Dim count As Long
-        count = ReadCountWithCompressionFlag()
-        If count > 0 And count <= cb - 8 Then faceNameLen = count
-    End If
-    ' Skip remaining binary props as opaque (read but don't flag).  The
-    ' FaceName, if present, lives at the very end of cb (aligned to 4),
-    ' so its starting offset relative to startPos = cb - faceNameLen,
-    ' rounded down to a multiple of 4 from the StreamPos side.
-    If faceNameLen > 0 Then
-        ' Compute string start, then skip-without-flag to that offset.
-        Dim stringStart As Long
-        stringStart = startPos + (cb - faceNameLen)
-        ' Round DOWN to 4-aligned (relative to startPos) -- Excel pads
-        ' to 4 within the cb scope after the FaceName.
-        Dim relOff As Long
-        relOff = stringStart - startPos
-        Dim mod4 As Long
-        mod4 = relOff Mod 4
-        If mod4 <> 0 Then stringStart = stringStart + (4 - mod4)
-        If stringStart < mStreamPos Then stringStart = mStreamPos
-        ' Skip-without-flag (preserve binary props).
-        If stringStart - mStreamPos > 0 Then
-            If Not StreamReadOpaque(stringStart - mStreamPos) Then Exit Function
-        End If
-        If Not StreamReadOpaque(faceNameLen) Then Exit Function
-    End If
-    ' Fill cb -- trailing alignment is the only true padding.
+    PushPadded
+    If MaskBit(mask, 0) Then faceNameLen = ReadCountWithCompressionFlag()
+    If MaskBit(mask, 1) Then If Not StreamRead(4) Then Exit Function   ' fFontEffects
+    If MaskBit(mask, 2) Then If Not StreamRead(4) Then Exit Function   ' fFontHeight
+    If MaskBit(mask, 4) Then If Not StreamRead(1) Then Exit Function   ' fFontCharSet
+    If MaskBit(mask, 5) Then If Not StreamRead(1) Then Exit Function   ' fFontPitchAndFamily
+    If MaskBit(mask, 6) Then If Not StreamRead(1) Then Exit Function   ' fParagraphAlign
+    If MaskBit(mask, 7) Then If Not StreamRead(2) Then Exit Function   ' fFontWeight
+    PopPadded
+    ' ExtraDataBlock: FontName text (compressed = 1 byte/char).
+    If faceNameLen > 0 Then If Not StreamRead(faceNameLen) Then Exit Function
+    ' Trailing alignment pad.
     If Not JumpTo(cb, startPos) Then Exit Function
     ConsumeTextProps = True
-End Function
-
-' Like StreamRead but never flags padding (used inside TextProps for
-' opaque binary props between the count and the FaceName).
-Private Function StreamReadOpaque(ByVal n As Long) As Boolean
-    If n <= 0 Then StreamReadOpaque = True: Exit Function
-    If mStreamPos + n > mStreamLen Then
-        mParseErrorMsg = "Stream read past end (pos=" & mStreamPos & " n=" & n & ")"
-        Exit Function
-    End If
-    mStreamPos = mStreamPos + n
-    StreamReadOpaque = True
 End Function
 
 '-- GuidAndFont: [MS-OFORMS] 2.4.7 ------------------------------------
