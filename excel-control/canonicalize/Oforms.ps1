@@ -256,10 +256,45 @@ function Read-CountOfBytesWithCompressionFlag([PadStream]$s) {
 }
 
 function Read-TextProps([PadStream]$s) {
-    # 2.3.1
-    $null = $s.Read(2)               # versions: BB (0, 2)
+    # 2.3.1 + 2.3.2/2.3.3/2.3.4 -- decode property mask + variable-length
+    # font name so we can emit the trailing pad inside cbTextProps.
+    # oleform.py treats this as opaque (`stream.read(cbTextProps)`), missing
+    # the alignment-pad churn that Excel writes after the font name.
+    $null = $s.Read(2)                              # versions BB (0, 2)
     $cb = $s.U16()
-    $null = $s.Read($cb)
+    # cb covers the property block: mask (4) + per-bit data + variable string + pad.
+    $s.WillJumpTo($cb)
+    try {
+        $mask = $s.U32()
+        $hasFontName = (($mask -shr 0) -band 1) -ne 0   # bit 0: fFontName length
+        $hasFontEffects = (($mask -shr 1) -band 1) -ne 0  # bit 1: 4 bytes (assumed)
+        $hasFontHeight = (($mask -shr 2) -band 1) -ne 0   # bit 2: 4 bytes (height)
+        $hasFontOffset = (($mask -shr 3) -band 1) -ne 0   # bit 3: 4 bytes (assumed)
+        $hasFontCharsetWeight = (($mask -shr 4) -band 1) -ne 0  # bit 4: 4 bytes (charset+weight)
+        # bits 5, 6, 7 observed as boolean (no data) -- italic/underline/strikeout flags
+        # Higher bits: unknown; if a real .frx ever sets them we'll likely overread.
+        $fontNameSize = 0
+        $s.PaddedStruct()
+        try {
+            if ($hasFontName)         { $fontNameSize = Read-CountOfBytesWithCompressionFlag $s }
+            if ($hasFontEffects)      { $null = $s.Read(4) }
+            if ($hasFontHeight)       { $null = $s.Read(4) }
+            if ($hasFontOffset)       { $null = $s.Read(4) }
+            if ($hasFontCharsetWeight){ $null = $s.Read(4) }
+        } finally { $s.End() }
+        # ExtraDataBlock: font name (variable) -- 4-byte aligned trailing pad
+        # handled by the WillJumpTo End() which fills cb tail with content read.
+        # The pad bytes within cb are NOT real content here -- they're alignment.
+        if ($fontNameSize -gt 0) { $null = $s.Read($fontNameSize) }
+        # The tail of cbTextProps is alignment pad -- mark it as such by
+        # recording the range before the jump-end consumes it.
+        $consumed = $s.Pos - ($s.Frames.Peek().Start)
+        $tail = $cb - $consumed
+        if ($tail -gt 0) {
+            $s.RecordPad($s.Pos, $tail)
+            $null = $s.ReadRaw($tail)
+        }
+    } finally { $s.End() }
 }
 
 function Read-GuidAndFont([PadStream]$s) {
@@ -446,10 +481,24 @@ function Read-MorphDataControl([PadStream]$s) {
             if ($mask.fGroupName) { $groupNameSize = Read-CountOfBytesWithCompressionFlag $s }
         } finally { $s.End() }
         # MorphDataExtraDataBlock 2.2.5.4
+        # 8-byte "Size" prefix (textbox layout in himetric) then each variable
+        # string is padded to 4-byte alignment relative to the ExtraDataBlock
+        # start. oleform.py just concatenates them, but Excel pads -- the pads
+        # are uninitialised and are the dominant source of o-stream churn.
         $null = $s.Read(8)
-        if ($valueSize     -gt 0) { $null = $s.Read($valueSize) }
-        if ($captionSize   -gt 0) { $null = $s.Read($captionSize) }
-        if ($groupNameSize -gt 0) { $null = $s.Read($groupNameSize) }
+        $extraStart = $s.Pos
+        if ($valueSize     -gt 0) {
+            $null = $s.Read($valueSize)
+            $s.PadTo($extraStart, 4)
+        }
+        if ($captionSize   -gt 0) {
+            $null = $s.Read($captionSize)
+            $s.PadTo($extraStart, 4)
+        }
+        if ($groupNameSize -gt 0) {
+            $null = $s.Read($groupNameSize)
+            $s.PadTo($extraStart, 4)
+        }
     } finally { $s.End() }
     if ($maskFMouseIcon) { Read-GuidAndPicture $s }
     if ($maskFPicture)   { Read-GuidAndPicture $s }
@@ -473,16 +522,37 @@ function Read-ImageControl([PadStream]$s) {
 }
 
 function Read-CommandButtonControl([PadStream]$s) {
-    # 2.2.1.1
+    # 2.2.1.1 -- decode DataBlock + ExtraDataBlock so we can emit caption-pad
+    # ranges. oleform.py skips both via will_jump_to which hides the churn.
     $null = $s.Read(2)
     $cb = $s.U16()
     $maskFMouseIcon = 0; $maskFPicture = 0
+    $hasSize = 0
     $s.WillJumpTo($cb)
     try {
         $maskVal = $s.U32()
         $mask = New-Mask $maskVal $Script:CommandButtonPropMaskNames
         $maskFMouseIcon = $mask.fMouseIcon
         $maskFPicture   = $mask.fPicture
+        $hasSize        = $mask.fSize
+        $s.PaddedStruct()
+        try {
+            Read-Propmask-Consume $s $mask @(@('fForeColor', 4), @('fBackColor', 4), @('fVariousPropertyBits', 4))
+            $captionSize = 0
+            if ($mask.fCaption) { $captionSize = Read-CountOfBytesWithCompressionFlag $s }
+            Read-Propmask-Consume $s $mask @(
+                @('fPicturePosition', 4), @('fMousePointer', 1),
+                @('fPicture', 2),  @('fAccelerator', 2),
+                @('fTakeFocusOnClick', 1), @('fMouseIcon', 2)
+            )
+        } finally { $s.End() }
+        # ExtraDataBlock 2.2.1.4: caption (variable, 4-byte aligned), then 8-byte Size if fSize.
+        $extraStart = $s.Pos
+        if ($captionSize -gt 0) {
+            $null = $s.Read($captionSize)
+            $s.PadTo($extraStart, 4)
+        }
+        if ($hasSize) { $null = $s.Read(8) }
     } finally { $s.End() }
     if ($maskFPicture)   { Read-GuidAndPicture $s }
     if ($maskFMouseIcon) { Read-GuidAndPicture $s }
@@ -553,7 +623,13 @@ function Read-LabelControl([PadStream]$s) {
                 @('fAccelerator', 2),     @('fMouseIcon', 2)
             )
         } finally { $s.End() }
-        if ($captionSize -gt 0) { $null = $s.Read($captionSize) }
+        # LabelExtraDataBlock 2.2.4.4: caption (variable) then 8-byte LabelSize.
+        # Caption is padded to 4-byte alignment before the size struct.
+        $extraStart = $s.Pos
+        if ($captionSize -gt 0) {
+            $null = $s.Read($captionSize)
+            $s.PadTo($extraStart, 4)
+        }
         $null = $s.Read(8)
     } finally { $s.End() }
     if ($maskFPicture)   { Read-GuidAndPicture $s }
