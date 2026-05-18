@@ -89,7 +89,7 @@ function Get-FileRanges($stream, [int64]$streamOffset, [int]$length) {
 
 try {
     if (-not (Test-Path -LiteralPath $Path)) {
-        Write-Error "File not found: $Path"
+        [Console]::Error.WriteLine("File not found: $Path")
         exit 3
     }
 
@@ -98,7 +98,7 @@ try {
     try {
         $ole = Read-CfbfStreams $absPath
     } catch {
-        Write-Error "CFBF parse failed: $($_.Exception.Message)"
+        [Console]::Error.WriteLine("CFBF parse failed: $($_.Exception.Message)")
         exit 2
     }
 
@@ -107,8 +107,8 @@ try {
 
     $fStream = $ole.Streams | Where-Object { $_.Name.Trim() -eq 'f' } | Select-Object -First 1
     $oStream = $ole.Streams | Where-Object { $_.Name.Trim() -eq 'o' } | Select-Object -First 1
-    if (-not $fStream) { Write-Error "No 'f' stream in CFBF -- not a .frx?"; exit 2 }
-    if (-not $oStream) { Write-Error "No 'o' stream in CFBF -- not a .frx?"; exit 2 }
+    if (-not $fStream) { [Console]::Error.WriteLine("No 'f' stream in CFBF -- not a .frx?"); exit 2 }
+    if (-not $oStream) { [Console]::Error.WriteLine("No 'o' stream in CFBF -- not a .frx?"); exit 2 }
 
     $fBytes = [byte[]](ConvertTo-StreamBytes $bytes $fStream)
     $oBytes = [byte[]](ConvertTo-StreamBytes $bytes $oStream)
@@ -116,7 +116,7 @@ try {
     try {
         $pads = Get-OformsPaddingRanges -FStreamBytes $fBytes -OStreamBytes $oBytes
     } catch {
-        Write-Error "OFORMS walk failed: $($_.Exception.Message)"
+        [Console]::Error.WriteLine("OFORMS walk failed: $($_.Exception.Message)")
         exit 2
     }
 
@@ -183,13 +183,13 @@ try {
     try {
         [System.IO.File]::WriteAllBytes($outPath, $bytes)
     } catch {
-        Write-Error "Write failed: $($_.Exception.Message)"
+        [Console]::Error.WriteLine("Write failed: $($_.Exception.Message)")
         exit 3
     }
 
     Write-Host "canonicalized $totalZeroed padding bytes"
     exit 0
 } catch {
-    Write-Error $_
+    [Console]::Error.WriteLine($_)
     exit 3
 }

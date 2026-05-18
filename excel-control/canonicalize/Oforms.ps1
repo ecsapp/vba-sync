@@ -331,9 +331,8 @@ function Read-SiteClassInfo([PadStream]$s) {
 }
 
 function Read-FormObjectDepthTypeCount([PadStream]$s) {
-    # 2.2.10.7
+    # 2.2.10.7 -- the first byte is `depth` (nesting level), unused here.
     $b = $s.Read(2)
-    $depth = $b[0]
     $mixed = $b[1]
     if ($mixed -band 0x80) {
         $null = $s.U8()              # SITE_TYPE byte = 1
