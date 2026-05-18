@@ -27,8 +27,9 @@ New-Item -ItemType Directory -Force -Path $workDir | Out-Null
 $workWb = Join-Path $workDir 'msgbox.xlsm'
 Copy-Item -LiteralPath $fixtureSrc -Destination $workWb -Force
 
-Get-Process EXCEL -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 300
+. (Join-Path $PSScriptRoot '_helpers.ps1')
+Clear-OrphanSessionExcels $sessions
+Start-Sleep -Milliseconds 200
 
 Write-Host "Test: bundle (SessionId=$SessionId)" -ForegroundColor Cyan
 
@@ -147,7 +148,6 @@ End Sub
     if (Test-Path $eventsFile) { Get-Content -LiteralPath $eventsFile | ForEach-Object { Write-Host "  $_" } }
     exit 1
 } finally {
-    if ($proc -and -not $proc.HasExited) { try { $proc.Kill() } catch {} }
-    Get-Process EXCEL -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Stop-SessionProcesses -HostProc $proc -SessionDir $sessionDir
     if (Test-Path $workDir) { try { Remove-Item -Recurse -Force $workDir } catch {} }
 }

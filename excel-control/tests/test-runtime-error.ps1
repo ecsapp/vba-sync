@@ -15,8 +15,9 @@ $sessions   = Join-Path $repo 'excel-control\sessions'
 $sessionDir = Join-Path $sessions $SessionId
 if (Test-Path $sessionDir) { Remove-Item -Recurse -Force $sessionDir }
 
-Get-Process EXCEL -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 300
+. (Join-Path $PSScriptRoot '_helpers.ps1')
+Clear-OrphanSessionExcels $sessions
+Start-Sleep -Milliseconds 200
 
 Write-Host "Test: runtime_error (SessionId=$SessionId)" -ForegroundColor Cyan
 
@@ -76,6 +77,5 @@ catch {
     exit 1
 }
 finally {
-    if ($proc -and -not $proc.HasExited) { try { $proc.Kill() } catch {} }
-    Get-Process EXCEL -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Stop-SessionProcesses -HostProc $proc -SessionDir $sessionDir
 }

@@ -20,8 +20,9 @@ $sessionDir = Join-Path $sessions $SessionId
 if (Test-Path $sessionDir) { Remove-Item -Recurse -Force $sessionDir }
 
 # Kill any orphan Excel before we start so PIDs don't clash
-Get-Process EXCEL -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 300
+. (Join-Path $PSScriptRoot '_helpers.ps1')
+Clear-OrphanSessionExcels $sessions
+Start-Sleep -Milliseconds 200
 
 Write-Host "Test: session protocol (SessionId=$SessionId)" -ForegroundColor Cyan
 
@@ -98,6 +99,5 @@ catch {
     exit 1
 }
 finally {
-    if ($proc -and -not $proc.HasExited) { try { $proc.Kill() } catch {} }
-    Get-Process EXCEL -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Stop-SessionProcesses -HostProc $proc -SessionDir $sessionDir
 }

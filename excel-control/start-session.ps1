@@ -24,7 +24,12 @@ param(
     [Parameter(Mandatory=$true)] [string]$Workbook,
     [Parameter(Mandatory=$true)] [string]$SessionId,
     [string]$SessionsRoot = (Join-Path $PSScriptRoot 'sessions'),
-    [int]$PollMs = 250
+    [int]$PollMs = 250,
+    # -Visible: show Excel on the desktop so you can watch the agent
+    # work. Worksheet screenshots become meaningful (headless mode
+    # renders mostly-empty main window). Side-effects: any UI element
+    # the agent triggers steals foreground focus from other windows.
+    [switch]$Visible
 )
 
 $ErrorActionPreference = 'Stop'
@@ -79,9 +84,11 @@ function Write-EventLine([hashtable]$Event) {
 function Save-State([string]$Status) {
     $s = [ordered]@{
         pid                 = $PID
+        excel_pid           = $script:ExcelPid
         workbook            = $Workbook
         session_id          = $SessionId
         status              = $Status
+        visible             = [bool]$Visible
         started_at          = $script:StartedAt
         last_command_offset = $script:LastOffset
     }
@@ -668,7 +675,7 @@ function Handle-Command($Xl, $Wb, $cmd) {
 
 $resolvedWb = (Resolve-Path -LiteralPath $Workbook).Path
 $xl = New-Object -ComObject Excel.Application
-$xl.Visible = $false
+$xl.Visible = [bool]$Visible
 $xl.DisplayAlerts = $false
 $xl.AskToUpdateLinks = $false
 # Low = let macros run (default ForceDisable would block xl.Run)
@@ -681,12 +688,16 @@ try {
                              [Type]::Missing, [Type]::Missing, $true)
 
     Save-State 'ready'
-    Write-EventLine @{ t = 'started'; pid = $PID; workbook = $resolvedWb; session_id = $SessionId }
-    Write-Host "Session $SessionId started (pid=$PID, workbook=$resolvedWb)" -ForegroundColor Cyan
+    Write-EventLine @{ t = 'started'; pid = $PID; workbook = $resolvedWb; session_id = $SessionId; visible = [bool]$Visible }
+    Write-Host "Session $SessionId started (pid=$PID, workbook=$resolvedWb, visible=$([bool]$Visible))" -ForegroundColor Cyan
 
-    # Determine Excel's PID (not our $PID) so the watcher targets the right process
+    # Determine Excel's PID (not our $PID) so the watcher targets the right process.
+    # Recorded in state.json so tests / cleanup scripts can identify which
+    # EXCEL.EXE belongs to this session — never blanket-kill all Excel.
     $excelPid = [uint32]0
     [XcSession.Win32]::GetWindowThreadProcessId([IntPtr]$xl.Hwnd, [ref]$excelPid) | Out-Null
+    $script:ExcelPid = [int]$excelPid
+    Save-State 'ready'  # re-save now that we know excel_pid
 
     $watcher = Start-SessionDialogWatcher `
         -ProcessId    $excelPid `

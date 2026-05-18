@@ -8,8 +8,12 @@ events to `events.jsonl`.
 ## Quickstart (Claude Code)
 
 ```
-# Start a session in the background
+# Start a session in the background (headless Excel by default)
 Bash run_in_background=true: pwsh tools/start-session.ps1 -Workbook X.xlsm -SessionId s1
+
+# OR visible Excel (user can watch the agent work; worksheet
+# screenshots become meaningful)
+Bash run_in_background=true: pwsh tools/start-session.ps1 -Workbook X.xlsm -SessionId s1 -Visible
 
 # Tail events.jsonl — each new line is a push notification
 Monitor: tools/sessions/s1/events.jsonl
@@ -21,6 +25,16 @@ Write/Edit append: tools/sessions/s1/commands.jsonl
 # End the session
    {"id":"cN","cmd":"close"}
 ```
+
+## start-session.ps1 parameters
+
+| Param | Default | Purpose |
+|-------|---------|---------|
+| `-Workbook` | (required) | Path to .xlsm/.xlsx/.xlam to open |
+| `-SessionId` | (required) | Folder name under `sessions/` |
+| `-SessionsRoot` | `tools/sessions/` | Override the sessions folder location |
+| `-Visible` | off (headless) | Show Excel on the desktop. Trade-off: agent operations may steal foreground focus, but `screenshot target=worksheet:<name>` becomes meaningful (headless Excel main window doesn't render content) |
+| `-PollMs` | 250 | Commands.jsonl polling cadence (ms) |
 
 ## Session layout
 
@@ -166,6 +180,20 @@ Every command produces a `command_ack` first.
 - **Always** send `close` before killing the session process (otherwise the .xlsm may go into "recover this file?" state).
 - Event ordering: `command_ack` always precedes any other event for the same `id`.
 - Session is single-threaded; commands process in append order.
+
+### Running alongside the user's interactive Excel
+
+The session host spawns its **own** `EXCEL.EXE` process (separate PID
+from any Excel the user has open). The two are mostly isolated:
+
+- ✅ Separate VBA runtime, memory, command bars
+- ⚠️  **File locks** — if both processes open the same `.xlsm` read-write, the OS denies the second. Don't open the same workbook in both
+- ⚠️  **Add-ins** auto-load in BOTH processes from `%APPDATA%\Microsoft\AddIns\` — usually harmless
+- ⚠️  **MsgBox / runtime-error dialogs** from the headless session POP ON THE USER'S DESKTOP — Win32 dispatches them to the foreground session. The dialog watcher auto-dismisses these via WM_COMMAND but a fast user click can race the watcher
+- ⚠️  **Foreground focus** — if `-Visible` is set, agent operations may steal focus from windows the user is working in
+
+If concurrent use is essential, prefer `-Visible` so the user can SEE
+what the agent is doing instead of being surprised by stray dialogs.
 
 ### Known limitations (deferred)
 

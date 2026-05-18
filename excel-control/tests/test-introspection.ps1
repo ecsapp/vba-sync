@@ -12,8 +12,9 @@ $sessions  = Join-Path $repo 'excel-control\sessions'
 $sessionDir = Join-Path $sessions $SessionId
 if (Test-Path $sessionDir) { Remove-Item -Recurse -Force $sessionDir }
 
-Get-Process EXCEL -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 300
+. (Join-Path $PSScriptRoot '_helpers.ps1')
+Clear-OrphanSessionExcels $sessions
+Start-Sleep -Milliseconds 200
 
 Write-Host "Test: introspection (SessionId=$SessionId)" -ForegroundColor Cyan
 
@@ -71,6 +72,5 @@ try {
     if (Test-Path $eventsFile) { Get-Content -LiteralPath $eventsFile | ForEach-Object { Write-Host "  $_" } }
     exit 1
 } finally {
-    if ($proc -and -not $proc.HasExited) { try { $proc.Kill() } catch {} }
-    Get-Process EXCEL -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Stop-SessionProcesses -HostProc $proc -SessionDir $sessionDir
 }

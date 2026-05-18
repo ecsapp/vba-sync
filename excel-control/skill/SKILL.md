@@ -18,13 +18,28 @@ how to do common things.
 ## Quickstart
 
 ```
+# headless (default — Excel runs invisibly)
 Bash run_in_background=true: pwsh tools/start-session.ps1 -Workbook X.xlsm -SessionId s1
+
+# visible (Excel on the desktop — user sees what the agent does;
+# screenshots of worksheets become meaningful instead of mostly empty)
+Bash run_in_background=true: pwsh tools/start-session.ps1 -Workbook X.xlsm -SessionId s1 -Visible
+
 Monitor: tools/sessions/s1/events.jsonl     ← push notifications, one per new line
 Write/Edit append: tools/sessions/s1/commands.jsonl
 
 # end the session:
    {"id":"cN","cmd":"close"}
 ```
+
+**Concurrent Excel use**: the session creates a separate `EXCEL.EXE`
+process. It's safe to run alongside the user's interactive Excel
+PROVIDED:
+- Don't open the same workbook in both (file-lock conflict)
+- Be aware that MsgBoxes / runtime-error dialogs from the harness POP
+  ON THE USER'S DESKTOP (the watcher auto-dismisses them fast, but a
+  user click can race the watcher)
+- With `-Visible`, agent operations may steal foreground focus
 
 Every command needs an `id` (any unique string per session — typically `c1`,
 `c2`, …) and a `cmd`. You get one `command_ack` event per command, then the
