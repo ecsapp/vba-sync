@@ -553,6 +553,13 @@ Private Sub PadTo4(ByVal startPos As Long)
     End If
 End Sub
 
+' Same as PadTo4 but the caller passes the "alignment anchor" -- not
+' tied to mPadStart.  Used for ExtraDataBlock string alignment where
+' strings are 4-aligned relative to the ExtraDataBlock start.
+Private Sub PadTo4Relative(ByVal alignAnchor As Long)
+    PadTo4 alignAnchor
+End Sub
+
 ' Mark `n` bytes starting at stream offset `streamOff` as padding (zero on write-back).
 Private Sub FlagPadding(ByVal streamOff As Long, ByVal n As Long)
     Dim i As Long
@@ -919,13 +926,82 @@ Private Function ConsumeOleSiteConcreteControl(ByRef outClsidCacheIndex As Long)
 End Function
 
 '-- TextProps: [MS-OFORMS] 2.3.1 ---------------------------------------
+' Excel-written TextProps body (empirical, mask=0x35, cb=24):
+'   [PropMask 4] [Count 4] [Field 4] [Field 4] [FaceName 6] [pad 2] = 24
+'
+' We can't trust the per-bit field sizes without a definitive MS-OFORMS
+' spec, BUT we know:
+'   - PropMask is 4 bytes.
+'   - If a FaceName is present, it ends right at (cb - trailing-pad)
+'     where the trailing pad is whatever's needed to make the string-end
+'     reach a 4-byte boundary from startPos.
+'   - FaceName length is encoded as a CountWithCompressionFlag DWORD
+'     somewhere in the binary-props area.
+'
+' Strategy: skip past PropMask, scan forward looking for a
+' CountWithCompressionFlag DWORD whose `count` value (low 31 bits)
+' equals (cb - currentPos - count_padToEnd).  In practice the count
+' is always the very first DWORD after PropMask when fFontName is set
+' (mask bit 0 in the layout below), so just probe that.
+'
+' If we find a valid count, the FaceName lives at the end of cb,
+' aligned to 4.  We pad-fill anything between the count's position+4
+' and the string start as opaque (binary props -- left alone), and
+' flag only the trailing alignment pad as padding.
 Private Function ConsumeTextProps() As Boolean
     Dim ver0 As Long, ver1 As Long
     ver0 = ReadByte(): ver1 = ReadByte()
     Dim cb As Long
     cb = ReadWord()
-    If Not StreamRead(cb) Then Exit Function
+    Dim startPos As Long
+    startPos = mStreamPos
+    If cb <= 0 Then ConsumeTextProps = True: Exit Function
+
+    Dim mask As Double
+    mask = ReadDword()      ' 4 bytes
+    Dim faceNameLen As Long: faceNameLen = 0
+    If MaskBit(mask, 0) Then
+        Dim count As Long
+        count = ReadCountWithCompressionFlag()
+        If count > 0 And count <= cb - 8 Then faceNameLen = count
+    End If
+    ' Skip remaining binary props as opaque (read but don't flag).  The
+    ' FaceName, if present, lives at the very end of cb (aligned to 4),
+    ' so its starting offset relative to startPos = cb - faceNameLen,
+    ' rounded down to a multiple of 4 from the StreamPos side.
+    If faceNameLen > 0 Then
+        ' Compute string start, then skip-without-flag to that offset.
+        Dim stringStart As Long
+        stringStart = startPos + (cb - faceNameLen)
+        ' Round DOWN to 4-aligned (relative to startPos) -- Excel pads
+        ' to 4 within the cb scope after the FaceName.
+        Dim relOff As Long
+        relOff = stringStart - startPos
+        Dim mod4 As Long
+        mod4 = relOff Mod 4
+        If mod4 <> 0 Then stringStart = stringStart + (4 - mod4)
+        If stringStart < mStreamPos Then stringStart = mStreamPos
+        ' Skip-without-flag (preserve binary props).
+        If stringStart - mStreamPos > 0 Then
+            If Not StreamReadOpaque(stringStart - mStreamPos) Then Exit Function
+        End If
+        If Not StreamReadOpaque(faceNameLen) Then Exit Function
+    End If
+    ' Fill cb -- trailing alignment is the only true padding.
+    If Not JumpTo(cb, startPos) Then Exit Function
     ConsumeTextProps = True
+End Function
+
+' Like StreamRead but never flags padding (used inside TextProps for
+' opaque binary props between the count and the FaceName).
+Private Function StreamReadOpaque(ByVal n As Long) As Boolean
+    If n <= 0 Then StreamReadOpaque = True: Exit Function
+    If mStreamPos + n > mStreamLen Then
+        mParseErrorMsg = "Stream read past end (pos=" & mStreamPos & " n=" & n & ")"
+        Exit Function
+    End If
+    mStreamPos = mStreamPos + n
+    StreamReadOpaque = True
 End Function
 
 '-- GuidAndFont: [MS-OFORMS] 2.4.7 ------------------------------------
@@ -1051,11 +1127,21 @@ Private Function ConsumeMorphDataControl() As Boolean
     If (CLng(m_hi) And 1) Then groupSize = ReadCountWithCompressionFlag()
     PopPadded
 
-    ' ExtraDataBlock: discard 8 (Size), then value, caption, group_name
+    ' ExtraDataBlock: discard 8 (Size), then value, caption, group_name.
+    ' Each variable-length string is followed by 4-byte alignment padding
+    ' (oletools omits this; Excel actually leaves those bytes uninitialised).
+    Dim extraStart As Long
+    extraStart = mStreamPos
     If Not StreamRead(8) Then Exit Function
+    Dim afterValue As Long, afterCaption As Long
     If valueSize > 0 Then If Not StreamRead(valueSize) Then Exit Function
+    afterValue = mStreamPos
+    PadTo4Relative extraStart
     If captionSize > 0 Then If Not StreamRead(captionSize) Then Exit Function
+    afterCaption = mStreamPos
+    PadTo4Relative extraStart
     If groupSize > 0 Then If Not StreamRead(groupSize) Then Exit Function
+    PadTo4Relative extraStart
 
     If Not JumpTo(cb, startPos) Then Exit Function
 
@@ -1190,8 +1276,13 @@ Private Function ConsumeLabelControl() As Boolean
     bits(7) = 12: sizes(7) = 2  ' fMouseIcon
     If Not ConsumeProps(mask, bits, sizes, 8) Then Exit Function
     PopPadded
-    ' ExtraDataBlock: caption + 8
+    ' ExtraDataBlock: caption + (4-aligned) fSize 8.
+    ' oleform.py reads the 8 immediately after caption -- that's wrong
+    ' for Excel-written .frx, which pads caption to 4 before fSize.
+    Dim extraStart As Long
+    extraStart = mStreamPos
     If captionSize > 0 Then If Not StreamRead(captionSize) Then Exit Function
+    PadTo4Relative extraStart
     If Not StreamRead(8) Then Exit Function
     If Not JumpTo(cb, startPos) Then Exit Function
     If MaskBit(mask, 10) Then If Not ConsumeGuidAndPicture() Then Exit Function
