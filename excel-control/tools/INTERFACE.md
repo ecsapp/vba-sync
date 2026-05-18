@@ -149,6 +149,51 @@ Win32 buttons — so `buttons` may be empty. In that case the watcher
 sends VK_RETURN, which fires the form's Default button click handler.
 Per-control introspection lands in Phase 8.
 
+## `compile_check`
+
+Force a VBA Project compile.
+
+```json
+{"id":"c1","cmd":"compile_check"}
+```
+
+Events:
+
+```json
+{"t":"compile_result","id":"c1","ok":true}
+```
+
+On failure: `ok:false` + `module`, `line`, `column`, `source_context` (5 lines centered on the offending line).
+
+## `sync_vba`
+
+Strip user VBComponents and re-import .bas/.cls/.frm from a source folder
+following the vba-sync convention (`Modules/`, `ClassModules/`, `Forms/`).
+Pure PowerShell — no `VBA Sync.xlam` runtime dependency.
+
+```json
+{"id":"c2","cmd":"sync_vba","source_dir":"./MyWorkbook"}
+```
+
+Event:
+
+```json
+{"t":"sync_completed","id":"c2","imported":["modSales","clsCustomer"],"removed":["modOld"]}
+```
+
+VBA-password unlock is not yet implemented (deferred).
+
+## `read_range` / `write_range`
+
+```json
+{"id":"c3","cmd":"read_range","sheet":"Inputs","range":"A1:C10","include_formulas":false}
+{"id":"c4","cmd":"write_range","sheet":"Inputs","range":"A1","values":[["Name","Age"],["Alice",30]]}
+```
+
+Events: `range_read` with `rows` (2D array), `range_written` with
+`rows` + `cols`. Single-cell anchor is auto-resized to the input
+dimensions. Writes are per-cell (slower than batch but reliable).
+
 More commands and events land in subsequent phases.
 
 ## Gotchas

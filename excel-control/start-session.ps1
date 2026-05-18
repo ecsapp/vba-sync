@@ -218,6 +218,185 @@ function Handle-Command($Xl, $Wb, $cmd) {
                 Write-EventLine @{ t = 'screenshot_failed'; id = $cmd.id; target = $cmd.target; error = $_.Exception.Message }
             }
         }
+        'compile_check' {
+            try {
+                # CommandBar control id 578 = "Compile VBAProject"
+                $btn = $Xl.VBE.CommandBars.FindControl([Type]::Missing, 578)
+                if (-not $btn) { throw "Could not find Compile VBAProject control (id 578)" }
+                $btn.Execute()
+                Start-Sleep -Milliseconds 600
+                # If compile failed, VBE.ActiveCodePane is positioned on the error line.
+                $pane = $null
+                try { $pane = $Xl.VBE.ActiveCodePane } catch {}
+                if (-not $pane) {
+                    Write-EventLine @{ t = 'compile_result'; id = $cmd.id; ok = $true }
+                } else {
+                    $module = $pane.CodeModule.Name
+                    $sLine = 0; $sCol = 0; $eLine = 0; $eCol = 0
+                    [void]$pane.GetSelection([ref]$sLine, [ref]$sCol, [ref]$eLine, [ref]$eCol)
+                    $start = [Math]::Max(1, $sLine - 2)
+                    $end   = [Math]::Min($pane.CodeModule.CountOfLines, $sLine + 2)
+                    $ctx = @()
+                    for ($i = $start; $i -le $end; $i++) {
+                        $ctx += ('{0}: {1}' -f $i, $pane.CodeModule.Lines($i, 1))
+                    }
+                    Write-EventLine @{
+                        t = 'compile_result'
+                        id = $cmd.id
+                        ok = $false
+                        module = $module
+                        line = $sLine
+                        column = $sCol
+                        source_context = $ctx
+                    }
+                }
+            } catch {
+                Write-EventLine @{ t = 'compile_failed'; id = $cmd.id; error = $_.Exception.Message }
+            }
+        }
+        'sync_vba' {
+            try {
+                $sourceDir = $cmd.source_dir
+                if (-not $sourceDir) { throw "sync_vba requires source_dir" }
+                $resolvedSrc = (Resolve-Path -LiteralPath $sourceDir).Path
+
+                # Optional unlock — defer the import here, no .xlam dependency.
+                if ($cmd.vba_password) {
+                    throw "VBA password unlock is not yet implemented in sync_vba (deferred to a later phase). Unlock manually for now."
+                }
+
+                $imported = @()
+                $removed  = @()
+
+                # Strip user components (anything not Document, type != 100)
+                $proj = $Wb.VBProject
+                $toRemove = @()
+                foreach ($c in $proj.VBComponents) {
+                    if ($c.Type -ne 100) { $toRemove += $c.Name }
+                }
+                foreach ($name in $toRemove) {
+                    $proj.VBComponents.Remove($proj.VBComponents.Item($name)) | Out-Null
+                    $removed += $name
+                }
+                # Re-import .bas/.cls/.frm from source layout
+                foreach ($sub in @('Modules','ClassModules','Forms','Objects')) {
+                    $d = Join-Path $resolvedSrc $sub
+                    if (-not (Test-Path $d)) { continue }
+                    Get-ChildItem -LiteralPath $d -File | ForEach-Object {
+                        if ($_.Extension -in '.bas','.cls','.frm') {
+                            $imp = $proj.VBComponents.Import($_.FullName)
+                            $imported += $imp.Name
+                        }
+                    }
+                }
+                Write-EventLine @{
+                    t = 'sync_completed'
+                    id = $cmd.id
+                    imported = $imported
+                    removed  = $removed
+                }
+            } catch {
+                Write-EventLine @{ t = 'sync_failed'; id = $cmd.id; error = $_.Exception.Message }
+            }
+        }
+        'read_range' {
+            try {
+                $sheetName = $cmd.sheet
+                $addr      = $cmd.range
+                $sheet = if ($sheetName) { $Wb.Sheets.Item($sheetName) } else { $Wb.ActiveSheet }
+                $rng = $sheet.Range($addr)
+                $useFormulas = [bool]$cmd.include_formulas
+                $values = if ($useFormulas) { $rng.Formula } else { $rng.Value() }
+                # Range.Value returns scalar for single cell, 2D array otherwise.
+                # Build a jagged object[][] for JSON-friendly nesting.
+                # Use Rank/GetUpperBound rather than `-is [object[,]]` — under
+                # PowerShell COM marshalling the runtime type isn't always
+                # [object[,]] even when the value is a 2D array.
+                $rows = $null
+                $rank = 0
+                try { $rank = $values.Rank } catch { $rank = 0 }
+                if ($rank -eq 2) {
+                    $r1 = $values.GetLowerBound(0); $r2 = $values.GetUpperBound(0)
+                    $c1 = $values.GetLowerBound(1); $c2 = $values.GetUpperBound(1)
+                    $h = $r2 - $r1 + 1
+                    $w = $c2 - $c1 + 1
+                    $rows = New-Object 'object[][]' $h
+                    for ($i = 0; $i -lt $h; $i++) {
+                        $rows[$i] = New-Object 'object[]' $w
+                        for ($j = 0; $j -lt $w; $j++) {
+                            $rows[$i][$j] = $values[$r1 + $i, $c1 + $j]
+                        }
+                    }
+                } else {
+                    $rows = New-Object 'object[][]' 1
+                    $rows[0] = ,$values
+                }
+                Write-EventLine @{
+                    t = 'range_read'
+                    id = $cmd.id
+                    sheet = $sheet.Name
+                    range = $rng.Address($false, $false)
+                    rows = $rows
+                }
+            } catch {
+                Write-EventLine @{ t = 'range_read_failed'; id = $cmd.id; error = $_.Exception.Message }
+            }
+        }
+        'write_range' {
+            try {
+                $sheetName = $cmd.sheet
+                $addr      = $cmd.range
+                $sheet = if ($sheetName) { $Wb.Sheets.Item($sheetName) } else { $Wb.ActiveSheet }
+                $rng = $sheet.Range($addr)
+                $rowsIn = @($cmd.values)
+                $h = $rowsIn.Count
+                $w = if ($h -gt 0) { @($rowsIn[0]).Count } else { 0 }
+                if ($h -eq 0 -or $w -eq 0) { throw "write_range: values must be non-empty 2D array" }
+
+                # Resize range if a single anchor cell was passed
+                if ($rng.Rows.Count -eq 1 -and $rng.Columns.Count -eq 1) {
+                    $rng = $rng.Resize($h, $w)
+                }
+
+                # Per-cell write via the sheet's absolute Cells(row, col)
+                # property. Cell-by-cell is slower than batch Value2 but
+                # reliable in PowerShell — batch COM marshalling of an
+                # object[,] sometimes flattens into a 1D string array.
+                # Build the absolute address per cell. Cells.Item(row, col)
+                # ran into PowerShell COM overload-resolution issues
+                # ("cannot cast Double to String"); going through
+                # Range("A1") is unambiguous.
+                $startRow = [int]$rng.Row
+                $startCol = [int]$rng.Column
+                for ($i = 0; $i -lt $h; $i++) {
+                    $rowArr = @($rowsIn[$i])
+                    for ($j = 0; $j -lt $w; $j++) {
+                        $val = $rowArr[$j]
+                        if ($val -is [int64] -or $val -is [decimal]) { $val = [double]$val }
+                        $colLetter = ''
+                        $cn = $startCol + $j
+                        while ($cn -gt 0) {
+                            $rem = (($cn - 1) % 26)
+                            $colLetter = [char]([byte][char]'A' + $rem) + $colLetter
+                            $cn = [int](($cn - $rem - 1) / 26)
+                        }
+                        $cellAddr = "$colLetter$($startRow + $i)"
+                        $sheet.Range($cellAddr).Value2 = $val
+                    }
+                }
+
+                Write-EventLine @{
+                    t = 'range_written'
+                    id = $cmd.id
+                    sheet = $sheet.Name
+                    range = $rng.Address($false, $false)
+                    rows = $h
+                    cols = $w
+                }
+            } catch {
+                Write-EventLine @{ t = 'range_write_failed'; id = $cmd.id; error = $_.Exception.Message; trace = $_.ScriptStackTrace }
+            }
+        }
         'close' {
             Write-EventLine @{ t = 'closing'; id = $cmd.id }
             $script:Stop = $true
