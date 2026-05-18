@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pwsh tools/start-session.ps1 *)",
+      "Bash(pwsh tools/start-session.ps1*)",
+      "Read(tools/sessions/**)",
+      "Write(tools/sessions/**)",
+      "Edit(tools/sessions/**)",
+      "Monitor(tools/sessions/**)"
+    ]
+  }
+}

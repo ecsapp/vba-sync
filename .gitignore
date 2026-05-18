@@ -24,3 +24,6 @@ Thumbs.db
 .vs/
 .idea/
 .scratch/
+
+# excel-control runtime session data (per-session JSONL + screenshots)
+excel-control/sessions/

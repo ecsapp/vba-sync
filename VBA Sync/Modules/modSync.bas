@@ -147,6 +147,7 @@ NextComponent:
     WriteGitIgnore repoPath
     WriteReadme repoPath, wb
     WriteVSCodeSettings repoPath
+    WriteHarness repoPath
     
     Debug.Print "VBA Sync: Export completed successfully!"
     MsgBox "VBA Sync export completed successfully!" & vbCrLf & "Files exported to: " & rootPath, vbInformation, "VBA Sync"
@@ -209,6 +210,7 @@ NextComponent:
     WriteGitIgnore repoPath
     WriteReadme repoPath, wb
     WriteVSCodeSettings repoPath
+    WriteHarness repoPath
 
     ' Check for per-sheet failures captured by modExcelExport. If any are
     ' present, the success MsgBox is replaced with a warning summary so the
@@ -712,6 +714,12 @@ Private Sub WriteReadme(basePath As String, wb As Workbook)
           "|   |       tables/<TableName>/{definition.json, data.tsv}" & vbCrLf & _
           "|   |       drawings/{shapes.json, _assets/}" & vbCrLf & _
           "|   `-- STRUCTURE_SUMMARY.md  # Human-readable data model overview" & vbCrLf & _
+          "|-- tools/                # excel-control: PowerShell agent harness" & vbCrLf & _
+          "|   |-- start-session.ps1     # Spawn a long-running Excel session" & vbCrLf & _
+          "|   |-- INTERFACE.md          # Full command + event reference for agents" & vbCrLf & _
+          "|   `-- clsAssert.cls         # Optional assertion lib for run_tests" & vbCrLf & _
+          "|-- .claude/" & vbCrLf & _
+          "|   `-- skills/excel-control/SKILL.md  # Claude Code auto-discovery" & vbCrLf & _
           "|-- .gitattributes        # Git configuration for VBA files" & vbCrLf & _
           "|-- .gitignore            # Excludes temp files from version control" & vbCrLf & _
           "`-- README.md             # This file" & vbCrLf
@@ -723,6 +731,13 @@ Private Sub WriteReadme(basePath As String, wb As Workbook)
           "- **Git**: Use branches (`git checkout -b feature-name`) for development" & vbCrLf
     
     txt = txt & vbCrLf & _
+          "## AGENT HARNESS (tools/)" & vbCrLf & _
+          "An AI agent (Claude Code, MCP client, bash script) can drive this" & vbCrLf & _
+          "workbook end-to-end via the bundled PowerShell session harness:" & vbCrLf & _
+          "run macros, read/write cells, respond to dialogs, capture runtime" & vbCrLf & _
+          "errors, run a discovered Test_* suite. See ``tools/INTERFACE.md`` for" & vbCrLf & _
+          "the full reference, and ``.claude/skills/excel-control/SKILL.md`` for" & vbCrLf & _
+          "agent-facing usage patterns (Claude Code auto-discovers it)." & vbCrLf & vbCrLf & _
           "## NOTES" & vbCrLf & _
           "- Edit code files directly, then import back to Excel" & vbCrLf & _
           "- Form design must be done in Excel (only code imports)" & vbCrLf & _
@@ -781,6 +796,75 @@ Private Sub WriteVSCodeSettings(basePath As String)
     Set ts = fso.CreateTextFile(sPath, True)
     ts.Write txt
     ts.Close
+End Sub
+
+' Copies the excel-control PowerShell harness into <repo>/tools/ so an
+' AI agent can drive the workbook via a session protocol. Source files
+' are expected at <xlam_dir>/excel-control/ — present when vba-sync is
+' run from the dev tree or shipped as a release zip with the harness
+' alongside. If the source folder isn't there, this routine silently
+' skips (the rest of the export is unaffected).
+'
+' Files copied:
+'   tools/start-session.ps1
+'   tools/session-dialog-watcher.ps1
+'   tools/capture.ps1
+'   tools/INTERFACE.md                   (overwritten — always fresh)
+'   tools/clsAssert.cls
+'   tools/.claude/settings.json
+Private Sub WriteHarness(basePath As String)
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    Dim xlamDir As String: xlamDir = ThisWorkbook.Path
+    If Right$(xlamDir, 1) <> "\" Then xlamDir = xlamDir & "\"
+    Dim srcRoot As String: srcRoot = xlamDir & "excel-control\"
+    If Not fso.FolderExists(srcRoot) Then
+        Debug.Print "VBA Sync: excel-control harness not bundled (skipping tools/)"
+        Exit Sub
+    End If
+
+    Dim toolsDir As String: toolsDir = basePath & "tools\"
+    EnsureFolder toolsDir
+    Debug.Print "VBA Sync: Bundling excel-control harness into tools/"
+
+    ' Top-level scripts
+    Dim psList As Variant: psList = Array("start-session.ps1", "session-dialog-watcher.ps1", "capture.ps1")
+    Dim i As Long
+    For i = LBound(psList) To UBound(psList)
+        Dim src As String: src = srcRoot & psList(i)
+        Dim dst As String: dst = toolsDir & psList(i)
+        If fso.FileExists(src) Then fso.CopyFile src, dst, True
+    Next
+
+    ' Files under excel-control/tools/
+    Dim toolsSrc As String: toolsSrc = srcRoot & "tools\"
+    If fso.FolderExists(toolsSrc) Then
+        Dim toolFiles As Variant: toolFiles = Array("INTERFACE.md", "clsAssert.cls")
+        For i = LBound(toolFiles) To UBound(toolFiles)
+            Dim s2 As String: s2 = toolsSrc & toolFiles(i)
+            Dim d2 As String: d2 = toolsDir & toolFiles(i)
+            If fso.FileExists(s2) Then fso.CopyFile s2, d2, True
+        Next
+        ' .claude/settings.json under tools/ (scoped permissions for
+        ' the session files agents will be poking at)
+        Dim claudeSrc As String: claudeSrc = toolsSrc & ".claude\settings.json"
+        If fso.FileExists(claudeSrc) Then
+            Dim claudeDir As String: claudeDir = toolsDir & ".claude\"
+            EnsureFolder claudeDir
+            fso.CopyFile claudeSrc, claudeDir & "settings.json", True
+        End If
+    End If
+
+    ' Claude Code skill at <repo>/.claude/skills/excel-control/SKILL.md so
+    ' the agent auto-discovers the harness when opening this workbook
+    ' repo. Source lives at excel-control/skill/SKILL.md.
+    Dim skillSrc As String: skillSrc = srcRoot & "skill\SKILL.md"
+    If fso.FileExists(skillSrc) Then
+        Dim skillDstDir As String: skillDstDir = basePath & ".claude\skills\excel-control\"
+        EnsureFolder basePath & ".claude\"
+        EnsureFolder basePath & ".claude\skills\"
+        EnsureFolder skillDstDir
+        fso.CopyFile skillSrc, skillDstDir & "SKILL.md", True
+    End If
 End Sub
 
 ' Map a Windows ANSI codepage number to the VS Code encoding name.
