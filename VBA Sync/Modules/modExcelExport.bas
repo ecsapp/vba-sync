@@ -559,46 +559,57 @@ Private Sub WalkUsedRange(ur As Range, ByRef cellValues As Object, _
     Dim absCol As Long, absRow As Long
     Dim v As Variant, f As Variant
     Dim k As String
+    Dim rowPart As String
+    Dim vType As Integer
+    Dim hasValue As Boolean
+    Dim hasFormula As Boolean
 
     For i = 1 To nRows
         absRow = baseRow + i - 1
+        rowPart = "," & CStr(absRow)
         For j = 1 To nCols
-            absCol = baseCol + j - 1
             v = values(i, j)
             f = formulas(i, j)
 
-            ' Skip wholly empty cells
-            Dim hasValue As Boolean: hasValue = False
-            Dim hasFormula As Boolean: hasFormula = False
-            If Not IsEmpty(v) And Not IsNull(v) Then
-                If VarType(v) <> vbString Then
+            ' Empty cells dominate the COM-read rectangle on most sheets; one
+            ' fused IsEmpty pair skips the rest of the body cheaply.
+            If IsEmpty(v) And IsEmpty(f) Then GoTo NextCellWUR
+
+            hasValue = False
+            vType = VarType(v)
+            Select Case vType
+                Case vbEmpty, vbNull
+                Case vbString
+                    If Len(v) > 0 Then hasValue = True
+                Case Else
                     hasValue = True
-                ElseIf CStr(v) <> "" Then
-                    hasValue = True
-                End If
-            End If
-            If Not IsEmpty(f) And Not IsNull(f) Then
-                If VarType(f) = vbString Then
-                    If Len(CStr(f)) > 0 Then
-                        If Left$(CStr(f), 1) = "=" Then
-                            hasFormula = True
-                        End If
-                    End If
+            End Select
+
+            hasFormula = False
+            If VarType(f) = vbString Then
+                If Len(f) > 0 Then
+                    If Left$(f, 1) = "=" Then hasFormula = True
                 End If
             End If
 
             If hasValue Or hasFormula Then
-                k = CStr(absCol) & "," & CStr(absRow)
+                absCol = baseCol + j - 1
+                k = CStr(absCol) & rowPart
                 If hasValue Then
-                    cellValues(k) = FormatCellValue(v)
+                    ' Strings (the common case in big data tables) bypass the
+                    ' Sub-call entirely — same result as FormatCellValue's
+                    ' Case Else branch.
+                    If vType = vbString Then
+                        cellValues(k) = CStr(v)
+                    Else
+                        cellValues(k) = FormatCellValue(v)
+                    End If
                 End If
                 If hasFormula Then
                     cellFormulas(k) = CStr(f)
                 End If
-
-                ' cellStyles is populated via OOXML cellXfs lookup (TODO);
-                ' per-cell COM probing is intentionally not done here.
             End If
+NextCellWUR:
         Next
     Next
 End Sub
