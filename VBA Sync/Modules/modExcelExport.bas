@@ -440,47 +440,31 @@ Private Function ProcessWorksheet(ws As Worksheet, sheetId As Long, padWidth As 
         WalkUsedRange ur, cellValues, cellFormulas, cellStyles
     End If
 
-    ' --- Carve out table cells (so they don't appear in sheet data.tsv) ---
-    g_sheetPhase = "tables-carve"
-    Dim tableMarkers As Object: Set tableMarkers = CreateObject("Scripting.Dictionary")
+    ' --- Write per-table files directly from sheet-wide dicts ---
+    ' Sheet writers below filter out in-table cells via InAnyTable; no carve,
+    ' no per-table copy. Markers at each table's anchor cell are injected into
+    ' cellValues after the table writers run so the sheet's data.tsv still
+    ' shows where every table lives.
+    g_sheetPhase = "tables-write"
     Dim ti As Variant
     For Each ti In tableRanges
         Dim t As Object: Set t = ti
-        Dim r As Long, c As Long
-        Dim tableValues As Object: Set tableValues = CreateObject("Scripting.Dictionary")
-        Dim tableFormulas As Object: Set tableFormulas = CreateObject("Scripting.Dictionary")
-        For r = t("startRow") To t("endRow")
-            For c = t("startCol") To t("endCol")
-                Dim k As String: k = CStr(c) & "," & CStr(r)
-                If cellValues.Exists(k) Then
-                    tableValues(k) = cellValues(k)
-                    cellValues.Remove k
-                End If
-                If cellFormulas.Exists(k) Then
-                    tableFormulas(k) = cellFormulas(k)
-                    cellFormulas.Remove k
-                End If
-            Next
-        Next
-        Dim markerKey As String: markerKey = CStr(t("startCol")) & "," & CStr(t("startRow"))
-        tableMarkers(markerKey) = "[table:" & t("name") & " ref=" & t("ref") & " -> tables/" & t("safeName") & "/]"
-
         EnsureFolder t("folder")
-        SaveTableDataTsv t("folder") & "data.tsv", tableValues, t, exported
-        SaveTableDefinitionJson t("folder") & "definition.json", t, tableFormulas, tableValues, tableCalcFormulas, exported
+        SaveTableDataTsv t("folder") & "data.tsv", cellValues, t, exported
+        SaveTableDefinitionJson t("folder") & "definition.json", t, cellFormulas, cellValues, tableCalcFormulas, exported
     Next
 
-    ' Merge marker rows back into sheet's values
-    Dim mk As Variant
-    For Each mk In tableMarkers.Keys
-        cellValues(mk) = tableMarkers(mk)
+    For Each ti In tableRanges
+        Dim tm As Object: Set tm = ti
+        Dim markerKey As String: markerKey = CStr(tm("startCol")) & "," & CStr(tm("startRow"))
+        cellValues(markerKey) = "[table:" & tm("name") & " ref=" & tm("ref") & " -> tables/" & tm("safeName") & "/]"
     Next
 
     ' --- Write sheet-level files ---
     Dim tW As Double
     g_sheetPhase = "save-meta": tW = Timer:        SaveMetaJson sheetFolder & "_meta.json", ws, sheetId, tableRanges, exported, ooxmlSheetView: TimingsAdd "ws:save-meta", tW
-    g_sheetPhase = "save-data-tsv": tW = Timer:    SaveDataTsv sheetFolder & "data.tsv", cellValues, exported: TimingsAdd "ws:save-data-tsv", tW
-    g_sheetPhase = "save-formulas": tW = Timer:    SaveFormulasJson sheetFolder & "formulas.json", cellFormulas, exported: TimingsAdd "ws:save-formulas", tW
+    g_sheetPhase = "save-data-tsv": tW = Timer:    SaveDataTsv sheetFolder & "data.tsv", cellValues, tableRanges, exported: TimingsAdd "ws:save-data-tsv", tW
+    g_sheetPhase = "save-formulas": tW = Timer:    SaveFormulasJson sheetFolder & "formulas.json", cellFormulas, tableRanges, exported: TimingsAdd "ws:save-formulas", tW
     g_sheetPhase = "save-styles": tW = Timer:      SaveStylesJson sheetFolder & "styles.json", cellStyles, exported: TimingsAdd "ws:save-styles", tW
     g_sheetPhase = "save-validations": tW = Timer: SaveValidationsJson sheetFolder & "validations.json", ws, exported, ooxmlValidations: TimingsAdd "ws:save-validations", tW
     g_sheetPhase = "save-cf": tW = Timer:          SaveConditionalFormatsJson sheetFolder & "conditional_formats.json", ws, exported: TimingsAdd "ws:save-cf", tW
@@ -895,7 +879,20 @@ End Function
 
 '====================  FILE WRITERS  =========================
 
-Private Sub SaveDataTsv(path As String, cells As Object, exported As Object)
+' True if (c, r) is inside any table rectangle in tableRanges.
+Private Function InAnyTable(c As Long, r As Long, tableRanges As Object) As Boolean
+    Dim ti As Variant
+    For Each ti In tableRanges
+        Dim t As Object: Set t = ti
+        If c >= t("startCol") And c <= t("endCol") _
+       And r >= t("startRow") And r <= t("endRow") Then
+            InAnyTable = True
+            Exit Function
+        End If
+    Next
+End Function
+
+Private Sub SaveDataTsv(path As String, cells As Object, tableRanges As Object, exported As Object)
     Dim sb As Object: Set sb = NewStringBuilder()
 
     If cells.Count = 0 Then
@@ -903,6 +900,15 @@ Private Sub SaveDataTsv(path As String, cells As Object, exported As Object)
         WriteIfChanged path, sbToString(sb), exported, True
         Exit Sub
     End If
+
+    ' Anchor cells (top-left of each table) hold the [table:...] marker and must
+    ' pass through; all other in-table cells live in tables/<n>/data.tsv only.
+    Dim anchors As Object: Set anchors = CreateObject("Scripting.Dictionary")
+    Dim ai As Variant
+    For Each ai In tableRanges
+        Dim at As Object: Set at = ai
+        anchors(CStr(at("startCol")) & "," & CStr(at("startRow"))) = True
+    Next
 
     ' Determine extents
     Dim maxCol As Long: maxCol = 0
@@ -912,12 +918,14 @@ Private Sub SaveDataTsv(path As String, cells As Object, exported As Object)
         Dim parts() As String: parts = Split(CStr(k), ",")
         Dim c As Long: c = CLng(parts(0))
         Dim r As Long: r = CLng(parts(1))
+        If InAnyTable(c, r, tableRanges) And Not anchors.Exists(CStr(k)) Then GoTo NextCellSDT
         If c > maxCol Then maxCol = c
         If Not byRow.Exists(r) Then
             Dim rowDict As Object: Set rowDict = CreateObject("Scripting.Dictionary")
             Set byRow(r) = rowDict
         End If
         byRow(r)(c) = cells(CStr(k))
+NextCellSDT:
     Next
 
     ' Header: "Row\tA\tB\t..."
@@ -946,11 +954,28 @@ Private Sub SaveDataTsv(path As String, cells As Object, exported As Object)
     WriteIfChanged path, sbToString(sb), exported, True
 End Sub
 
-Private Sub SaveFormulasJson(path As String, cells As Object, exported As Object)
+Private Sub SaveFormulasJson(path As String, cells As Object, tableRanges As Object, exported As Object)
     If cells.Count = 0 Then Exit Sub
 
+    ' Strip out cells living inside any table rectangle — those formulas are
+    ' represented in tables/<n>/definition.json (column formula + overrides).
+    Dim filtered As Object: Set filtered = cells
+    If Not tableRanges Is Nothing Then
+        If tableRanges.Count > 0 Then
+            Set filtered = CreateObject("Scripting.Dictionary")
+            Dim fk As Variant
+            For Each fk In cells.Keys
+                Dim fparts() As String: fparts = Split(CStr(fk), ",")
+                If Not InAnyTable(CLng(fparts(0)), CLng(fparts(1)), tableRanges) Then
+                    filtered(CStr(fk)) = cells(CStr(fk))
+                End If
+            Next
+            If filtered.Count = 0 Then Exit Sub
+        End If
+    End If
+
     ' CompressCellsToRanges returns entries in row-major order; no sort needed.
-    Dim sortedMerged As Object: Set sortedMerged = CompressCellsToRanges(cells)
+    Dim sortedMerged As Object: Set sortedMerged = CompressCellsToRanges(filtered)
 
     ' Each entry is a 2-element Variant array (range:String, value:Variant).
     Dim ranges As Object: Set ranges = CreateObject("Scripting.Dictionary")
@@ -2365,62 +2390,40 @@ Private Sub CleanupTempDir(tempDir As String)
 End Sub
 
 '====================  TABLE WRITERS  ========================
+' Reads cells directly from the sheet-wide `cells` dict by iterating the
+' table's rectangle. No per-table copy — `cells` is the same dict the sheet
+' writers see.
 Private Sub SaveTableDataTsv(path As String, cells As Object, t As Object, exported As Object)
     Dim startCol As Long: startCol = t("startCol")
     Dim endCol As Long: endCol = t("endCol")
     Dim startRow As Long: startRow = t("startRow")
     Dim endRow As Long: endRow = t("endRow")
 
-    Dim byRow As Object: Set byRow = CreateObject("Scripting.Dictionary")
-    Dim k As Variant
-    For Each k In cells.Keys
-        Dim parts() As String: parts = Split(CStr(k), ",")
-        Dim c As Long: c = CLng(parts(0))
-        Dim r As Long: r = CLng(parts(1))
-        If Not byRow.Exists(r) Then
-            Dim rowDict As Object: Set rowDict = CreateObject("Scripting.Dictionary")
-            Set byRow(r) = rowDict
-        End If
-        byRow(r)(c) = cells(CStr(k))
-    Next
-
     Dim sb As Object: Set sb = NewStringBuilder()
-    Dim headers As Object: Set headers = New Collection
-    Dim c2 As Long
-    If byRow.Exists(startRow) Then
-        For c2 = startCol To endCol
-            Dim h As String
-            If byRow(startRow).Exists(c2) Then
-                h = CStr(byRow(startRow)(c2))
-            Else
-                h = ""
-            End If
-            If Len(h) = 0 Then h = ColLetters(c2)
-            headers.Add h
-        Next
-    Else
-        For c2 = startCol To endCol
-            headers.Add ColLetters(c2)
-        Next
-    End If
-
-    Dim hi As Long, hFirst As Boolean: hFirst = True
-    Dim hVal As Variant
-    For Each hVal In headers
+    Dim c2 As Long, hFirst As Boolean: hFirst = True
+    Dim k As String, hv As String
+    For c2 = startCol To endCol
         If hFirst Then hFirst = False Else sbAppend sb, vbTab
-        sbAppend sb, TsvEscape(CStr(hVal))
+        k = CStr(c2) & "," & CStr(startRow)
+        If cells.Exists(k) Then
+            hv = CStr(cells(k))
+        Else
+            hv = ""
+        End If
+        If Len(hv) = 0 Then hv = ColLetters(c2)
+        sbAppend sb, TsvEscape(hv)
     Next
     sbAppend sb, vbCrLf
 
     Dim r2 As Long
     For r2 = startRow + 1 To endRow
         Dim first As Boolean: first = True
+        Dim rPart As String: rPart = "," & CStr(r2)
         For c2 = startCol To endCol
             If Not first Then sbAppend sb, vbTab Else first = False
-            If byRow.Exists(r2) Then
-                If byRow(r2).Exists(c2) Then
-                    sbAppend sb, TsvEscape(CStr(byRow(r2)(c2)))
-                End If
+            k = CStr(c2) & rPart
+            If cells.Exists(k) Then
+                sbAppend sb, TsvEscape(CStr(cells(k)))
             End If
         Next
         sbAppend sb, vbCrLf
