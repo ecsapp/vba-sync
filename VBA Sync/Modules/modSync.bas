@@ -946,7 +946,13 @@ End Function
 
 Private Function CleanCode(src As String) As String
     Dim ln As Variant, out$, inBegin As Boolean, t As String
-    For Each ln In Split(src, vbCrLf)
+    ' Normalize line endings: files hand-edited in VS Code / other modern
+    ' editors default to LF, while Excel's own comp.Export writes CRLF.
+    ' Splitting on vbCrLf alone collapses an LF-only file into a single
+    ' "line" that starts with "VERSION 1.0 CLASS" and matches the wholesale
+    ' header skip — silently emptying the target CodeModule on import.
+    src = Replace(Replace(src, vbCrLf, vbLf), vbCr, vbLf)
+    For Each ln In Split(src, vbLf)
         t = Trim$(ln)
         Select Case True
             Case t Like "VERSION *", t Like "Attribute VB_*":
