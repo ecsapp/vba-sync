@@ -21,7 +21,9 @@ $ErrorActionPreference = 'Stop'
 
 $here     = $PSScriptRoot
 $testDir  = Join-Path $here 'test'
-$basPath  = Join-Path $here 'modFrxCanonicalize.bas'
+# .bas lives in the xlam source tree (it ships inside VBA Sync.xlam now).
+$basPath  = Resolve-Path (Join-Path $here '..\..\VBA Sync\Modules\modFrxCanonicalize.bas') |
+    Select-Object -ExpandProperty Path
 $sampleA  = Join-Path $testDir 'A\frmLogin.frx'
 $sampleB  = Join-Path $testDir 'B\frmLogin.frx'
 
