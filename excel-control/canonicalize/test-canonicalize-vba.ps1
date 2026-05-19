@@ -126,6 +126,14 @@ try {
             $errB = $xl.Run("$modName.CanonicalizeFrxLastError")
             Write-Host "    LastError: $errB" -ForegroundColor Red
         }
+
+        # Idempotence: a second run on canon(A) should zero ZERO bytes.
+        Write-Host "[4/5] Calling CanonicalizeFrx on A again (idempotence)..." -ForegroundColor Cyan
+        $zeroedA2 = $xl.Run("$modName.CanonicalizeFrx", $canonA)
+        Write-Host "    Returned: $zeroedA2 bytes zeroed (must be 0 for idempotence)"
+        if ($zeroedA2 -ne 0) {
+            Write-Host "    FAIL: canonicalize not idempotent" -ForegroundColor Red
+        }
     } catch {
         $importedErr = $_
     } finally {
@@ -163,6 +171,84 @@ Write-Host ("    canon(A) vs canon(B): {0} bytes vs {1} bytes, {2} diffs" -f $po
 if ($postCmp.Equal) {
     Write-Host ""
     Write-Host "PASS: canon(A) == canon(B)  (zeroed A=$zeroedA, B=$zeroedB)" -ForegroundColor Green
+
+    # Round-trip check: import canonicalized .frx into a new Excel workbook,
+    # re-export, canonicalize, and compare to the original canonicalized .frx.
+    Write-Host ""
+    Write-Host "[bonus] Round-trip test: canonicalize -> Excel import -> re-export -> canonicalize" -ForegroundColor Cyan
+    $roundtripDir = Join-Path $testDir 'RT'
+    if (Test-Path $roundtripDir) { Remove-Item -Recurse -Force $roundtripDir }
+    New-Item -ItemType Directory -Path $roundtripDir -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $testDir 'A\frmLogin.frm') -Destination (Join-Path $roundtripDir 'frmLogin.frm') -Force
+    Copy-Item -LiteralPath $canonA -Destination (Join-Path $roundtripDir 'frmLogin.frx') -Force
+
+    $rtXl = New-ExcelCom
+    $rtPid = Get-LastExcelPid
+    $rtFrxOut = Join-Path $roundtripDir 'frmLogin.reexport.frx'
+    $rtOk = $false
+    try {
+        $rtWb = $rtXl.Workbooks.Add()
+        try {
+            $rtComp = $rtWb.VBProject.VBComponents.Import((Join-Path $roundtripDir 'frmLogin.frm'))
+            $reFrmPath = Join-Path $roundtripDir 'reexport.frm'
+            $rtComp.Export($reFrmPath)
+            $rtFrxRaw = [System.IO.Path]::ChangeExtension($reFrmPath, '.frx')
+            Copy-Item -LiteralPath $rtFrxRaw -Destination $rtFrxOut -Force
+            $rtOk = $true
+        } finally {
+            $rtWb.Close($false)
+        }
+    } finally {
+        try { $rtXl.Quit() | Out-Null } catch {}
+        try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($rtXl) | Out-Null } catch {}
+        [System.GC]::Collect()
+        if ($rtPid) {
+            Start-Sleep -Milliseconds 300
+            try { Stop-Process -Id $rtPid -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    }
+
+    if (-not $rtOk) {
+        Write-Host "    Round-trip import/export failed" -ForegroundColor Yellow
+        exit 0
+    }
+
+    # Canonicalize the re-exported .frx and compare to the original canon(A).
+    $rt2Xl = New-ExcelCom
+    $rt2Pid = Get-LastExcelPid
+    try {
+        $rt2Wb = $rt2Xl.Workbooks.Add()
+        try {
+            $rt2Comp = $rt2Wb.VBProject.VBComponents.Import($basPath)
+            $null = $rt2Xl.Run("$($rt2Comp.Name).CanonicalizeFrx", $rtFrxOut)
+        } finally {
+            $rt2Wb.Close($false)
+        }
+    } finally {
+        try { $rt2Xl.Quit() | Out-Null } catch {}
+        try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($rt2Xl) | Out-Null } catch {}
+        [System.GC]::Collect()
+        if ($rt2Pid) {
+            Start-Sleep -Milliseconds 300
+            try { Stop-Process -Id $rt2Pid -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    }
+
+    $rtCmp = Compare-Bytes $canonA $rtFrxOut
+    if ($rtCmp.Equal) {
+        Write-Host "    PASS: round-trip canon == original canon" -ForegroundColor Green
+    } else {
+        Write-Host "    FAIL: round-trip canon differs ($($rtCmp.Diffs) bytes)" -ForegroundColor Red
+        $aBytes = [System.IO.File]::ReadAllBytes($canonA)
+        $bBytes = [System.IO.File]::ReadAllBytes($rtFrxOut)
+        $shown = 0
+        for ($i = 0; $i -lt [Math]::Min($aBytes.Length, $bBytes.Length) -and $shown -lt 20; $i++) {
+            if ($aBytes[$i] -ne $bBytes[$i]) {
+                Write-Host ("      diff @ 0x{0:X8} ({0,5}): canon=0x{1:X2} rt=0x{2:X2}" -f $i, $aBytes[$i], $bBytes[$i])
+                $shown++
+            }
+        }
+    }
     exit 0
 } else {
     Write-Host ""

@@ -337,6 +337,10 @@ End Function
 ' Walk the directory chain (starts at mFirstDirSec, follows FAT) and
 ' pull out start-sector + size for Root Entry, 'f', 'o'.  We don't care
 ' about CompObj.  Names are UTF-16LE in the first 64 bytes.
+'
+' We also FLAG each directory entry's CreationTime (8 bytes, +100) and
+' ModifiedTime (8 bytes, +108) as padding -- these timestamps differ
+' between Excel exports of the same form.
 Private Function WalkDirectory(ByRef fStartSec As Long, ByRef fSize As Long, ByRef foundF As Boolean, _
                                ByRef oStartSec As Long, ByRef oSize As Long, ByRef foundO As Boolean) As Boolean
     foundF = False: foundO = False
@@ -358,6 +362,12 @@ Private Function WalkDirectory(ByRef fStartSec As Long, ByRef fSize As Long, ByR
             Dim objType As Byte
             objType = mBytes(base + 66)
             If objType = 0 Then GoTo NextEntry  ' empty
+            ' Flag CreationTime + ModifiedTime (16 bytes) as padding for
+            ' every populated directory entry.
+            Dim k As Long
+            For k = 0 To 15
+                mPadMask(base + 100 + k) = 1
+            Next k
             Dim name As String
             name = ReadDirName(base)
             Dim startSec As Long, streamSize As Long
@@ -610,6 +620,22 @@ Private Function JumpTo(ByVal cbRecord As Long, ByVal startPos As Long) As Boole
     JumpTo = True
 End Function
 
+' Same as JumpTo but SKIP without flagging as padding.  Used when we
+' know the trailing bytes are real data (e.g. caption, fSize) that we
+' don't want to fully parse.
+Private Function JumpToOpaque(ByVal cbRecord As Long, ByVal startPos As Long) As Boolean
+    Dim consumed As Long
+    consumed = mStreamPos - startPos
+    If consumed > cbRecord Then
+        mParseErrorMsg = "Bad opaque jump: consumed=" & consumed & " > cbRecord=" & cbRecord & " at pos=" & mStreamPos
+        Exit Function
+    End If
+    Dim remaining As Long
+    remaining = cbRecord - consumed
+    If remaining > 0 Then mStreamPos = mStreamPos + remaining
+    JumpToOpaque = True
+End Function
+
 
 '======================================================================
 '  PRIMITIVE FILE-LEVEL READERS (operate on mBytes(), file offsets)
@@ -758,8 +784,9 @@ Private Function ConsumeFormControl(ByRef siteClsids() As Long, ByRef siteCount 
         ' bit 15 = DONTSAVECLASSTABLE
         If MaskBit(boolProps, 15) Then formDontSaveClass = 1
     End If
-    ' Skip the rest of the FormDataBlock + FormExtraDataBlock via JumpTo
-    If Not JumpTo(cbform, startPos) Then Exit Function
+    ' Skip the rest of the FormDataBlock + FormExtraDataBlock opaquely.
+    ' (The skipped bytes are real data -- colors, positions, etc -- not pad.)
+    If Not JumpToOpaque(cbform, startPos) Then Exit Function
 
     ' FormStreamData: GuidAndPicture for MouseIcon, GuidAndFont for Font, GuidAndPicture for Picture
     If MaskBit(mask, 15) Then  ' fMouseIcon
@@ -905,19 +932,26 @@ Private Function ConsumeOleSiteConcreteControl(ByRef outClsidCacheIndex As Long)
     If Not ConsumeProps(mask, bits, sizes, 3) Then Exit Function
     PopPadded
 
-    ' SiteExtraDataBlock: name, tag, optional position(8), control_tip_text
+    ' SiteExtraDataBlock: name, tag, optional position(8), control_tip_text.
+    ' Each variable-length string is followed by 4-byte alignment padding
+    ' (oleform.py omits this; Excel leaves the alignment gap uninitialised).
+    Dim extraStart As Long
+    extraStart = mStreamPos
     If nameLen > 0 Then
         If Not StreamRead(nameLen) Then Exit Function
     End If
+    PadTo4Relative extraStart
     If tagLen > 0 Then
         If Not StreamRead(tagLen) Then Exit Function
     End If
+    PadTo4Relative extraStart
     If MaskBit(mask, 8) Then
         If Not StreamRead(8) Then Exit Function   ' SitePosition
     End If
     If ctlTipLen > 0 Then
         If Not StreamRead(ctlTipLen) Then Exit Function
     End If
+    PadTo4Relative extraStart
 
     outClsidCacheIndex = clsidCache
     ' Trailing padding inside cbSite
@@ -1129,7 +1163,8 @@ Private Function ConsumeImageControl() As Boolean
     startPos = mStreamPos
     Dim mask As Double
     mask = ReadDword()
-    If Not JumpTo(cb, startPos) Then Exit Function
+    ' Skip remaining DataBlock+ExtraDataBlock opaquely (real data).
+    If Not JumpToOpaque(cb, startPos) Then Exit Function
     ' Bits 10 fPicture, 14 fMouseIcon
     If MaskBit(mask, 10) Then If Not ConsumeGuidAndPicture() Then Exit Function
     If MaskBit(mask, 14) Then If Not ConsumeGuidAndPicture() Then Exit Function
@@ -1137,6 +1172,18 @@ Private Function ConsumeImageControl() As Boolean
 End Function
 
 '-- CommandButtonControl: [MS-OFORMS] 2.2.1.1 -------------------------
+' CommandButtonPropMask (MS-OFORMS 2.2.1.2):
+'   bit 0 fForeColor (4)
+'   bit 1 fBackColor (4)
+'   bit 2 fVariousPropertyBits (4)
+'   bit 3 fCaption (count 4 in DataBlock, text in ExtraDataBlock)
+'   bit 4 fPicturePosition (4)
+'   bit 5 fSize (8 in ExtraDataBlock, after caption + align-pad)
+'   bit 6 fMousePointer (1)
+'   bit 7 fPicture (2)
+'   bit 8 fAccelerator (2)
+'   bit 9 fTakeFocusOnClick (1 -- only in newer Office versions; treat as 0)
+'   bit 10 fMouseIcon (2)
 Private Function ConsumeCommandButtonControl() As Boolean
     Dim ver0 As Long, ver1 As Long
     ver0 = ReadByte(): ver1 = ReadByte()
@@ -1146,8 +1193,27 @@ Private Function ConsumeCommandButtonControl() As Boolean
     startPos = mStreamPos
     Dim mask As Double
     mask = ReadDword()
+    PushPadded
+    Dim captionSize As Long: captionSize = 0
+    If MaskBit(mask, 0) Then If Not StreamRead(4) Then Exit Function  ' fForeColor
+    If MaskBit(mask, 1) Then If Not StreamRead(4) Then Exit Function  ' fBackColor
+    If MaskBit(mask, 2) Then If Not StreamRead(4) Then Exit Function  ' fVariousPropertyBits
+    If MaskBit(mask, 3) Then captionSize = ReadCountWithCompressionFlag()
+    If MaskBit(mask, 4) Then If Not StreamRead(4) Then Exit Function  ' fPicturePosition
+    If MaskBit(mask, 6) Then If Not StreamRead(1) Then Exit Function  ' fMousePointer
+    If MaskBit(mask, 7) Then If Not StreamRead(2) Then Exit Function  ' fPicture
+    If MaskBit(mask, 8) Then If Not StreamRead(2) Then Exit Function  ' fAccelerator
+    If MaskBit(mask, 10) Then If Not StreamRead(2) Then Exit Function ' fMouseIcon
+    PopPadded
+    ' ExtraDataBlock: caption (align-pad to 4), then fSize 8 if fSize bit set.
+    Dim extraStart As Long
+    extraStart = mStreamPos
+    If captionSize > 0 Then If Not StreamRead(captionSize) Then Exit Function
+    PadTo4Relative extraStart
+    If MaskBit(mask, 5) Then If Not StreamRead(8) Then Exit Function  ' Size (cx, cy)
+    ' Trailing alignment pad inside cb.
     If Not JumpTo(cb, startPos) Then Exit Function
-    ' Bits 7 fPicture, 10 fMouseIcon
+    ' StreamData
     If MaskBit(mask, 7) Then If Not ConsumeGuidAndPicture() Then Exit Function
     If MaskBit(mask, 10) Then If Not ConsumeGuidAndPicture() Then Exit Function
     If Not ConsumeTextProps() Then Exit Function
@@ -1164,7 +1230,7 @@ Private Function ConsumeSpinButtonControl() As Boolean
     startPos = mStreamPos
     Dim mask As Double
     mask = ReadDword()
-    If Not JumpTo(cb, startPos) Then Exit Function
+    If Not JumpToOpaque(cb, startPos) Then Exit Function
     ' Bit 13 = fMouseIcon
     If MaskBit(mask, 13) Then If Not ConsumeGuidAndPicture() Then Exit Function
     ConsumeSpinButtonControl = True
@@ -1199,7 +1265,8 @@ Private Function ConsumeTabStripControl() As Boolean
     If Not ConsumeProps(mask, bits, sizes, 14) Then Exit Function
     Dim tabData As Long: tabData = 0
     If MaskBit(mask, 22) Then tabData = CLng(ReadDword())
-    If Not JumpTo(cb, startPos) Then Exit Function
+    ' ExtraDataBlock contains tab names etc -- opaque skip, not pad.
+    If Not JumpToOpaque(cb, startPos) Then Exit Function
     If MaskBit(mask, 24) Then If Not ConsumeGuidAndPicture() Then Exit Function
     If Not ConsumeTextProps() Then Exit Function
     Dim i As Long
@@ -1264,7 +1331,7 @@ Private Function ConsumeScrollBarControl() As Boolean
     startPos = mStreamPos
     Dim mask As Double
     mask = ReadDword()
-    If Not JumpTo(cb, startPos) Then Exit Function
+    If Not JumpToOpaque(cb, startPos) Then Exit Function
     If MaskBit(mask, 16) Then If Not ConsumeGuidAndPicture() Then Exit Function
     ConsumeScrollBarControl = True
 End Function
