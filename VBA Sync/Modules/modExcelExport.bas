@@ -431,40 +431,47 @@ Private Function ProcessWorksheet(ws As Worksheet, sheetId As Long, padWidth As 
     Set ur = ws.UsedRange
     On Error GoTo 0
 
-    Dim cellValues As Object: Set cellValues = CreateObject("Scripting.Dictionary")     ' "col,row" -> value
-    Dim cellFormulas As Object: Set cellFormulas = CreateObject("Scripting.Dictionary") ' "col,row" -> "=..."
-    Dim cellStyles As Object: Set cellStyles = CreateObject("Scripting.Dictionary")     ' "col,row" -> style dict
+    ' grid bundles the in-memory representation of UsedRange: two 2D arrays
+    ' (values, formulas) plus base coords + dimensions. Cells live at
+    ' arr(r - baseRow + 1, c - baseCol + 1); Empty == no value / no formula.
+    ' No "col,row"-keyed Dictionary on the hot path.
+    Dim grid As Object: Set grid = CreateObject("Scripting.Dictionary")
+    grid("baseCol") = 0: grid("baseRow") = 0: grid("nCols") = 0: grid("nRows") = 0
+    Dim emptyGridArr(1 To 1, 1 To 1) As Variant
+    grid("values") = emptyGridArr
+    grid("formulas") = emptyGridArr
+    Dim cellStyles As Object: Set cellStyles = CreateObject("Scripting.Dictionary")
 
     If Not ur Is Nothing Then
         g_sheetPhase = "walk-used-range"
-        WalkUsedRange ur, cellValues, cellFormulas, cellStyles
+        WalkUsedRange ur, grid, cellStyles
     End If
 
-    ' --- Write per-table files directly from sheet-wide dicts ---
-    ' Sheet writers below filter out in-table cells via InAnyTable; no carve,
-    ' no per-table copy. Markers at each table's anchor cell are injected into
-    ' cellValues after the table writers run so the sheet's data.tsv still
-    ' shows where every table lives.
+    ' --- Per-table files: table writers read straight from the grid by
+    ' iterating the table's rectangle. No carve, no per-table copy. ---
     g_sheetPhase = "tables-write"
     Dim ti As Variant
     For Each ti In tableRanges
         Dim t As Object: Set t = ti
         EnsureFolder t("folder")
-        SaveTableDataTsv t("folder") & "data.tsv", cellValues, t, exported
-        SaveTableDefinitionJson t("folder") & "definition.json", t, cellFormulas, cellValues, tableCalcFormulas, exported
+        SaveTableDataTsv t("folder") & "data.tsv", grid, t, exported
+        SaveTableDefinitionJson t("folder") & "definition.json", t, grid, tableCalcFormulas, exported
     Next
 
+    ' Sheet-level markers: SaveDataTsv overlays these at each table's anchor
+    ' cell so the worksheet's data.tsv still shows where every table lives.
+    Dim markers As Object: Set markers = CreateObject("Scripting.Dictionary")
     For Each ti In tableRanges
         Dim tm As Object: Set tm = ti
-        Dim markerKey As String: markerKey = CStr(tm("startCol")) & "," & CStr(tm("startRow"))
-        cellValues(markerKey) = "[table:" & tm("name") & " ref=" & tm("ref") & " -> tables/" & tm("safeName") & "/]"
+        markers(CStr(tm("startCol")) & "," & CStr(tm("startRow"))) = _
+            "[table:" & tm("name") & " ref=" & tm("ref") & " -> tables/" & tm("safeName") & "/]"
     Next
 
     ' --- Write sheet-level files ---
     Dim tW As Double
     g_sheetPhase = "save-meta": tW = Timer:        SaveMetaJson sheetFolder & "_meta.json", ws, sheetId, tableRanges, exported, ooxmlSheetView: TimingsAdd "ws:save-meta", tW
-    g_sheetPhase = "save-data-tsv": tW = Timer:    SaveDataTsv sheetFolder & "data.tsv", cellValues, tableRanges, exported: TimingsAdd "ws:save-data-tsv", tW
-    g_sheetPhase = "save-formulas": tW = Timer:    SaveFormulasJson sheetFolder & "formulas.json", cellFormulas, tableRanges, exported: TimingsAdd "ws:save-formulas", tW
+    g_sheetPhase = "save-data-tsv": tW = Timer:    SaveDataTsv sheetFolder & "data.tsv", grid, markers, tableRanges, exported: TimingsAdd "ws:save-data-tsv", tW
+    g_sheetPhase = "save-formulas": tW = Timer:    SaveFormulasJson sheetFolder & "formulas.json", grid, tableRanges, exported: TimingsAdd "ws:save-formulas", tW
     g_sheetPhase = "save-styles": tW = Timer:      SaveStylesJson sheetFolder & "styles.json", cellStyles, exported: TimingsAdd "ws:save-styles", tW
     g_sheetPhase = "save-validations": tW = Timer: SaveValidationsJson sheetFolder & "validations.json", ws, exported, ooxmlValidations: TimingsAdd "ws:save-validations", tW
     g_sheetPhase = "save-cf": tW = Timer:          SaveConditionalFormatsJson sheetFolder & "conditional_formats.json", ws, exported: TimingsAdd "ws:save-cf", tW
@@ -500,13 +507,13 @@ Private Sub SanityCheckSheetFolders(worksheetsDir As String, excelDir As String)
 End Sub
 
 '====================  USEDRANGE WALKER  =====================
-' Reads UsedRange.Value2 and UsedRange.Formula in two big COM calls.
-' Then walks the 2D arrays to populate cellValues, cellFormulas, cellStyles.
-' Styles are read cell-by-cell only for non-default cells (still need to touch
-' COM per cell for Font/Interior/Border, but only where the formula or value
-' indicates a non-empty cell — empty cells skip the style probe).
-Private Sub WalkUsedRange(ur As Range, ByRef cellValues As Object, _
-                          ByRef cellFormulas As Object, ByRef cellStyles As Object)
+' Reads UsedRange.Value2 and UsedRange.Formula in two big COM calls and
+' mutates the 2D arrays in place into the shape the export sinks consume:
+' values(i,j) holds the formatted string (or Empty for blank cells), and
+' formulas(i,j) holds the formula string (or Empty when the cell has no
+' formula). The arrays + base coords are bundled into `grid` and passed
+' through to the table/sheet writers — no per-cell Dictionary insertions.
+Private Sub WalkUsedRange(ur As Range, ByRef grid As Object, ByRef cellStyles As Object)
     Dim baseCol As Long: baseCol = ur.Column
     Dim baseRow As Long: baseRow = ur.Row
     Dim nRows As Long: nRows = ur.Rows.Count
@@ -556,17 +563,10 @@ Private Sub WalkUsedRange(ur As Range, ByRef cellValues As Object, _
     End If
 
     Dim i As Long, j As Long
-    Dim absCol As Long, absRow As Long
     Dim v As Variant, f As Variant
-    Dim k As String
-    Dim rowPart As String
     Dim vType As Integer
-    Dim hasValue As Boolean
-    Dim hasFormula As Boolean
 
     For i = 1 To nRows
-        absRow = baseRow + i - 1
-        rowPart = "," & CStr(absRow)
         For j = 1 To nCols
             v = values(i, j)
             f = formulas(i, j)
@@ -575,43 +575,42 @@ Private Sub WalkUsedRange(ur As Range, ByRef cellValues As Object, _
             ' fused IsEmpty pair skips the rest of the body cheaply.
             If IsEmpty(v) And IsEmpty(f) Then GoTo NextCellWUR
 
-            hasValue = False
+            ' Coerce value to its emit form in place. Empty/blank → Empty so
+            ' consumers can do a single IsEmpty test instead of a type chain.
             vType = VarType(v)
             Select Case vType
                 Case vbEmpty, vbNull
+                    values(i, j) = Empty
                 Case vbString
-                    If Len(v) > 0 Then hasValue = True
+                    If Len(v) = 0 Then values(i, j) = Empty
+                    ' else leave the string as-is — same as FormatCellValue's
+                    ' Case Else branch (CStr is a no-op on a String Variant).
                 Case Else
-                    hasValue = True
+                    values(i, j) = FormatCellValue(v)
             End Select
 
-            hasFormula = False
+            ' Formula slot only holds real formulas; otherwise blank. .Formula
+            ' returns the literal cell value for non-formula cells, which we
+            ' don't want here (values already carry that).
             If VarType(f) = vbString Then
                 If Len(f) > 0 Then
-                    If Left$(f, 1) = "=" Then hasFormula = True
+                    If Left$(f, 1) <> "=" Then formulas(i, j) = Empty
+                Else
+                    formulas(i, j) = Empty
                 End If
-            End If
-
-            If hasValue Or hasFormula Then
-                absCol = baseCol + j - 1
-                k = CStr(absCol) & rowPart
-                If hasValue Then
-                    ' Strings (the common case in big data tables) bypass the
-                    ' Sub-call entirely — same result as FormatCellValue's
-                    ' Case Else branch.
-                    If vType = vbString Then
-                        cellValues(k) = CStr(v)
-                    Else
-                        cellValues(k) = FormatCellValue(v)
-                    End If
-                End If
-                If hasFormula Then
-                    cellFormulas(k) = CStr(f)
-                End If
+            Else
+                formulas(i, j) = Empty
             End If
 NextCellWUR:
         Next
     Next
+
+    grid("baseCol") = baseCol
+    grid("baseRow") = baseRow
+    grid("nCols") = nCols
+    grid("nRows") = nRows
+    grid("values") = values
+    grid("formulas") = formulas
 End Sub
 
 ' Coerce a VBA cell value (Variant from .Value2) to its TSV-emit form.
@@ -888,6 +887,109 @@ NextCell:
     Set CompressCellsToRanges = out
 End Function
 
+' Same greedy-rect-merge logic as CompressCellsToRanges, but takes a 2D
+' array (1-indexed) plus the rectangle's base coords. Cells inside any
+' tableRanges rectangle are skipped — they live in tables/<n>/definition.json
+' as overrides, not in the sheet-level output. Empty entries (Variant Empty)
+' are skipped.
+Private Function CompressArrayToRanges(arr As Variant, _
+                                       baseCol As Long, baseRow As Long, _
+                                       nRows As Long, nCols As Long, _
+                                       tableRanges As Object) As Object
+    Dim out As Object: Set out = New Collection
+    If nRows <= 0 Or nCols <= 0 Then Set CompressArrayToRanges = out: Exit Function
+
+    Dim sv() As String: ReDim sv(0 To nRows - 1, 0 To nCols - 1)
+    Dim vals() As Variant: ReDim vals(0 To nRows - 1, 0 To nCols - 1)
+    Dim hasTables As Boolean: hasTables = (tableRanges.Count > 0)
+
+    Dim i As Long, j As Long
+    Dim v As Variant
+    Dim absCol As Long, absRow As Long
+    Dim total As Long: total = 0
+    For i = 1 To nRows
+        absRow = baseRow + i - 1
+        For j = 1 To nCols
+            v = arr(i, j)
+            If IsEmpty(v) Then GoTo NextSrcCell
+            absCol = baseCol + j - 1
+            If hasTables Then
+                If InAnyTable(absCol, absRow, tableRanges) Then GoTo NextSrcCell
+            End If
+            If IsObject(v) Then
+                sv(i - 1, j - 1) = JsonConverter.ConvertToJson(v)
+                Set vals(i - 1, j - 1) = v
+            Else
+                sv(i - 1, j - 1) = "S:" & CStr(v)
+                vals(i - 1, j - 1) = v
+            End If
+            total = total + 1
+NextSrcCell:
+        Next
+    Next
+    If total = 0 Then Set CompressArrayToRanges = out: Exit Function
+
+    Dim vis() As Boolean: ReDim vis(0 To nRows - 1, 0 To nCols - 1)
+    Dim r As Long, c As Long
+    For r = 0 To nRows - 1
+        For c = 0 To nCols - 1
+            If vis(r, c) Then GoTo NextMergeCell
+            If Len(sv(r, c)) = 0 Then GoTo NextMergeCell
+
+            Dim curVal As String: curVal = sv(r, c)
+
+            Dim endCol As Long: endCol = c
+            Do While endCol + 1 <= nCols - 1
+                If vis(r, endCol + 1) Then Exit Do
+                If sv(r, endCol + 1) <> curVal Then Exit Do
+                endCol = endCol + 1
+            Loop
+
+            Dim endRow As Long: endRow = r
+            Dim canExtend As Boolean: canExtend = True
+            Do While endRow + 1 <= nRows - 1 And canExtend
+                Dim cc3 As Long
+                For cc3 = c To endCol
+                    If vis(endRow + 1, cc3) Then canExtend = False: Exit For
+                    If sv(endRow + 1, cc3) <> curVal Then canExtend = False: Exit For
+                Next
+                If canExtend Then endRow = endRow + 1
+            Loop
+
+            Dim rr3 As Long, cc4 As Long
+            For rr3 = r To endRow
+                For cc4 = c To endCol
+                    vis(rr3, cc4) = True
+                Next
+            Next
+
+            Dim absC As Long: absC = c + baseCol
+            Dim absR As Long: absR = r + baseRow
+            Dim absEC As Long: absEC = endCol + baseCol
+            Dim absER As Long: absER = endRow + baseRow
+            Dim startRef As String: startRef = ColLetters(absC) & CStr(absR)
+            Dim rangeStr As String
+            If endCol = c And endRow = r Then
+                rangeStr = startRef
+            Else
+                rangeStr = startRef & ":" & ColLetters(absEC) & CStr(absER)
+            End If
+
+            Dim entryArr(0 To 1) As Variant
+            entryArr(0) = rangeStr
+            If IsObject(vals(r, c)) Then
+                Set entryArr(1) = vals(r, c)
+            Else
+                entryArr(1) = vals(r, c)
+            End If
+            out.Add entryArr
+NextMergeCell:
+        Next
+    Next
+
+    Set CompressArrayToRanges = out
+End Function
+
 '====================  FILE WRITERS  =========================
 
 ' True if (c, r) is inside any table rectangle in tableRanges.
@@ -903,17 +1005,24 @@ Private Function InAnyTable(c As Long, r As Long, tableRanges As Object) As Bool
     Next
 End Function
 
-Private Sub SaveDataTsv(path As String, cells As Object, tableRanges As Object, exported As Object)
+Private Sub SaveDataTsv(path As String, grid As Object, markers As Object, tableRanges As Object, exported As Object)
     Dim sb As Object: Set sb = NewStringBuilder()
 
-    If cells.Count = 0 Then
+    Dim baseCol As Long: baseCol = grid("baseCol")
+    Dim baseRow As Long: baseRow = grid("baseRow")
+    Dim nCols As Long: nCols = grid("nCols")
+    Dim nRows As Long: nRows = grid("nRows")
+
+    If nRows = 0 Or nCols = 0 Then
         sbAppend sb, "Row" & vbCrLf
         WriteIfChanged path, sbToString(sb), exported, True
         Exit Sub
     End If
 
-    ' Anchor cells (top-left of each table) hold the [table:...] marker and must
-    ' pass through; all other in-table cells live in tables/<n>/data.tsv only.
+    Dim values As Variant: values = grid("values")
+
+    ' Anchor cells (top-left of each table) hold the [table:...] marker and
+    ' must pass through; all other in-table cells live in tables/<n>/data.tsv.
     Dim anchors As Object: Set anchors = CreateObject("Scripting.Dictionary")
     Dim ai As Variant
     For Each ai In tableRanges
@@ -921,22 +1030,62 @@ Private Sub SaveDataTsv(path As String, cells As Object, tableRanges As Object, 
         anchors(CStr(at("startCol")) & "," & CStr(at("startRow"))) = True
     Next
 
-    ' Determine extents
+    ' Sweep the 2D arrays directly. byRow gathers row -> {col -> value};
+    ' maxCol caps the header row width.
     Dim maxCol As Long: maxCol = 0
-    Dim k As Variant
     Dim byRow As Object: Set byRow = CreateObject("Scripting.Dictionary")
-    For Each k In cells.Keys
-        Dim parts() As String: parts = Split(CStr(k), ",")
-        Dim c As Long: c = CLng(parts(0))
-        Dim r As Long: r = CLng(parts(1))
-        If InAnyTable(c, r, tableRanges) And Not anchors.Exists(CStr(k)) Then GoTo NextCellSDT
-        If c > maxCol Then maxCol = c
-        If Not byRow.Exists(r) Then
-            Dim rowDict As Object: Set rowDict = CreateObject("Scripting.Dictionary")
-            Set byRow(r) = rowDict
-        End If
-        byRow(r)(c) = cells(CStr(k))
+    Dim i As Long, j As Long
+    Dim absRow As Long, absCol As Long
+    Dim rowPart As String, k As String
+    Dim v As Variant
+    Dim hasTableRanges As Boolean: hasTableRanges = (tableRanges.Count > 0)
+    For i = 1 To nRows
+        absRow = baseRow + i - 1
+        rowPart = "," & CStr(absRow)
+        Dim rowDict As Object: Set rowDict = Nothing
+        For j = 1 To nCols
+            v = values(i, j)
+            absCol = baseCol + j - 1
+            If hasTableRanges Then
+                If InAnyTable(absCol, absRow, tableRanges) Then
+                    ' Anchor cells carry the [table:...] marker; everything
+                    ' else in the rectangle lives in tables/<n>/data.tsv.
+                    k = CStr(absCol) & rowPart
+                    If markers.Exists(k) Then
+                        v = markers(k)
+                    Else
+                        GoTo NextCellSDT
+                    End If
+                End If
+            End If
+            If IsEmpty(v) Then GoTo NextCellSDT
+            If absCol > maxCol Then maxCol = absCol
+            If rowDict Is Nothing Then
+                Set rowDict = CreateObject("Scripting.Dictionary")
+                Set byRow(absRow) = rowDict
+            End If
+            rowDict(absCol) = v
 NextCellSDT:
+        Next
+    Next
+
+    ' Marker may sit at a cell outside the UsedRange (rare, but possible if the
+    ' anchor cell was empty and Excel trimmed UsedRange before it). Sweep
+    ' markers once more to make sure every one is represented.
+    Dim mk As Variant
+    For Each mk In markers.Keys
+        Dim mparts() As String: mparts = Split(CStr(mk), ",")
+        Dim mc As Long: mc = CLng(mparts(0))
+        Dim mr As Long: mr = CLng(mparts(1))
+        Dim mRow As Object
+        If byRow.Exists(mr) Then
+            Set mRow = byRow(mr)
+        Else
+            Set mRow = CreateObject("Scripting.Dictionary")
+            Set byRow(mr) = mRow
+        End If
+        If Not mRow.Exists(mc) Then mRow(mc) = markers(CStr(mk))
+        If mc > maxCol Then maxCol = mc
     Next
 
     ' Header: "Row\tA\tB\t..."
@@ -947,7 +1096,6 @@ NextCellSDT:
     Next
     sbAppend sb, vbCrLf
 
-    ' Sort rows ascending
     Dim sortedRows As Object: Set sortedRows = SortedNumericKeys(byRow)
     Dim ri As Variant
     For Each ri In sortedRows
@@ -965,28 +1113,19 @@ NextCellSDT:
     WriteIfChanged path, sbToString(sb), exported, True
 End Sub
 
-Private Sub SaveFormulasJson(path As String, cells As Object, tableRanges As Object, exported As Object)
-    If cells.Count = 0 Then Exit Sub
+Private Sub SaveFormulasJson(path As String, grid As Object, tableRanges As Object, exported As Object)
+    Dim nRows As Long: nRows = grid("nRows")
+    Dim nCols As Long: nCols = grid("nCols")
+    If nRows = 0 Or nCols = 0 Then Exit Sub
 
-    ' Strip out cells living inside any table rectangle — those formulas are
-    ' represented in tables/<n>/definition.json (column formula + overrides).
-    Dim filtered As Object: Set filtered = cells
-    If Not tableRanges Is Nothing Then
-        If tableRanges.Count > 0 Then
-            Set filtered = CreateObject("Scripting.Dictionary")
-            Dim fk As Variant
-            For Each fk In cells.Keys
-                Dim fparts() As String: fparts = Split(CStr(fk), ",")
-                If Not InAnyTable(CLng(fparts(0)), CLng(fparts(1)), tableRanges) Then
-                    filtered(CStr(fk)) = cells(CStr(fk))
-                End If
-            Next
-            If filtered.Count = 0 Then Exit Sub
-        End If
-    End If
+    Dim baseCol As Long: baseCol = grid("baseCol")
+    Dim baseRow As Long: baseRow = grid("baseRow")
+    Dim formulas As Variant: formulas = grid("formulas")
 
-    ' CompressCellsToRanges returns entries in row-major order; no sort needed.
-    Dim sortedMerged As Object: Set sortedMerged = CompressCellsToRanges(filtered)
+    ' CompressArrayToRanges filters in-table cells inline. Cells inside any
+    ' table live in tables/<n>/definition.json (column formula + overrides).
+    Dim sortedMerged As Object
+    Set sortedMerged = CompressArrayToRanges(formulas, baseCol, baseRow, nRows, nCols, tableRanges)
 
     ' Each entry is a 2-element Variant array (range:String, value:Variant).
     Dim ranges As Object: Set ranges = CreateObject("Scripting.Dictionary")
@@ -2401,40 +2540,50 @@ Private Sub CleanupTempDir(tempDir As String)
 End Sub
 
 '====================  TABLE WRITERS  ========================
-' Reads cells directly from the sheet-wide `cells` dict by iterating the
-' table's rectangle. No per-table copy — `cells` is the same dict the sheet
-' writers see.
-Private Sub SaveTableDataTsv(path As String, cells As Object, t As Object, exported As Object)
+' Reads cells directly from the grid's values array via offset math. No dict
+' lookups, no per-table copy. Cells outside the UsedRange rectangle (rare —
+' tables are always inside UsedRange) are treated as Empty.
+Private Sub SaveTableDataTsv(path As String, grid As Object, t As Object, exported As Object)
     Dim startCol As Long: startCol = t("startCol")
     Dim endCol As Long: endCol = t("endCol")
     Dim startRow As Long: startRow = t("startRow")
     Dim endRow As Long: endRow = t("endRow")
 
+    Dim baseCol As Long: baseCol = grid("baseCol")
+    Dim baseRow As Long: baseRow = grid("baseRow")
+    Dim nCols As Long: nCols = grid("nCols")
+    Dim nRows As Long: nRows = grid("nRows")
+    Dim values As Variant: values = grid("values")
+
     Dim sb As Object: Set sb = NewStringBuilder()
     Dim c2 As Long, hFirst As Boolean: hFirst = True
-    Dim k As String, hv As String
+    Dim hi As Long, hj As Long, hv As String
+    Dim hval As Variant
     For c2 = startCol To endCol
         If hFirst Then hFirst = False Else sbAppend sb, vbTab
-        k = CStr(c2) & "," & CStr(startRow)
-        If cells.Exists(k) Then
-            hv = CStr(cells(k))
-        Else
-            hv = ""
+        hi = startRow - baseRow + 1
+        hj = c2 - baseCol + 1
+        hv = ""
+        If hi >= 1 And hi <= nRows And hj >= 1 And hj <= nCols Then
+            hval = values(hi, hj)
+            If Not IsEmpty(hval) Then hv = CStr(hval)
         End If
         If Len(hv) = 0 Then hv = ColLetters(c2)
         sbAppend sb, TsvEscape(hv)
     Next
     sbAppend sb, vbCrLf
 
-    Dim r2 As Long
+    Dim r2 As Long, ri As Long, ci As Long
+    Dim cval As Variant
     For r2 = startRow + 1 To endRow
         Dim first As Boolean: first = True
-        Dim rPart As String: rPart = "," & CStr(r2)
+        ri = r2 - baseRow + 1
         For c2 = startCol To endCol
             If Not first Then sbAppend sb, vbTab Else first = False
-            k = CStr(c2) & rPart
-            If cells.Exists(k) Then
-                sbAppend sb, TsvEscape(CStr(cells(k)))
+            ci = c2 - baseCol + 1
+            If ri >= 1 And ri <= nRows And ci >= 1 And ci <= nCols Then
+                cval = values(ri, ci)
+                If Not IsEmpty(cval) Then sbAppend sb, TsvEscape(CStr(cval))
             End If
         Next
         sbAppend sb, vbCrLf
@@ -2443,7 +2592,13 @@ Private Sub SaveTableDataTsv(path As String, cells As Object, t As Object, expor
     WriteIfChanged path, sbToString(sb), exported, True
 End Sub
 
-Private Sub SaveTableDefinitionJson(path As String, t As Object, cellFormulas As Object, cellValues As Object, tableCalcFormulas As Object, exported As Object)
+Private Sub SaveTableDefinitionJson(path As String, t As Object, grid As Object, tableCalcFormulas As Object, exported As Object)
+    Dim baseCol As Long: baseCol = grid("baseCol")
+    Dim baseRow As Long: baseRow = grid("baseRow")
+    Dim gridCols As Long: gridCols = grid("nCols")
+    Dim gridRows As Long: gridRows = grid("nRows")
+    Dim gridValues As Variant: gridValues = grid("values")
+    Dim gridFormulas As Variant: gridFormulas = grid("formulas")
     Dim lo As ListObject: Set lo = t("listObject")
     Dim obj As Object: Set obj = CreateObject("Scripting.Dictionary")
     obj("name") = lo.Name
@@ -2506,21 +2661,26 @@ Private Sub SaveTableDefinitionJson(path As String, t As Object, cellFormulas As
             ' a formula. Both cases get tracked.
             Dim sheetColIdx As Long: sheetColIdx = t("startCol") + colIdx
             Dim overrides As Object: Set overrides = CreateObject("Scripting.Dictionary")
-            Dim r As Long
+            Dim r As Long, ri As Long, ci As Long
+            ci = sheetColIdx - baseCol + 1
             For r = t("startRow") + 1 To t("endRow")
-                Dim k As String: k = CStr(sheetColIdx) & "," & CStr(r)
                 Dim tableRowIdx As Long: tableRowIdx = r - t("startRow")
-                If cellFormulas.Exists(k) Then
-                    Dim cellF As String: cellF = CStr(cellFormulas(k))
-                    If cellF <> calcFormula Then
-                        overrides(CStr(tableRowIdx)) = cellF
+                ri = r - baseRow + 1
+                Dim cellF As Variant: cellF = Empty
+                Dim litVal As Variant: litVal = Empty
+                If ri >= 1 And ri <= gridRows And ci >= 1 And ci <= gridCols Then
+                    cellF = gridFormulas(ri, ci)
+                    litVal = gridValues(ri, ci)
+                End If
+                If Not IsEmpty(cellF) Then
+                    Dim cellFStr As String: cellFStr = CStr(cellF)
+                    If cellFStr <> calcFormula Then
+                        overrides(CStr(tableRowIdx)) = cellFStr
                     End If
                 Else
-                    ' Cell has no formula at all -- it's a literal value
-                    ' overriding the calc column. Record the literal so the
-                    ' override is reversible and reviewable in the diff.
-                    Dim litVal As Variant: litVal = Empty
-                    If cellValues.Exists(k) Then litVal = cellValues(k)
+                    ' Cell has no formula -- literal value overriding the
+                    ' calc column. Record the literal so the override is
+                    ' reversible and reviewable in the diff.
                     If IsEmpty(litVal) Then
                         overrides(CStr(tableRowIdx)) = ""   ' explicit blank override
                     Else
