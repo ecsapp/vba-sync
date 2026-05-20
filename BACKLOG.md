@@ -96,6 +96,20 @@ what a VS Code edit wants back in Excel.
 - **`<extLst>` extension lists** in worksheets carry x14
   conditional-formatting and data-validation rules that the current
   parsers miss (they only look at the main namespace).
+- **Static export templates risk the VBA 25-continuation limit.**
+  `WriteGitIgnore` and `WriteReadme` build static text via long `& _`
+  continuation chains. VBA caps line-continuations at 25 per logical
+  statement; crossing it makes the VBE reject the whole module on Import
+  with a bare `0x800A9D00` — and it compiles fine until it doesn't (the
+  `.gitignore` builder hit exactly this on 2026-05-20). Proposed fix:
+  move the static templates into an embedded payload part — same
+  `CustomXMLPart` mechanism as the harness payload, but a separate part
+  (`urn:vba-sync:core-templates:v1`), since `.gitignore`/README are
+  vba-sync core export artifacts, not excel-control harness files. At
+  emit time, load the template and token-substitute the dynamic bits
+  (the `Format(Now …)` timestamp, the secret-file line). Removes the
+  continuation hazard for good and makes the templates diffable text
+  instead of escaped VBA concatenation.
 
 ## excel-control harness — deferred audit findings
 
