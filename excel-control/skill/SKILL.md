@@ -1,6 +1,6 @@
 ---
 name: excel-control
-description: Drive this Excel workbook end-to-end — run macros, read/write cells, handle dialogs and runtime errors, write and run a VBA test suite. Use whenever the user wants to execute, inspect, or interact with the workbook beyond static source editing. Reference at tools/INTERFACE.md.
+description: Drive this Excel workbook end-to-end — run macros, read/write cells, handle dialogs and runtime errors, refresh data connections, write and run a VBA test suite. Use whenever the user wants to execute, inspect, debug, or test the workbook beyond static source editing.
 ---
 
 # excel-control — agent guide
@@ -15,31 +15,47 @@ instance open; you communicate via two append-only JSONL files:
 `tools/INTERFACE.md` is the full API reference. This file is the guide:
 how to do common things.
 
+### Paths
+
+All paths in this guide are **relative to the workbook root** — the
+folder vba-sync Export wrote, where the harness lives at `./tools/`. If
+you are working in the **excel-control dev tree** instead (the source
+repo), the scripts are at `excel-control/` and sessions at
+`excel-control/sessions/` — substitute accordingly. The `pwsh` launch
+runs from the workbook root.
+
 ## Quickstart
 
-```
-# headless (default — Excel runs invisibly)
-Bash run_in_background=true: pwsh tools/start-session.ps1 -Workbook X.xlsm -SessionId s1
-
-# visible (Excel on the desktop — user sees what the agent does;
-# screenshots of worksheets become meaningful instead of mostly empty)
-Bash run_in_background=true: pwsh tools/start-session.ps1 -Workbook X.xlsm -SessionId s1 -Visible
-
-Monitor: tools/sessions/s1/events.jsonl     ← push notifications, one per new line
-Write/Edit append: tools/sessions/s1/commands.jsonl
-
-# end the session:
-   {"id":"cN","cmd":"close"}
-```
+1. **Launch the session** (Bash, `run_in_background: true`). Headless by
+   default — Excel runs invisibly:
+   ```
+   pwsh tools/start-session.ps1 -Workbook X.xlsm -SessionId s1
+   ```
+   Add `-Visible` to show Excel on the desktop. Use `-Visible` when you
+   need meaningful worksheet screenshots, **or when running an Export**
+   — some workbook structure (frozen panes, view state) can serialize
+   incompletely from an invisible automation Excel.
+2. **Wait for readiness.** The harness emits
+   `{"t":"started","pid":...,"excel_pid":...,"session_id":...}` to
+   `tools/sessions/s1/events.jsonl` once Excel has opened the workbook —
+   this takes a few seconds. **Do not send a command before `started`
+   arrives.** If it has not arrived in ~15s, read
+   `tools/sessions/s1/state.json`: `status:crashed` means startup failed
+   — check the `events.jsonl` tail for a `session_error`.
+3. **Watch events** — point the Monitor tool at
+   `tools/sessions/s1/events.jsonl` (one notification per appended line).
+4. **Send commands** — append one JSON object per line to
+   `tools/sessions/s1/commands.jsonl` (append only; never rewrite it).
+5. **End the session** — append `{"id":"cN","cmd":"close"}`.
 
 **Concurrent Excel use**: the session creates a separate `EXCEL.EXE`
-process. It's safe to run alongside the user's interactive Excel
-PROVIDED:
-- Don't open the same workbook in both (file-lock conflict)
-- Be aware that MsgBoxes / runtime-error dialogs from the harness POP
-  ON THE USER'S DESKTOP (the watcher auto-dismisses them fast, but a
-  user click can race the watcher)
-- With `-Visible`, agent operations may steal foreground focus
+process. It is safe to run alongside the user's interactive Excel
+provided:
+- Don't open the same workbook in both (file-lock conflict).
+- MsgBoxes / runtime-error dialogs from the harness pop on the user's
+  desktop — the watcher auto-dismisses them fast, but a user click can
+  race the watcher.
+- With `-Visible`, agent operations may steal foreground focus.
 
 Every command needs an `id` (any unique string per session — typically `c1`,
 `c2`, …) and a `cmd`. You get one `command_ack` event per command, then the
@@ -57,6 +73,12 @@ result event(s).
 {"t":"command_ack","id":"c1","cmd":"run_macro"}
 {"t":"macro_completed","id":"c1","name":"BuildReport","result":1247,"duration_ms":4210}
 ```
+
+`args` crosses the COM boundary, which constrains what you can pass:
+scalars (numbers, strings, booleans, dates) and arrays of those work;
+`Range`, `Workbook`, or other object references do **not**; `ByRef`
+out-parameters are not returned — only the function's return value
+comes back in `result`. Keep macro signatures to value arguments.
 
 ### Run a macro that pops a dialog
 
@@ -114,7 +136,10 @@ Fix loop:
 
 The harness has a discover-and-run convention for VBA tests:
 
-- Any `Public Sub Test_<Name>()` in any module gets discovered by `run_tests`.
+- Any `Sub Test_<Name>()` in any module gets discovered by `run_tests`
+  — the `Public` keyword is optional. Only a `Sub` is matched: a
+  `Function` named `Test_*`, or a `Private Sub Test_*`, is **not**
+  discovered and silently never runs.
 - A test **passes** if it runs to completion without raising an error.
 - A test **fails** if it raises any error (via `Err.Raise` or an
   unhandled runtime error).
@@ -168,8 +193,12 @@ To run them:
 {"t":"test_result","module":"modSalesTests","name":"Test_Sales_BasicTotal","status":"pass","duration_ms":12}
 {"t":"test_result","module":"modSalesTests","name":"Test_Sales_RejectsNegatives","status":"pass","duration_ms":8}
 {"t":"test_result","module":"modSalesTests","name":"Test_Sales_HappyPath_Refresh","status":"fail","duration_ms":420,"error":{"message":"AreEqual failed: expected=100 actual=0","hresult":-2147221503}}
-{"t":"tests_completed","id":"c3","total":3,"passed":2,"failed":1,"duration_ms":520}
+{"t":"tests_completed","id":"c3","total":3,"passed":2,"failed":1,"errored":0,"duration_ms":520}
 ```
+
+The emitter always includes `errored` in `tests_completed`; it is
+currently always `0` (the runner has no separate error category — see
+the next note), so rely on `passed`/`failed`.
 
 Interpreting:
 - `tests_completed.passed`/`failed` is your summary
@@ -201,6 +230,11 @@ the land:
 //      ...]}
 ```
 
+The event payloads above are **abridged** — the emitters send more
+fields than shown (`workbook_info` adds `full_name`, `file_format`,
+`named_range_count`, …; `list_sheets` adds `index`; `list_macros` adds
+`line`). See `tools/INTERFACE.md` for the full shape of every event.
+
 ### Refresh data and verify
 
 ```jsonc
@@ -231,6 +265,8 @@ Single-cell anchor (`A1`) auto-resizes to the input dimensions.
 
 ## When NOT to use the harness
 
+- **Just reading VBA source** — that's a vba-sync Export; no session
+  needed.
 - **Pure source edits** that don't need execution — use vba-sync's
   Import (faster, no session overhead).
 - **SharePoint-hosted workbooks** that open from a URL — the harness
@@ -247,8 +283,9 @@ Single-cell anchor (`A1`) auto-resizes to the input dimensions.
   open — file lock conflict.
 - **Always send `close`** before killing the session process; otherwise
   Excel may flag the .xlsm as "needing recovery" on next open.
-- **Don't modify .bas files on disk** while a session is live without a
-  follow-up `sync_vba` — the in-memory VBA project diverges from disk.
+- **After editing `.bas`/`.cls` on disk during a live session, always
+  `sync_vba`** before `compile_check` / `run_macro` — the harness only
+  sees synced source; the in-memory VBA project does not track disk.
 - **Don't open the same workbook twice** — use one session per
   workbook (multi-workbook within a session is fine via
   `open_workbook` / `close_workbook`).
@@ -260,14 +297,20 @@ Look at `tools/sessions/<id>/state.json`:
 ```json
 {
   "pid": 12345,
+  "excel_pid": 23320,
   "workbook": "C:\\path\\X.xlsm",
   "session_id": "s1",
   "status": "busy",
+  "visible": false,
   "started_at": "2026-05-19T10:30:00Z",
   "last_command_offset": 482
 }
 ```
 
+- `pid` — the PowerShell **host** process.
+- `excel_pid` — the **spawned Excel** process. This is the one to kill
+  if you ever must force-terminate — never `Stop-Process -Name EXCEL`,
+  which would also kill the user's interactive Excel.
 - `status: ready` — idle, waiting for commands
 - `status: busy` — executing a command (likely run_macro)
 - `status: closed` — clean shutdown
@@ -283,9 +326,16 @@ Look at `tools/sessions/<id>/state.json`:
    dialog from a prior crash), screenshot the host's main window via
    `{"id":"cN","cmd":"screenshot","target":"window"}` to see what's
    on screen.
-3. Last resort: if no response to commands at all and PID is alive
-   but unresponsive, terminate the PID (NOT all of Excel) and start a
-   fresh session.
+3. Last resort: if no response to commands at all and the host is
+   alive but unresponsive, terminate `state.json.pid` (the host) and,
+   if it is orphaned, `state.json.excel_pid` (the spawned Excel) — never
+   all of Excel — then start a fresh session.
+
+**Resuming after a crash:** a session directory persists after the host
+dies. `start-session.ps1` resumes from `last_command_offset` if you
+reuse an existing `SessionId`. To pick up where a crashed session left
+off, reuse its id; to start clean, `ls tools/sessions/` and choose an
+unused one.
 
 **Commands not being processed:**
 - `commands.jsonl` is read by byte offset (tracked in

@@ -242,6 +242,17 @@ Public Sub DoExportExcelStructure(wb As Workbook, rootPath As String, exported A
     On Error GoTo Fail
     TimingsAdd "build-drawing-map", tBDM
 
+    ' Loud failure: if the OOXML package extraction failed, validations.json,
+    ' frozen panes and drawing _assets/ are all silently absent. Record it in
+    ' the export error log rather than ship a quietly-incomplete export.
+    If Not drawingMap Is Nothing Then
+        If drawingMap.Exists("error") Then
+            LogExportError excelDir, "OOXML package extraction failed (" & _
+                CStr(drawingMap("error")) & ") -- validations.json, frozen " & _
+                "panes and drawing _assets/ will be MISSING from this export."
+        End If
+    End If
+
     ' Side-load calc-column formulas from xl/tables/*.xml. The same temp unzip
     ' BuildDrawingImageMap created above is reused. Map is empty if no tables
     ' or if the unzip failed; callers must check.
@@ -2389,6 +2400,10 @@ NextSheet:
     Exit Function
 Fail:
     Debug.Print "VBA Sync: BuildDrawingImageMap failed: " & Err.Description
+    ' Surface the reason in-band — the caller logs it loudly. Without this
+    ' the whole OOXML side-data pipeline (validations, frozen panes,
+    ' drawing _assets/) degrades to empty with no trace.
+    If Not result Is Nothing Then result("error") = Err.Description
     Set BuildDrawingImageMap = result   ' may be partially populated; tempDir is still set for cleanup
 End Function
 
@@ -2482,18 +2497,70 @@ End Function
 ' Raises if tar.exe is missing or extract fails.
 Private Sub ExtractZipSynchronously(zipPath As String, destDir As String)
     Dim tEx As Double: tEx = Timer
+    Dim tarExe As String: tarExe = ResolveTarExe()
     Dim wsh As Object: Set wsh = CreateObject("WScript.Shell")
+    ' Invoke tar.exe by its absolute System32 path. The previous form,
+    ' "cmd /c tar.exe", relies on PATH resolution — which failed inside the
+    ' excel-control harness's Excel process: a harness-driven export then
+    ' silently dropped ALL OOXML side-data (validations, frozen panes,
+    ' drawing assets). A directly COM-spawned Excel resolves a bare
+    ' "tar.exe" fine, so the harness's process environment is the
+    ' differentiator. The absolute path removes the dependency entirely.
+    ' Window style 0 = hidden; True = wait for exit.
     Dim cmd As String
-    cmd = "cmd /c tar.exe -xf """ & zipPath & """ -C """ & destDir & """"
+    cmd = """" & tarExe & """ -xf """ & zipPath & """ -C """ & destDir & """"
     Dim exitCode As Long
     exitCode = wsh.Run(cmd, 0, True)
     TimingsAdd "extract-zip", tEx
     If exitCode <> 0 Then
         Err.Raise vbObjectError + 9001, "ExtractZipSynchronously", _
-                  "tar.exe extract failed (exit " & exitCode & _
-                  "). Source=" & zipPath & " Dest=" & destDir & _
-                  ". Requires Windows 10 1803+."
+                  "tar extract failed (exit " & exitCode & "). tar=[" & tarExe & _
+                  "] zip=[" & zipPath & "] dest=[" & destDir & "] :: " & _
+                  CaptureProcessStdErr(cmd)
     End If
+End Sub
+
+' Resolve tar.exe to an absolute path. Bundled with Windows 10 1803+ in
+' System32. A 32-bit Excel on 64-bit Windows must reach it via Sysnative —
+' System32 file-system-redirects to SysWOW64 for 32-bit processes, and
+' SysWOW64 has no tar.exe.
+Private Function ResolveTarExe() As String
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    Dim winDir As String: winDir = Environ$("SystemRoot")
+    If Len(winDir) = 0 Then winDir = Environ$("windir")
+    If Len(winDir) = 0 Then winDir = "C:\Windows"
+    If fso.FileExists(winDir & "\Sysnative\tar.exe") Then
+        ResolveTarExe = winDir & "\Sysnative\tar.exe"
+    ElseIf fso.FileExists(winDir & "\System32\tar.exe") Then
+        ResolveTarExe = winDir & "\System32\tar.exe"
+    Else
+        ResolveTarExe = "tar.exe"   ' last resort: rely on PATH
+    End If
+End Function
+
+' Re-run a failed command via WshShell.Exec purely to capture its stderr
+' for an error message. Diagnostic-only — the hidden run already failed.
+Private Function CaptureProcessStdErr(cmdLine As String) As String
+    On Error Resume Next
+    Dim ex As Object: Set ex = CreateObject("WScript.Shell").Exec(cmdLine)
+    Dim guard As Long
+    Do While ex.Status = 0 And guard < 1000000
+        guard = guard + 1
+        DoEvents
+    Loop
+    CaptureProcessStdErr = Trim$(Left$(CStr(ex.StdErr.ReadAll()) & _
+                                       CStr(ex.StdOut.ReadAll()), 400))
+End Function
+
+' Append a line to the export error log (.export_sheet_errors.log). The
+' same log the per-sheet handler writes; modSync surfaces it in the
+' post-export summary, so anything logged here is seen, not silent.
+Private Sub LogExportError(excelDir As String, msg As String)
+    On Error Resume Next
+    Dim fnum As Integer: fnum = FreeFile
+    Open excelDir & ".export_sheet_errors.log" For Append As #fnum
+    Print #fnum, Format(Now, "yyyy-mm-dd hh:nn:ss") & " VBA Sync: " & msg
+    Close #fnum
 End Sub
 
 ' Load a small XML file via MSXML2.DOMDocument. Returns Nothing on parse failure.
