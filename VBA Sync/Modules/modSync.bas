@@ -7,6 +7,10 @@ Option Explicit
     Private Declare Function GetACP Lib "kernel32" () As Long
 #End If
 
+' Namespace of the embedded excel-control harness payload (a CustomXMLPart).
+' See RefreshHarnessPayload (build) and WriteHarness (export).
+Private Const HARNESS_NS As String = "urn:vba-sync:excel-control-harness:v1"
+
 ' MIT License
 '
 ' Copyright (c) 2025 Arnaud Lavignolle
@@ -631,8 +635,26 @@ End Sub
 Private Sub WriteGitIgnore(basePath As String)
     Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
     Dim iPath As String: iPath = basePath & GIT_IGNORE
+
+    ' The excel-control harness writes the project's VBA password to
+    ' tools/.vba-password (the -VbaPassword file fallback). It must never
+    ' be committed — guarantee the rule is present even on repos whose
+    ' .gitignore was written before this entry existed.
+    Const SECRET_LINE As String = "tools/.vba-password"
+
     If fso.FileExists(iPath) Then
-        Debug.Print "VBA Sync: .gitignore already exists, skipping"
+        Dim existing As String: existing = ReadAllText(iPath)
+        If InStr(1, existing, SECRET_LINE, vbTextCompare) > 0 Then
+            Debug.Print "VBA Sync: .gitignore already exists, skipping"
+        Else
+            Debug.Print "VBA Sync: appending harness secret rule to .gitignore"
+            Dim ap
+            Set ap = fso.OpenTextFile(iPath, 8, True)   ' 8 = ForAppending
+            ap.Write vbCrLf & vbCrLf & _
+                     "# excel-control harness VBA password (never commit)" & vbCrLf & _
+                     SECRET_LINE & vbCrLf
+            ap.Close
+        End If
         Exit Sub
     End If
     Debug.Print "VBA Sync: Creating .gitignore"
@@ -662,6 +684,11 @@ Private Sub WriteGitIgnore(basePath As String)
           "# IDE/project folders (optional)" & vbCrLf & _
           ".vs/" & vbCrLf & _
           ".idea/" & vbCrLf
+    ' Second statement: VBA caps line-continuations at 25 per logical
+    ' statement — keep the harness-secret rule split off from the block above.
+    txt = txt & vbCrLf & _
+          "# excel-control harness VBA password (never commit)" & vbCrLf & _
+          SECRET_LINE & vbCrLf
 
     Dim ts
     Set ts = fso.CreateTextFile(iPath, True)
@@ -798,73 +825,160 @@ Private Sub WriteVSCodeSettings(basePath As String)
     ts.Close
 End Sub
 
-' Copies the excel-control PowerShell harness into <repo>/tools/ so an
-' AI agent can drive the workbook via a session protocol. Source files
-' are expected at <xlam_dir>/excel-control/ — present when vba-sync is
-' run from the dev tree or shipped as a release zip with the harness
-' alongside. If the source folder isn't there, this routine silently
-' skips (the rest of the export is unaffected).
+' --- excel-control harness bundling ------------------------------------
+' The harness payload (PowerShell scripts + docs) is embedded in this
+' .xlam as a single CustomXMLPart, so Export can write a complete tools/
+' folder on ANY machine with no dependency on an external excel-control\
+' folder sitting next to the .xlam.
 '
-' Files copied:
-'   tools/start-session.ps1
-'   tools/session-dialog-watcher.ps1
-'   tools/capture.ps1
-'   tools/INTERFACE.md                   (overwritten — always fresh)
-'   tools/clsAssert.cls
-'   tools/.claude/settings.json
-Private Sub WriteHarness(basePath As String)
+'   RefreshHarnessPayload   build time, dev machine:
+'                           excel-control\ + MANIFEST.json  ->  CustomXMLPart
+'   WriteHarness            run time, any machine:
+'                           CustomXMLPart  ->  exported repo
+'
+' Each payload entry carries its own destination, so WriteHarness needs
+' nothing external. Re-run RefreshHarnessPayload whenever a harness file
+' changes, before saving the rebuilt .xlam.
+
+' Build-time. Reads excel-control\MANIFEST.json next to the .xlam,
+' base64-encodes every file it lists, and stores them all in one
+' CustomXMLPart. Public so the .xlam rebuild can invoke it via the
+' excel-control harness (run_macro RefreshHarnessPayload) between
+' sync_vba and save_workbook.
+Public Sub RefreshHarnessPayload()
     Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
     Dim xlamDir As String: xlamDir = ThisWorkbook.Path
     If Right$(xlamDir, 1) <> "\" Then xlamDir = xlamDir & "\"
     Dim srcRoot As String: srcRoot = xlamDir & "excel-control\"
-    If Not fso.FolderExists(srcRoot) Then
-        Debug.Print "VBA Sync: excel-control harness not bundled (skipping tools/)"
+    Dim manifestPath As String: manifestPath = srcRoot & "MANIFEST.json"
+    If Not fso.FileExists(manifestPath) Then
+        Err.Raise vbObjectError + 720, "RefreshHarnessPayload", _
+            "excel-control\MANIFEST.json not found at: " & manifestPath
+    End If
+
+    Dim manifest As Object
+    Set manifest = JsonConverter.ParseJson(ReadAllText(manifestPath))
+    If Not manifest.Exists("files") Then
+        Err.Raise vbObjectError + 721, "RefreshHarnessPayload", _
+            "MANIFEST.json has no 'files' array."
+    End If
+    Dim files As Object: Set files = manifest("files")
+
+    Dim xml As String
+    xml = "<harness xmlns=""" & HARNESS_NS & """>"
+    Dim entry As Variant
+    For Each entry In files
+        Dim srcRel As String: srcRel = CStr(entry("src"))
+        Dim dstRel As String: dstRel = CStr(entry("dst"))
+        Dim srcPath As String: srcPath = srcRoot & Replace(srcRel, "/", "\")
+        If Not fso.FileExists(srcPath) Then
+            Err.Raise vbObjectError + 722, "RefreshHarnessPayload", _
+                "manifest lists a missing file: " & srcPath
+        End If
+        Dim raw() As Byte: raw = ReadFileBytes(srcPath)
+        xml = xml & "<file path=""" & dstRel & """>" & _
+              BytesToBase64(raw) & "</file>"
+    Next
+    xml = xml & "</harness>"
+
+    DeleteHarnessPayload
+    ThisWorkbook.CustomXMLParts.Add xml
+    Debug.Print "VBA Sync: harness payload refreshed (" & _
+                files.Count & " files embedded)"
+End Sub
+
+' Removes any previously embedded harness payload part.
+Private Sub DeleteHarnessPayload()
+    Dim parts As Object
+    Set parts = ThisWorkbook.CustomXMLParts.SelectByNamespace(HARNESS_NS)
+    Dim i As Long
+    For i = parts.Count To 1 Step -1
+        parts(i).Delete
+    Next
+End Sub
+
+' Run-time. Writes the embedded harness payload into the exported repo so
+' an AI agent can drive the workbook via the excel-control session
+' protocol. Each payload entry carries its own destination relative to
+' basePath. If no payload is embedded (an older .xlam), this silently
+' skips and the rest of the export is unaffected.
+Private Sub WriteHarness(basePath As String)
+    Dim parts As Object
+    Set parts = ThisWorkbook.CustomXMLParts.SelectByNamespace(HARNESS_NS)
+    If parts.Count = 0 Then
+        Debug.Print "VBA Sync: excel-control harness payload not embedded (skipping tools/)"
         Exit Sub
     End If
+    Debug.Print "VBA Sync: Writing excel-control harness from embedded payload"
 
-    Dim toolsDir As String: toolsDir = basePath & "tools\"
-    EnsureFolder toolsDir
-    Debug.Print "VBA Sync: Bundling excel-control harness into tools/"
+    Dim dom As Object: Set dom = CreateObject("MSXML2.DOMDocument.6.0")
+    dom.async = False
+    dom.LoadXML parts(1).xml
+    dom.setProperty "SelectionNamespaces", "xmlns:h='" & HARNESS_NS & "'"
 
-    ' Top-level scripts
-    Dim psList As Variant: psList = Array("start-session.ps1", "session-dialog-watcher.ps1", "capture.ps1")
-    Dim i As Long
-    For i = LBound(psList) To UBound(psList)
-        Dim src As String: src = srcRoot & psList(i)
-        Dim dst As String: dst = toolsDir & psList(i)
-        If fso.FileExists(src) Then fso.CopyFile src, dst, True
+    Dim nodes As Object: Set nodes = dom.SelectNodes("//h:file")
+    Dim node As Object
+    For Each node In nodes
+        Dim dst As String: dst = node.getAttribute("path")
+        Dim outPath As String: outPath = basePath & Replace(dst, "/", "\")
+        EnsureFolderTree ParentFolder(outPath)
+        Dim raw() As Byte: raw = Base64ToBytes(node.Text)
+        WriteFileBytes outPath, raw
     Next
+    Debug.Print "VBA Sync: harness written (" & nodes.Length & " files)"
+End Sub
 
-    ' Files under excel-control/tools/
-    Dim toolsSrc As String: toolsSrc = srcRoot & "tools\"
-    If fso.FolderExists(toolsSrc) Then
-        Dim toolFiles As Variant: toolFiles = Array("INTERFACE.md", "clsAssert.cls")
-        For i = LBound(toolFiles) To UBound(toolFiles)
-            Dim s2 As String: s2 = toolsSrc & toolFiles(i)
-            Dim d2 As String: d2 = toolsDir & toolFiles(i)
-            If fso.FileExists(s2) Then fso.CopyFile s2, d2, True
-        Next
-        ' .claude/settings.json under tools/ (scoped permissions for
-        ' the session files agents will be poking at)
-        Dim claudeSrc As String: claudeSrc = toolsSrc & ".claude\settings.json"
-        If fso.FileExists(claudeSrc) Then
-            Dim claudeDir As String: claudeDir = toolsDir & ".claude\"
-            EnsureFolder claudeDir
-            fso.CopyFile claudeSrc, claudeDir & "settings.json", True
-        End If
-    End If
+' Create fPath and any missing parent folders.
+Private Sub EnsureFolderTree(fPath As String)
+    If Len(fPath) = 0 Then Exit Sub
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    If fso.FolderExists(fPath) Then Exit Sub
+    Dim parent As String: parent = fso.GetParentFolderName(fPath)
+    If Len(parent) > 0 Then EnsureFolderTree parent
+    If Not fso.FolderExists(fPath) Then fso.CreateFolder fPath
+End Sub
 
-    ' Claude Code skill at <repo>/.claude/skills/excel-control/SKILL.md so
-    ' the agent auto-discovers the harness when opening this workbook
-    ' repo. Source lives at excel-control/skill/SKILL.md.
-    Dim skillSrc As String: skillSrc = srcRoot & "skill\SKILL.md"
-    If fso.FileExists(skillSrc) Then
-        Dim skillDstDir As String: skillDstDir = basePath & ".claude\skills\excel-control\"
-        EnsureFolder basePath & ".claude\"
-        EnsureFolder basePath & ".claude\skills\"
-        EnsureFolder skillDstDir
-        fso.CopyFile skillSrc, skillDstDir & "SKILL.md", True
-    End If
+' Directory portion of a backslash path (no trailing separator).
+Private Function ParentFolder(path As String) As String
+    Dim p As Long: p = InStrRev(path, "\")
+    If p > 0 Then ParentFolder = Left$(path, p - 1) Else ParentFolder = ""
+End Function
+
+' base64 round-trip via an MSXML node typed bin.base64 (ships with
+' Windows — no extra reference). Byte arrays preserve encoding/BOM.
+Private Function BytesToBase64(bytes() As Byte) As String
+    Dim node As Object
+    Set node = CreateObject("MSXML2.DOMDocument.6.0").createElement("b64")
+    node.DataType = "bin.base64"
+    node.nodeTypedValue = bytes
+    BytesToBase64 = node.Text
+End Function
+
+Private Function Base64ToBytes(b64 As String) As Byte()
+    Dim node As Object
+    Set node = CreateObject("MSXML2.DOMDocument.6.0").createElement("b64")
+    node.DataType = "bin.base64"
+    node.Text = b64
+    Base64ToBytes = node.nodeTypedValue
+End Function
+
+' Raw byte file IO via ADODB.Stream — exact bytes, no codepage coercion.
+Private Function ReadFileBytes(path As String) As Byte()
+    Dim s As Object: Set s = CreateObject("ADODB.Stream")
+    s.Type = 1                  ' adTypeBinary
+    s.Open
+    s.LoadFromFile path
+    ReadFileBytes = s.Read
+    s.Close
+End Function
+
+Private Sub WriteFileBytes(path As String, bytes() As Byte)
+    Dim s As Object: Set s = CreateObject("ADODB.Stream")
+    s.Type = 1                  ' adTypeBinary
+    s.Open
+    s.Write bytes
+    s.SaveToFile path, 2        ' adSaveCreateOverWrite
+    s.Close
 End Sub
 
 ' Map a Windows ANSI codepage number to the VS Code encoding name.
