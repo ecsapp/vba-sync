@@ -201,6 +201,20 @@ against current code before acting.
   before the `try` block; a bad path throws a raw stack trace with no
   `session_error` event. Validate + emit a structured failure first.
 
+## excel-control SKILL.md — deferred doc-review items
+
+From the `skill/SKILL.md` review (2026-05-20). 13 of 15 findings were
+fixed in `a605f1a` / `b178c78`; these two are deferred — they need
+`INTERFACE.md` edits, out of the SKILL.md-only review scope:
+
+- **M4** — `SKILL.md` and `tools/INTERFACE.md` each maintain a separate
+  Quickstart and both repeat the Debug.Print / UserForm / `.frx`
+  limitations near-verbatim. They will drift. Split cleanly: SKILL.md =
+  workflows + decisions; INTERFACE.md = command/event reference. Link,
+  don't repeat.
+- **L5** — the Debug.Print limitation is stated twice (`SKILL.md` and
+  `INTERFACE.md`); pick one home (folds into M4).
+
 ## What not to do
 
 - Don't write parsers for OOXML features without a workbook that
