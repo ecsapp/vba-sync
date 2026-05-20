@@ -29,13 +29,19 @@ param(
     # work. Worksheet screenshots become meaningful (headless mode
     # renders mostly-empty main window). Side-effects: any UI element
     # the agent triggers steals foreground focus from other windows.
-    [switch]$Visible
+    [switch]$Visible,
+    # -VbaPassword: password for a locked VBA project. Without it the
+    # harness cannot sync/compile/test a password-protected VBA project.
+    # Precedence: this param > $env:XC_VBA_PASSWORD > a gitignored
+    # <tools>/.vba-password file. Never commit the secret.
+    [string]$VbaPassword
 )
 
 $ErrorActionPreference = 'Stop'
 
 . (Join-Path $PSScriptRoot 'session-dialog-watcher.ps1')
 . (Join-Path $PSScriptRoot 'capture.ps1')
+. (Join-Path $PSScriptRoot 'unlock-vba-project.ps1')
 
 # Win32 declaration to grab Excel's PID from its HWND
 if (-not ([System.Management.Automation.PSTypeName]'XcSession.Win32').Type) {
@@ -78,6 +84,13 @@ if (Test-Path $stateFile) {
 
 function Write-EventLine([hashtable]$EventObj) {
     $line = ConvertTo-Json -Compress -Depth 10 -InputObject $EventObj
+    # Retry on transient IO contention — the dialog watcher writes the
+    # same events.jsonl from another runspace. Without this a collision
+    # throws and (ErrorActionPreference=Stop) crashes the whole session.
+    for ($i = 0; $i -lt 5; $i++) {
+        try { Add-Content -LiteralPath $eventsFile -Value $line -Encoding UTF8; return }
+        catch { Start-Sleep -Milliseconds 30 }
+    }
     Add-Content -LiteralPath $eventsFile -Value $line -Encoding UTF8
 }
 
@@ -114,7 +127,14 @@ function Read-NewCommands {
                     $obj = $trim | ConvertFrom-Json
                     $results += [pscustomobject]@{ obj = $obj; raw = $trim }
                 } catch {
-                    Write-EventLine @{ t = 'command_error'; error = "Invalid JSON: $($_.Exception.Message)"; raw = $trim }
+                    # H5/M1: a malformed line (e.g. an un-escaped Windows
+                    # path '\U...') still usually carries a parseable "id" —
+                    # scrape it so the sender can correlate the failure
+                    # instead of waiting forever for a result.
+                    $scrapedId = $null
+                    $idMatch = [regex]::Match($trim, '"id"\s*:\s*"([^"]*)"')
+                    if ($idMatch.Success) { $scrapedId = $idMatch.Groups[1].Value }
+                    Write-EventLine @{ t = 'command_error'; id = $scrapedId; error = "Invalid JSON: $($_.Exception.Message)"; raw = $trim }
                 }
             }
         }
@@ -136,6 +156,34 @@ function Invoke-Macro($Xl, [string]$MacroName, [object[]]$MacroArgsArr) {
         $null, $Xl, $all)
 }
 
+
+# Returns the workbook's VBProject ready for VBComponents access, or throws
+# an actionable error. Two distinct failure modes both surface over COM as a
+# null/empty value with an unhelpful message:
+#   1. $Wb.VBProject is $null  -> "Trust access to the VBA project object
+#      model" is disabled in the Excel Trust Center.
+#   2. $Wb.VBProject is non-null but .Protection = vbext_pp_locked (1) and
+#      .VBComponents is $null -> the VBA project is password-locked. The
+#      session auto-unlocks at startup when a password is supplied; this
+#      path is the fallback when it was not (or unlock failed).
+function Get-AccessibleVBProject($Wb) {
+    $proj = $null
+    try { $proj = $Wb.VBProject } catch {}
+    if ($null -eq $proj) {
+        throw "VBA project object model is not accessible. Enable File > " +
+              "Options > Trust Center > Trust Center Settings > Macro " +
+              "Settings > 'Trust access to the VBA project object model'."
+    }
+    $locked = $false
+    try { $locked = ([int]$proj.Protection -ne 0) } catch {}
+    if ($locked -or $null -eq $proj.VBComponents) {
+        throw "VBA project is password-locked (Protection=vbext_pp_locked) " +
+              "- VBComponents is inaccessible over COM. Supply the password " +
+              "via -VbaPassword / `$env:XC_VBA_PASSWORD / tools/.vba-password " +
+              "so the session auto-unlocks the project at startup."
+    }
+    return $proj
+}
 
 function Invoke-SessionCommand($Xl, $Wb, $cmd) {
     switch ($cmd.cmd) {
@@ -177,7 +225,7 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd) {
                     3 { $Xl.Run($macroRef, $macroArgs[0], $macroArgs[1], $macroArgs[2]) }
                     4 { $Xl.Run($macroRef, $macroArgs[0], $macroArgs[1], $macroArgs[2], $macroArgs[3]) }
                     5 { $Xl.Run($macroRef, $macroArgs[0], $macroArgs[1], $macroArgs[2], $macroArgs[3], $macroArgs[4]) }
-                    default { Invoke-Macro -Xl $Xl -MacroName $macroRef -Args $macroArgs }
+                    default { Invoke-Macro -Xl $Xl -MacroName $macroRef -MacroArgsArr $macroArgs }
                 }
                 # Emit one debug_print event per non-empty line.
                 try {
@@ -265,6 +313,14 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd) {
                 # CommandBar control id 578 = "Compile VBAProject"
                 $btn = $Xl.VBE.CommandBars.FindControl([Type]::Missing, 578)
                 if (-not $btn) { throw "Could not find Compile VBAProject control (id 578)" }
+                # "Compile VBAProject" is disabled when the project is already
+                # fully compiled. Execute() on a disabled control throws
+                # "Unexpected HRESULT" — so a disabled control is success:
+                # nothing to compile means no compile errors.
+                if (-not $btn.Enabled) {
+                    Write-EventLine @{ t = 'compile_result'; id = $cmd.id; ok = $true; note = 'already compiled' }
+                    return
+                }
                 $btn.Execute()
                 Start-Sleep -Milliseconds 600
                 # If compile failed, VBE.ActiveCodePane is positioned on the error line.
@@ -302,16 +358,22 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd) {
                 if (-not $sourceDir) { throw "sync_vba requires source_dir" }
                 $resolvedSrc = (Resolve-Path -LiteralPath $sourceDir).Path
 
-                # Optional unlock — defer the import here, no .xlam dependency.
-                if ($cmd.vba_password) {
-                    throw "VBA password unlock is not yet implemented in sync_vba (deferred to a later phase). Unlock manually for now."
+                # Issue 3: a wrong source_dir otherwise looks like an empty
+                # success. Require at least one recognised VBA source folder.
+                $vbaSubdirs = @('Modules','ClassModules','Forms','Objects')
+                $foundSub = @($vbaSubdirs | Where-Object { Test-Path (Join-Path $resolvedSrc $_) })
+                if ($foundSub.Count -eq 0) {
+                    throw ("No VBA source folders ($($vbaSubdirs -join '/')) " +
+                           "found under '$resolvedSrc'. Check source_dir.")
                 }
 
                 $imported = @()
                 $removed  = @()
 
-                # Strip user components (anything not Document, type != 100)
-                $proj = $Wb.VBProject
+                # Strip user components (anything not Document, type != 100).
+                # A password-locked project is unlocked at session startup;
+                # Get-AccessibleVBProject throws an actionable error if not.
+                $proj = Get-AccessibleVBProject $Wb
                 $toRemove = @()
                 foreach ($c in $proj.VBComponents) {
                     if ($c.Type -ne 100) { $toRemove += $c.Name }
@@ -432,13 +494,17 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd) {
         'list_macros' {
             try {
                 $macros = New-Object System.Collections.ArrayList
-                foreach ($comp in $Wb.VBProject.VBComponents) {
+                $proj = Get-AccessibleVBProject $Wb
+                foreach ($comp in $proj.VBComponents) {
                     if ($comp.CodeModule.CountOfLines -eq 0) { continue }
                     $cm = $comp.CodeModule
                     for ($ln = 1; $ln -le $cm.CountOfLines; $ln++) {
                         $line = $cm.Lines($ln, 1).Trim()
                         if ($line -match '^\s*(Public\s+|Private\s+|Friend\s+)?(Sub|Function)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)') {
-                            $vis    = $Matches[1].Trim()
+                            # Group 1 is optional — $Matches[1] is $null for
+                            # a Sub/Function with no Public/Private/Friend
+                            # modifier; coerce to string before .Trim().
+                            $vis    = "$($Matches[1])".Trim()
                             $kind   = $Matches[2]
                             $name   = $Matches[3]
                             $argstr = $Matches[4].Trim()
@@ -520,7 +586,8 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd) {
                 $filter = $cmd.filter
                 # Discover Test_* Subs in any module
                 $tests = New-Object System.Collections.ArrayList
-                foreach ($comp in $Wb.VBProject.VBComponents) {
+                $proj = Get-AccessibleVBProject $Wb
+                foreach ($comp in $proj.VBComponents) {
                     if ($comp.CodeModule.CountOfLines -eq 0) { continue }
                     $cm = $comp.CodeModule
                     for ($ln = 1; $ln -le $cm.CountOfLines; $ln++) {
@@ -674,6 +741,9 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd) {
 # ---------- main ----------
 
 $resolvedWb = (Resolve-Path -LiteralPath $Workbook).Path
+# Snapshot existing EXCEL.EXE PIDs so we can identify the one we create
+# even when $xl.Hwnd is unavailable (a hidden COM Excel can report Hwnd 0).
+$excelPidsBefore = @(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
 $xl = New-Object -ComObject Excel.Application
 $xl.Visible = [bool]$Visible
 $xl.DisplayAlerts = $false
@@ -694,10 +764,58 @@ try {
     # Determine Excel's PID (not our $PID) so the watcher targets the right process.
     # Recorded in state.json so tests / cleanup scripts can identify which
     # EXCEL.EXE belongs to this session — never blanket-kill all Excel.
+    # A hidden COM Excel can report Hwnd = 0/null, so [IntPtr]$xl.Hwnd would
+    # throw "Cannot convert null to type System.IntPtr" — guard it and fall
+    # back to diffing the EXCEL.EXE process list captured before creation.
     $excelPid = [uint32]0
-    [XcSession.Win32]::GetWindowThreadProcessId([IntPtr]$xl.Hwnd, [ref]$excelPid) | Out-Null
+    $xlHwnd = $null
+    try { $xlHwnd = $xl.Hwnd } catch {}
+    if ($xlHwnd) {
+        [XcSession.Win32]::GetWindowThreadProcessId([IntPtr][int]$xlHwnd, [ref]$excelPid) | Out-Null
+    }
+    if (-not $excelPid) {
+        $excelPidNew = @(Get-Process -Name EXCEL -ErrorAction SilentlyContinue |
+                         Where-Object { $excelPidsBefore -notcontains $_.Id } |
+                         Select-Object -ExpandProperty Id)
+        if ($excelPidNew.Count -ge 1) { $excelPid = [uint32]$excelPidNew[0] }
+    }
     $script:ExcelPid = [int]$excelPid
     Save-State 'ready'  # re-save now that we know excel_pid
+
+    # Bug C: a password-locked VBA project is inaccessible over COM
+    # (VBComponents is null) until unlocked, and there is no object-model
+    # method to enter the password. Resolve the password (param > env >
+    # gitignored file) and, if the project is locked, unlock it once here —
+    # before the dialog watcher starts, so the watcher can't race the
+    # VBAProject Password dialog. The unlock persists for the COM session.
+    $vbaPw = $VbaPassword
+    if (-not $vbaPw) { $vbaPw = $env:XC_VBA_PASSWORD }
+    if (-not $vbaPw) {
+        $pwFile = Join-Path $PSScriptRoot '.vba-password'
+        if (Test-Path -LiteralPath $pwFile) {
+            $vbaPw = (Get-Content -LiteralPath $pwFile -Raw).Trim()
+        }
+    }
+    $projLocked = $false
+    try { $projLocked = ([int]$wb.VBProject.Protection -ne 0) } catch {}
+    if ($projLocked) {
+        if ($vbaPw) {
+            $unlocked = $false
+            try {
+                $unlocked = Unlock-VbaProject -Xl $xl -Password $vbaPw -ExcelPid $excelPid
+            } catch {
+                Write-EventLine @{ t = 'vba_unlock_failed'; error = $_.Exception.Message }
+            }
+            if ($unlocked) {
+                Write-EventLine @{ t = 'vba_unlocked' }
+                Write-Host "VBA project unlocked." -ForegroundColor Cyan
+            } elseif (-not $unlocked) {
+                Write-EventLine @{ t = 'vba_unlock_failed'; error = 'Unlock-VbaProject returned false — wrong password, or the password dialog could not be driven.' }
+            }
+        } else {
+            Write-EventLine @{ t = 'vba_unlock_failed'; error = 'VBA project is password-locked but no password was supplied (-VbaPassword / $env:XC_VBA_PASSWORD / tools/.vba-password). sync_vba / compile_check / run_tests / list_macros will fail.' }
+        }
+    }
 
     $watcher = Start-SessionDialogWatcher `
         -ProcessId    $excelPid `

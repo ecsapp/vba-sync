@@ -117,6 +117,10 @@ function Unlock-VbaProject {
     [Parameter(Mandatory=$true)] $Xl,
     [Parameter(Mandatory=$true)] [string]$Password,
     [int]$DialogWaitMs = 2500,
+    # Excel's process id. Pass it when known (the session host already
+    # has it) — a headless COM Excel can report Hwnd 0/null, so deriving
+    # the PID from the Hwnd is unreliable until Excel is made visible.
+    [uint32]$ExcelPid = 0,
     [switch]$Trace
   )
 
@@ -125,74 +129,78 @@ function Unlock-VbaProject {
   if ($Xl.ActiveWorkbook.VBProject.Protection -eq 0) { _trace 'already unlocked'; return $true }
   _trace 'protection=1, starting unlock'
 
-  $xlPid = [uint32]0
-  [VbaUnlock.Win32]::GetWindowThreadProcessId([IntPtr]$Xl.Hwnd, [ref]$xlPid) | Out-Null
-
-  # Both Excel main window and VBE main window must be alive for the
-  # menu item's Execute() to surface the modal Password dialog. Restore
-  # visibility on exit.
+  # Both Excel main window and VBE main window must be alive for the menu
+  # item's Execute() to surface the modal Password dialog. The finally
+  # restores visibility unconditionally — a mid-run failure must not leave
+  # Excel and the VBE on the desktop stealing focus.
   $xlWasVisible  = $Xl.Visible
   $vbeWasVisible = $Xl.VBE.MainWindow.Visible
-  $Xl.Visible = $true
-  Start-Sleep -Milliseconds 300
-  $Xl.VBE.MainWindow.Visible = $true
-  Start-Sleep -Milliseconds 300
-
-  # Control id 2578 = "VBAProject Properties..." in the VBE Tools bar.
-  $ctl = $null
-  try { $ctl = $Xl.VBE.CommandBars.FindControl([Type]::Missing, 2578) } catch { }
-  if ($null -eq $ctl) {
-    _trace 'could not FindControl(2578); falling back to Tools bar lookup'
-    try { $ctl = $Xl.VBE.CommandBars.Item('Tools').Controls.Item(5) } catch { }
-  }
-  if ($null -eq $ctl) {
-    _trace 'no VBAProject Properties control found'
-    $Xl.VBE.MainWindow.Visible = $vbeWasVisible
-    return $false
-  }
-
-  try { $ctl.Execute() } catch { _trace ("Execute threw: " + $_.Exception.Message) }
-
-  $dlg = [IntPtr]::Zero
-  $elapsed = 0
-  while ($elapsed -lt $DialogWaitMs) {
-    Start-Sleep -Milliseconds 150
-    $elapsed += 150
-    $dlg = Find-VbaPasswordDialog -ProcId $xlPid
-    if ($dlg -ne [IntPtr]::Zero) { break }
-  }
-  _trace ("password dialog: 0x{0:X} after {1}ms" -f $dlg.ToInt64(), $elapsed)
-  if ($dlg -eq [IntPtr]::Zero) {
-    $Xl.VBE.MainWindow.Visible = $vbeWasVisible
-    $Xl.Visible = $xlWasVisible
-    return $false
-  }
-
-  Start-Sleep -Milliseconds 250
-  $edit = Find-FirstEditChild -Parent $dlg
-  _trace ("edit child: 0x{0:X}" -f $edit.ToInt64())
-  if ($edit -eq [IntPtr]::Zero) {
-    [VbaUnlock.Win32]::PostMessage($dlg, [VbaUnlock.Win32]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
-    $Xl.VBE.MainWindow.Visible = $vbeWasVisible
-    $Xl.Visible = $xlWasVisible
-    return $false
-  }
-  [VbaUnlock.Win32]::SendMessage($edit, [VbaUnlock.Win32]::WM_SETTEXT, [IntPtr]::Zero, $Password) | Out-Null
-  Start-Sleep -Milliseconds 250
-  [VbaUnlock.Win32]::PostMessage($dlg, [VbaUnlock.Win32]::WM_COMMAND, [IntPtr][VbaUnlock.Win32]::IDOK, [IntPtr]::Zero) | Out-Null
-  Start-Sleep -Milliseconds 600
-
-  # The Properties dialog is now visible beneath; close it.
-  $propDlg = Find-VbaPropertiesDialog -ProcId $xlPid
-  if ($propDlg -ne [IntPtr]::Zero) {
-    [VbaUnlock.Win32]::PostMessage($propDlg, [VbaUnlock.Win32]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+  try {
+    $Xl.Visible = $true
     Start-Sleep -Milliseconds 300
+    $Xl.VBE.MainWindow.Visible = $true
+    Start-Sleep -Milliseconds 300
+
+    # Excel's PID drives the dialog search. Prefer the caller-supplied
+    # value; otherwise derive it from the Hwnd, now valid because Excel
+    # has been made visible above.
+    $xlPid = $ExcelPid
+    if (-not $xlPid) {
+      $h = $null; try { $h = $Xl.Hwnd } catch {}
+      if ($h) { [VbaUnlock.Win32]::GetWindowThreadProcessId([IntPtr][int]$h, [ref]$xlPid) | Out-Null }
+    }
+    if (-not $xlPid) { _trace 'could not determine Excel PID'; return $false }
+
+    # Control id 2578 = "VBAProject Properties..." in the VBE Tools bar.
+    $ctl = $null
+    try { $ctl = $Xl.VBE.CommandBars.FindControl([Type]::Missing, 2578) } catch { }
+    if ($null -eq $ctl) {
+      _trace 'could not FindControl(2578); falling back to Tools bar lookup'
+      try { $ctl = $Xl.VBE.CommandBars.Item('Tools').Controls.Item(5) } catch { }
+    }
+    if ($null -eq $ctl) {
+      _trace 'no VBAProject Properties control found'
+      return $false
+    }
+
+    try { $ctl.Execute() } catch { _trace ("Execute threw: " + $_.Exception.Message) }
+
+    $dlg = [IntPtr]::Zero
+    $elapsed = 0
+    while ($elapsed -lt $DialogWaitMs) {
+      Start-Sleep -Milliseconds 150
+      $elapsed += 150
+      $dlg = Find-VbaPasswordDialog -ProcId $xlPid
+      if ($dlg -ne [IntPtr]::Zero) { break }
+    }
+    _trace ("password dialog: 0x{0:X} after {1}ms" -f $dlg.ToInt64(), $elapsed)
+    if ($dlg -eq [IntPtr]::Zero) { return $false }
+
+    Start-Sleep -Milliseconds 250
+    $edit = Find-FirstEditChild -Parent $dlg
+    _trace ("edit child: 0x{0:X}" -f $edit.ToInt64())
+    if ($edit -eq [IntPtr]::Zero) {
+      [VbaUnlock.Win32]::PostMessage($dlg, [VbaUnlock.Win32]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+      return $false
+    }
+    [VbaUnlock.Win32]::SendMessage($edit, [VbaUnlock.Win32]::WM_SETTEXT, [IntPtr]::Zero, $Password) | Out-Null
+    Start-Sleep -Milliseconds 250
+    [VbaUnlock.Win32]::PostMessage($dlg, [VbaUnlock.Win32]::WM_COMMAND, [IntPtr][VbaUnlock.Win32]::IDOK, [IntPtr]::Zero) | Out-Null
+    Start-Sleep -Milliseconds 600
+
+    # The Properties dialog is now visible beneath; close it.
+    $propDlg = Find-VbaPropertiesDialog -ProcId $xlPid
+    if ($propDlg -ne [IntPtr]::Zero) {
+      [VbaUnlock.Win32]::PostMessage($propDlg, [VbaUnlock.Win32]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+      Start-Sleep -Milliseconds 300
+    }
+
+    $protAfter = $Xl.ActiveWorkbook.VBProject.Protection
+    _trace ("final Protection=$protAfter")
+    return ($protAfter -eq 0)
   }
-
-  $Xl.VBE.MainWindow.Visible = $vbeWasVisible
-  $Xl.Visible = $xlWasVisible
-
-  $protAfter = $Xl.ActiveWorkbook.VBProject.Protection
-  _trace ("final Protection=$protAfter")
-  return ($protAfter -eq 0)
+  finally {
+    try { $Xl.VBE.MainWindow.Visible = $vbeWasVisible } catch {}
+    try { $Xl.Visible = $xlWasVisible } catch {}
+  }
 }
