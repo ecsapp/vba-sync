@@ -15,7 +15,7 @@ instance open; you communicate via two append-only JSONL files:
 `tools/INTERFACE.md` is the full API reference. This file is the guide:
 how to do common things.
 
-### Paths
+## Paths
 
 All paths in this guide are **relative to the workbook root** — the
 folder vba-sync Export wrote, where the harness lives at `./tools/`. If
@@ -31,10 +31,10 @@ runs from the workbook root.
    ```
    pwsh tools/start-session.ps1 -Workbook X.xlsm -SessionId s1
    ```
-   Add `-Visible` to show Excel on the desktop. Use `-Visible` when you
-   need meaningful worksheet screenshots, **or when running an Export**
-   — some workbook structure (frozen panes, view state) can serialize
-   incompletely from an invisible automation Excel.
+   Add `-Visible` to show Excel on the desktop — useful when you need
+   meaningful worksheet screenshots (a headless automation Excel renders
+   a mostly-empty main window). Headless is otherwise fine for every
+   command, Export included.
 2. **Wait for readiness.** The harness emits
    `{"t":"started","pid":...,"excel_pid":...,"session_id":...}` to
    `tools/sessions/s1/events.jsonl` once Excel has opened the workbook —
