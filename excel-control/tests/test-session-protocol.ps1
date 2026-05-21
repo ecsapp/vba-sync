@@ -26,14 +26,10 @@ Start-Sleep -Milliseconds 200
 
 Write-Host "Test: session protocol (SessionId=$SessionId)" -ForegroundColor Cyan
 
-# Spawn the session host in the background. Use Start-Process so the
-# script gets its own PID and a clean COM apartment.
-$proc = Start-Process pwsh -ArgumentList @(
-    '-NoProfile','-File', $startSess,
-    '-Workbook', $workbook,
-    '-SessionId', $SessionId,
-    '-SessionsRoot', $sessions
-) -PassThru -WindowStyle Hidden
+# Spawn the session host in the background — its own PID and a clean
+# COM apartment (Start-SessionHost wraps Start-Process).
+$proc = Start-SessionHost -StartSession $startSess -Workbook $workbook `
+    -SessionId $SessionId -SessionsRoot $sessions
 
 try {
     # Wait for 'started' event

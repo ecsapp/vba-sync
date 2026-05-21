@@ -21,12 +21,8 @@ Start-Sleep -Milliseconds 200
 
 Write-Host "Test: runtime_error (SessionId=$SessionId)" -ForegroundColor Cyan
 
-$proc = Start-Process pwsh -ArgumentList @(
-    '-NoProfile','-File', $startSess,
-    '-Workbook', $workbook,
-    '-SessionId', $SessionId,
-    '-SessionsRoot', $sessions
-) -PassThru -WindowStyle Hidden
+$proc = Start-SessionHost -StartSession $startSess -Workbook $workbook `
+    -SessionId $SessionId -SessionsRoot $sessions
 
 function Read-Events([string]$path) {
     if (-not (Test-Path $path)) { return @() }

@@ -42,10 +42,8 @@ Start-Sleep -Milliseconds 200
 
 Write-Host "Test: run_tests (SessionId=$SessionId)" -ForegroundColor Cyan
 
-$proc = Start-Process pwsh -ArgumentList @(
-    '-NoProfile','-File', $startSess, '-Workbook', $workbook,
-    '-SessionId', $SessionId, '-SessionsRoot', $sessions
-) -PassThru -WindowStyle Hidden
+$proc = Start-SessionHost -StartSession $startSess -Workbook $workbook `
+    -SessionId $SessionId -SessionsRoot $sessions
 
 function Read-Events($p) { if (-not (Test-Path $p)) { return @() }; Get-Content -LiteralPath $p | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json } }
 function Wait-ForEvent($p, $T, $S=15, $Id=$null) {

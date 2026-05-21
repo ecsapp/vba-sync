@@ -80,3 +80,26 @@ function Clear-OrphanSessionExcels {
         } catch {}
     }
 }
+
+function Start-SessionHost {
+    <#
+        .SYNOPSIS
+        Spawn a start-session.ps1 host process for a test.
+
+        Builds one pre-quoted argument string rather than passing
+        -ArgumentList an array: an array does NOT quote elements
+        containing spaces, so a workbook path with a space (e.g.
+        "VBA Sync.xlam") gets split and breaks the host's parameter
+        binding. The host then dies before creating the session dir and
+        the test only sees a missing 'started' event.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$StartSession,
+        [Parameter(Mandatory)][string]$Workbook,
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$SessionsRoot
+    )
+    $argStr = '-NoProfile -File "{0}" -Workbook "{1}" -SessionId "{2}" -SessionsRoot "{3}"' -f `
+        $StartSession, $Workbook, $SessionId, $SessionsRoot
+    return Start-Process pwsh -ArgumentList $argStr -PassThru -WindowStyle Hidden
+}
