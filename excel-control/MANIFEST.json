@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "description": "excel-control harness export manifest. Single source of truth for which files the vba-sync addin ships into a project. Consumed by RefreshHarnessPayload (build time: src files -> CustomXMLPart) and WriteHarness (runtime: CustomXMLPart -> dst). 'src' is relative to excel-control/; 'dst' is relative to the exported repo root.",
   "files": [
     { "src": "start-session.ps1",          "dst": "tools/start-session.ps1" },

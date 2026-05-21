@@ -1,22 +1,41 @@
-# Session-aware dialog watcher. Dot-sourced by start-session.ps1.
+# Session-aware dialog + UserForm watcher. Dot-sourced by start-session.ps1.
 #
-# Runs in a background runspace alongside the main session loop. Polls
-# for #32770 dialogs and UserForm windows owned by Excel's PID. For each
-# new dialog:
-#   1. Assigns an id "d<N>"
-#   2. Writes a `dialog_appeared` (or `userform_appeared`) event
-#   3. Registers the hwnd in a shared map so respond_dialog can find it
+# Runs in a background STA runspace alongside the main session loop. The
+# main loop blocks inside $Xl.Run while a modal MsgBox or UserForm is up;
+# this watcher detects that window and drives it so COM unblocks.
 #
-# Independently polls commands.jsonl for `respond_dialog` commands. On
-# match: looks up the hwnd by dialog_id, dispatches a click via
-# WM_COMMAND → BM_CLICK → VK_RETURN → WM_CLOSE fallback chain. Emits
-# `dialog_dismissed` on success, `respond_failed` on miss.
+# Two window kinds, two interaction paths:
 #
-# If a dialog disappears externally (user closed it, macro ended), emits
-# `dialog_closed_externally` and frees the id.
+#   #32770        - standard dialog / MsgBox / VBA runtime-error box.
+#                   Buttons are real child windows -> WM_COMMAND / BM_CLICK.
+#
+#   ThunderDFrame - MSForms UserForm. Its controls are WINDOWLESS (no
+#                   child HWNDs - EnumChildWindows finds nothing). They
+#                   are driven through MSAA / IAccessible (oleacc.dll),
+#                   the same accessibility layer screen readers use:
+#                   accDoDefaultAction clicks a button, accSelect /
+#                   accDoDefaultAction picks an option button. This works
+#                   cross-process while VBA is blocked on the modal form
+#                   and needs no on-screen position or foreground focus.
+#
+# Window detection uses the window's OWN WS_VISIBLE style, not
+# IsWindowVisible: a dialog owned by a hidden (headless) Excel fails
+# IsWindowVisible because that walks the owner chain to the hidden main
+# window. Checking the window's own style finds it either way - and the
+# same test detects a UserForm dismissed via Me.Hide (window survives,
+# WS_VISIBLE clears).
+#
+# For each new window the watcher assigns id "d<N>", writes a
+# dialog_appeared / userform_appeared event (UserForms carry a controls[]
+# list), and registers it so the commands below can act on it.
+#
+# Commands polled from commands.jsonl (owned here, not by the main loop):
+#   respond_dialog    {dialog_id, button}          - click a button
+#   set_form_control  {dialog_id, control, value}  - set a UserForm
+#                                                    control (radio /
+#                                                    checkbox / text)
 
-if (-not ([System.Management.Automation.PSTypeName]'XcDialog.Win32').Type) {
-  Add-Type @"
+$script:XcWatcherCs = @"
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -27,10 +46,10 @@ namespace XcDialog {
   public static class Win32 {
     [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
     [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern int GetWindowTextLength(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
     [DllImport("user32.dll", SetLastError = true)] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
     [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+    [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
     public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
     [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
@@ -38,16 +57,21 @@ namespace XcDialog {
     [DllImport("user32.dll")] public static extern int GetDlgCtrlID(IntPtr hwndCtl);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
+    [DllImport("oleacc.dll")] public static extern int AccessibleObjectFromWindow(IntPtr hwnd, uint dwId, ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out object ppvObject);
+    [DllImport("oleacc.dll")] public static extern int AccessibleChildren([MarshalAs(UnmanagedType.Interface)] object paccContainer, int iChildStart, int cChildren, [Out] object[] rgvarChildren, out int pcObtained);
     public const uint BM_CLICK = 0x00F5;
     public const uint WM_COMMAND = 0x0111;
     public const uint WM_CLOSE = 0x0010;
-    public const uint WM_KEYDOWN = 0x0100;
-    public const uint WM_KEYUP = 0x0101;
-    public const int VK_RETURN = 0x0D;
+    public const int  GWL_STYLE = -16;
+    public const int  WS_VISIBLE = 0x10000000;
+    public const uint OBJID_CLIENT = 0xFFFFFFFC;
     public const uint PW_RENDERFULLCONTENT = 0x2;
   }
 }
 "@
+
+if (-not ([System.Management.Automation.PSTypeName]'XcDialog.Win32').Type) {
+  Add-Type -TypeDefinition $script:XcWatcherCs
   Add-Type -AssemblyName System.Drawing
 }
 
@@ -71,9 +95,14 @@ function Start-SessionDialogWatcher {
         DialogInfo    = [hashtable]::Synchronized(@{})
         NextId        = 1
         CmdOffset     = 0
+        Cs            = $script:XcWatcherCs
     })
 
     $rs = [runspacefactory]::CreateRunspace()
+    # STA: MSAA / IAccessible COM calls are happiest in a single-threaded
+    # apartment, and the watcher only ever calls OUT to the form, so it
+    # never needs to pump messages for incoming callbacks.
+    $rs.ApartmentState = [System.Threading.ApartmentState]::STA
     $rs.Open()
     $rs.SessionStateProxy.SetVariable('state', $state)
 
@@ -81,40 +110,50 @@ function Start-SessionDialogWatcher {
     $ps.Runspace = $rs
 
     [void]$ps.AddScript({
-        # Re-declare Win32 inside the runspace (includes capture types)
+        # Re-declare the Win32 + oleacc interop inside the runspace.
         if (-not ([System.Management.Automation.PSTypeName]'XcDialog.Win32').Type) {
-            Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-using System.Text;
-namespace XcDialog {
-  [StructLayout(LayoutKind.Sequential)]
-  public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
-  public static class Win32 {
-    [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int count);
-    [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern int GetWindowTextLength(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
-    [DllImport("user32.dll", SetLastError = true)] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-    [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
-    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
-    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
-    [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
-    [DllImport("user32.dll")] public static extern int GetDlgCtrlID(IntPtr hwndCtl);
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-    [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
-    public const uint BM_CLICK = 0x00F5;
-    public const uint WM_COMMAND = 0x0111;
-    public const uint WM_CLOSE = 0x0010;
-    public const uint WM_KEYDOWN = 0x0100;
-    public const uint WM_KEYUP = 0x0101;
-    public const int VK_RETURN = 0x0D;
-    public const uint PW_RENDERFULLCONTENT = 0x2;
-  }
-}
-"@
+            Add-Type -TypeDefinition $state.Cs
             Add-Type -AssemblyName System.Drawing
+        }
+
+        $IID_IAccessible = [Guid]'618736e0-3c3d-11cf-810c-00aa00389b71'
+
+        # MSAA role constants (winuser.h ROLE_SYSTEM_*).
+        $ROLE_WINDOW = 9; $ROLE_CLIENT = 10; $ROLE_PANE = 16
+        $ROLE_GROUPING = 20; $ROLE_PAGETABLIST = 59
+        $ROLE_PUSHBUTTON = 43; $ROLE_CHECKBUTTON = 44; $ROLE_RADIOBUTTON = 45
+        # MSAA state bits.
+        $STATE_UNAVAILABLE = 0x1; $STATE_SELECTED = 0x2
+        $STATE_CHECKED = 0x10; $STATE_INVISIBLE = 0x8000
+
+        # -------- window helpers --------------------------------------
+
+        function Get-WText([IntPtr]$h) {
+            $len = [XcDialog.Win32]::GetWindowTextLength($h)
+            if ($len -le 0) { return '' }
+            $sb = New-Object System.Text.StringBuilder ($len + 1)
+            [XcDialog.Win32]::GetWindowText($h, $sb, $sb.Capacity) | Out-Null
+            return $sb.ToString()
+        }
+        function Get-WClass([IntPtr]$h) {
+            $sb = New-Object System.Text.StringBuilder 256
+            [XcDialog.Win32]::GetClassName($h, $sb, $sb.Capacity) | Out-Null
+            return $sb.ToString()
+        }
+        function Get-WPid([IntPtr]$h) {
+            $p = [uint32]0
+            [XcDialog.Win32]::GetWindowThreadProcessId($h, [ref]$p) | Out-Null
+            return $p
+        }
+        # Is the window itself shown? Checks the window's OWN WS_VISIBLE
+        # style - unlike IsWindowVisible, which also requires every owner
+        # to be visible and so reports $false for a dialog owned by a
+        # hidden (headless) Excel. Also returns $false once a UserForm is
+        # dismissed with Me.Hide (the window survives, WS_VISIBLE clears).
+        function Test-WindowShown([IntPtr]$h) {
+            if (-not [XcDialog.Win32]::IsWindow($h)) { return $false }
+            $style = [XcDialog.Win32]::GetWindowLong($h, [XcDialog.Win32]::GWL_STYLE)
+            return (($style -band [XcDialog.Win32]::WS_VISIBLE) -ne 0)
         }
 
         function Save-DialogPng([int64]$Hwnd, [string]$Path) {
@@ -135,34 +174,16 @@ namespace XcDialog {
             return $Path
         }
 
-        function Get-WText([IntPtr]$h) {
-            $len = [XcDialog.Win32]::GetWindowTextLength($h)
-            if ($len -le 0) { return '' }
-            $sb = New-Object System.Text.StringBuilder ($len + 1)
-            [XcDialog.Win32]::GetWindowText($h, $sb, $sb.Capacity) | Out-Null
-            return $sb.ToString()
-        }
-        function Get-WClass([IntPtr]$h) {
-            $sb = New-Object System.Text.StringBuilder 256
-            [XcDialog.Win32]::GetClassName($h, $sb, $sb.Capacity) | Out-Null
-            return $sb.ToString()
-        }
-        function Get-WPid([IntPtr]$h) {
-            $p = [uint32]0
-            [XcDialog.Win32]::GetWindowThreadProcessId($h, [ref]$p) | Out-Null
-            return $p
-        }
-
+        # Top-level #32770 dialogs and ThunderDFrame UserForms owned by
+        # the session's Excel that are currently shown.
         function Find-Dialogs($targetPid) {
-            $chrome = @('XLMAIN','EXCEL7','XLDESK','wndclass_desked_gsk','NUIDialog','OUTEXVBA','NetUIHWND','MsoCommandBar','MsoCommandBarPopup','MsoWorkPane')
             $found = New-Object System.Collections.ArrayList
             $cb = {
                 param([IntPtr]$h, [IntPtr]$lp)
-                if (-not [XcDialog.Win32]::IsWindowVisible($h)) { return $true }
-                if ((Get-WPid -h $h) -ne $targetPid) { return $true }
                 $cls = Get-WClass -h $h
-                if ($chrome -contains $cls) { return $true }
-                if (-not (Get-WText -h $h)) { return $true }
+                if ($cls -ne '#32770' -and $cls -ne 'ThunderDFrame') { return $true }
+                if ((Get-WPid -h $h) -ne $targetPid) { return $true }
+                if (-not (Test-WindowShown -h $h)) { return $true }
                 [void]$found.Add($h)
                 return $true
             }
@@ -171,7 +192,11 @@ namespace XcDialog {
             return $found
         }
 
+        # -------- #32770 child-window payload -------------------------
+
         function Get-Payload([IntPtr]$dlg) {
+            # Standard dialogs have real child windows: Static = body
+            # text, Button = a clickable button.
             $statics = New-Object System.Collections.ArrayList
             $buttons = New-Object System.Collections.ArrayList
             $cb = {
@@ -190,18 +215,112 @@ namespace XcDialog {
             return [pscustomobject]@{ Body = ($statics -join ' | '); Buttons = $buttons }
         }
 
+        # -------- MSAA / IAccessible (UserForm controls) --------------
+
+        function Get-AccFromWindow([IntPtr]$h) {
+            # OBJID_CLIENT IAccessible for a window; $null on failure.
+            $iid = [Guid]'618736e0-3c3d-11cf-810c-00aa00389b71'
+            $obj = $null
+            try {
+                $hr = [XcDialog.Win32]::AccessibleObjectFromWindow($h, [XcDialog.Win32]::OBJID_CLIENT, [ref]$iid, [ref]$obj)
+                if ($hr -eq 0 -and $obj) { return $obj }
+            } catch {}
+            return $null
+        }
+
+        # Recursively collect leaf controls under an IAccessible
+        # container into $sink as { Name Role State Value Acc ChildId }.
+        # MSForms returns each control as a full child IAccessible
+        # (ChildId 0); a simple element (int childId) is a leaf of its
+        # parent. Containers are recursed; window/client wrappers are
+        # walked but not themselves recorded.
+        function Collect-AccControls($container, [int]$depth, $sink) {
+            if ($depth -gt 6 -or -not $container) { return }
+            $count = 0
+            try { $count = [int]$container.accChildCount } catch { return }
+            if ($count -le 0) { return }
+            $arr = New-Object 'object[]' $count
+            $got = 0
+            try { [void][XcDialog.Win32]::AccessibleChildren($container, 0, $count, $arr, [ref]$got) }
+            catch { return }
+            for ($i = 0; $i -lt $got; $i++) {
+                $raw = $arr[$i]
+                if ($null -eq $raw) { continue }
+                $cAcc = $null; $cId = 0
+                if ($raw -is [int]) { $cAcc = $container; $cId = [int]$raw }
+                else                { $cAcc = $raw;       $cId = 0 }
+
+                $role = 0; $name = ''; $stt = 0; $val = ''
+                try { $role = [int]$cAcc.accRole($cId) }  catch {}
+                try { $n = $cAcc.accName($cId);  if ($n) { $name = [string]$n } } catch {}
+                try { $stt = [int]$cAcc.accState($cId) }  catch {}
+                try { $v = $cAcc.accValue($cId); if ($v) { $val = [string]$v } } catch {}
+
+                if (($stt -band $STATE_INVISIBLE) -eq 0) {
+                    if ($role -ne $ROLE_WINDOW -and $role -ne $ROLE_CLIENT) {
+                        [void]$sink.Add([pscustomobject]@{
+                            Name = $name; Role = $role; State = $stt
+                            Value = $val; Acc = $cAcc; ChildId = $cId
+                        })
+                    }
+                }
+                # Recurse into full-object containers only (a simple
+                # element has no children and re-walking its parent
+                # would loop).
+                if ($cId -eq 0 -and ($role -eq $ROLE_WINDOW -or $role -eq $ROLE_CLIENT -or `
+                    $role -eq $ROLE_PANE -or $role -eq $ROLE_GROUPING -or $role -eq $ROLE_PAGETABLIST)) {
+                    Collect-AccControls $cAcc ($depth + 1) $sink
+                }
+            }
+        }
+
+        function Get-FormControls([IntPtr]$hwnd) {
+            $sink = New-Object System.Collections.ArrayList
+            $root = Get-AccFromWindow $hwnd
+            if ($root) { Collect-AccControls $root 0 $sink }
+            return $sink
+        }
+
+        function Get-RoleName([int]$r) {
+            switch ($r) {
+                43 { 'button' } 44 { 'checkbox' } 45 { 'radiobutton' }
+                42 { 'text' }   46 { 'combobox' } 41 { 'label' }
+                33 { 'list' }   34 { 'listitem' } 20 { 'grouping' }
+                16 { 'pane' }   50 { 'spinbutton' } 60 { 'pagetab' }
+                default { "role$r" }
+            }
+        }
+
+        function Norm([string]$s) { return (($s -replace '&', '').Trim().ToLower()) }
+
+        # Serialise the control list for a userform_appeared event.
+        function Format-Controls($controls) {
+            $arr = @()
+            foreach ($c in $controls) {
+                $checked = ((($c.State -band $STATE_CHECKED) -ne 0) -or (($c.State -band $STATE_SELECTED) -ne 0))
+                $enabled = (($c.State -band $STATE_UNAVAILABLE) -eq 0)
+                $arr += [pscustomobject]@{
+                    name    = $c.Name
+                    role    = (Get-RoleName ([int]$c.Role))
+                    value   = $c.Value
+                    checked = $checked
+                    enabled = $enabled
+                }
+            }
+            return ,$arr
+        }
+
         function Wait-Closed([IntPtr]$h, [int]$timeoutMs) {
             $end = [DateTime]::UtcNow.AddMilliseconds($timeoutMs)
             while ([DateTime]::UtcNow -lt $end) {
-                if (-not [XcDialog.Win32]::IsWindow($h)) { return $true }
-                if (-not [XcDialog.Win32]::IsWindowVisible($h)) { return $true }
+                if (-not (Test-WindowShown $h)) { return $true }
                 Start-Sleep -Milliseconds 50
             }
             return $false
         }
 
         function Write-SessionEvent([hashtable]$ev) {
-            $line = $ev | ConvertTo-Json -Compress -Depth 10
+            $line = $ev | ConvertTo-Json -Compress -Depth 12
             for ($i = 0; $i -lt 5; $i++) {
                 try { Add-Content -LiteralPath $state.EventsFile -Value $line -Encoding UTF8; return }
                 catch { Start-Sleep -Milliseconds 30 }
@@ -209,7 +328,8 @@ namespace XcDialog {
             Add-Content -LiteralPath $state.EventsFile -Value $line -Encoding UTF8
         }
 
-        function Read-RespondCommands {
+        function Read-WatcherCommands {
+            # respond_dialog + set_form_control are owned by this runspace.
             $out = New-Object System.Collections.ArrayList
             if (-not (Test-Path $state.CommandsFile)) { return $out }
             $fs = [System.IO.File]::Open($state.CommandsFile, 'Open', 'Read', 'ReadWrite')
@@ -224,7 +344,9 @@ namespace XcDialog {
                     if ($trim) {
                         try {
                             $obj = $trim | ConvertFrom-Json
-                            if ($obj.cmd -eq 'respond_dialog') { [void]$out.Add($obj) }
+                            if ($obj.cmd -eq 'respond_dialog' -or $obj.cmd -eq 'set_form_control') {
+                                [void]$out.Add($obj)
+                            }
                         } catch {}
                     }
                 }
@@ -234,44 +356,119 @@ namespace XcDialog {
             return $out
         }
 
-        function Send-DialogClick($dialogInfo, [string]$buttonLabel) {
-            $hwnd = [IntPtr]$dialogInfo.Hwnd
+        # -------- click / set actions ---------------------------------
+
+        # #32770: post WM_COMMAND to the button's control id, then
+        # BM_CLICK, then (no match) WM_CLOSE.
+        function Send-DialogClick($info, [string]$buttonLabel) {
+            $hwnd = [IntPtr]$info.Hwnd
+            $want = Norm $buttonLabel
             $target = $null
-            foreach ($b in $dialogInfo.Buttons) {
-                if ($b.Caption.Trim().ToLower() -eq $buttonLabel.ToLower()) { $target = $b; break }
+            foreach ($b in $info.Buttons) {
+                if ((Norm $b.Caption) -eq $want) { $target = $b; break }
             }
             $closed = $false
             if ($target) {
                 $ctrlId = [XcDialog.Win32]::GetDlgCtrlID([IntPtr]$target.Hwnd)
                 if ($ctrlId -ne 0) {
-                    [XcDialog.Win32]::PostMessage($hwnd, [XcDialog.Win32]::WM_COMMAND, [IntPtr]$ctrlId, [IntPtr]$target.Hwnd) | Out-Null
-                    $closed = Wait-Closed -h $hwnd -timeoutMs 800
+                    [void][XcDialog.Win32]::PostMessage($hwnd, [XcDialog.Win32]::WM_COMMAND, [IntPtr]$ctrlId, [IntPtr]$target.Hwnd)
+                    $closed = Wait-Closed $hwnd 800
                 }
                 if (-not $closed) {
-                    [XcDialog.Win32]::PostMessage([IntPtr]$target.Hwnd, [XcDialog.Win32]::BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
-                    $closed = Wait-Closed -h $hwnd -timeoutMs 800
+                    [void][XcDialog.Win32]::PostMessage([IntPtr]$target.Hwnd, [XcDialog.Win32]::BM_CLICK, [IntPtr]::Zero, [IntPtr]::Zero)
+                    $closed = Wait-Closed $hwnd 800
                 }
             }
-            if (-not $closed) {
-                # UserForm with Forms.CommandButton — VK_RETURN fires Default click handler
-                [XcDialog.Win32]::PostMessage($hwnd, [XcDialog.Win32]::WM_KEYDOWN, [IntPtr][XcDialog.Win32]::VK_RETURN, [IntPtr]0) | Out-Null
-                [XcDialog.Win32]::PostMessage($hwnd, [XcDialog.Win32]::WM_KEYUP,   [IntPtr][XcDialog.Win32]::VK_RETURN, [IntPtr]0) | Out-Null
-                $closed = Wait-Closed -h $hwnd -timeoutMs 1200
+            if ($closed) { return [pscustomobject]@{ Ok = $true; Reason = $null; Available = @() } }
+            if (-not $target) {
+                $avail = @($info.Buttons | ForEach-Object { $_.Caption })
+                return [pscustomobject]@{ Ok = $false; Reason = 'button_not_found'; Available = $avail }
             }
-            if (-not $closed) {
-                [XcDialog.Win32]::PostMessage($hwnd, [XcDialog.Win32]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
-                $closed = Wait-Closed -h $hwnd -timeoutMs 800
-            }
-            return $closed
+            return [pscustomobject]@{ Ok = $false; Reason = 'dialog_did_not_close'; Available = @() }
         }
 
-        # ---- main loop ----
+        # ThunderDFrame: click a UserForm button via MSAA.
+        function Send-FormClick([IntPtr]$hwnd, [string]$buttonLabel) {
+            $controls = Get-FormControls $hwnd
+            $want = Norm $buttonLabel
+            $target = $null
+            foreach ($c in $controls) {
+                if ([int]$c.Role -ne $ROLE_PUSHBUTTON) { continue }
+                if ((Norm $c.Name) -eq $want) { $target = $c; break }
+            }
+            if (-not $target) {
+                $avail = @($controls | Where-Object { [int]$_.Role -eq $ROLE_PUSHBUTTON } | ForEach-Object { $_.Name })
+                return [pscustomobject]@{ Ok = $false; Reason = 'button_not_found'; Available = $avail }
+            }
+            try { [void]$target.Acc.accDoDefaultAction($target.ChildId) }
+            catch { return [pscustomobject]@{ Ok = $false; Reason = ('invoke_failed: ' + $_.Exception.Message); Available = @() } }
+            $closed = Wait-Closed $hwnd 1500
+            if ($closed) { return [pscustomobject]@{ Ok = $true; Reason = $null; Available = @() } }
+            return [pscustomobject]@{ Ok = $false; Reason = 'form_did_not_close'; Available = @() }
+        }
+
+        # ThunderDFrame: set a UserForm control via MSAA. Radio buttons
+        # are selected; checkboxes toggled to the requested bool; text /
+        # combobox set best-effort through accValue.
+        function Set-FormControl([IntPtr]$hwnd, [string]$controlName, $value) {
+            $controls = Get-FormControls $hwnd
+            $want = Norm $controlName
+            $target = $null
+            foreach ($c in $controls) {
+                if ((Norm $c.Name) -eq $want) { $target = $c; break }
+            }
+            if (-not $target) {
+                return [pscustomobject]@{ Ok = $false; Reason = 'control_not_found'
+                    Available = @($controls | ForEach-Object { $_.Name }) }
+            }
+            $sv = ''
+            if ($null -ne $value) { $sv = [string]$value }
+            # Empty / true-ish means select-or-check; explicit false unchecks.
+            $desired = ($sv -eq '') -or ($sv -match '^(?i:true|1|yes|on|checked|selected)$')
+            $role = [int]$target.Role
+            $stt  = [int]$target.State
+            try {
+                if ($role -eq $ROLE_RADIOBUTTON) {
+                    $isSel = ((($stt -band $STATE_SELECTED) -ne 0) -or (($stt -band $STATE_CHECKED) -ne 0))
+                    if (-not $isSel) { [void]$target.Acc.accDoDefaultAction($target.ChildId) }
+                }
+                elseif ($role -eq $ROLE_CHECKBUTTON) {
+                    $isChk = (($stt -band $STATE_CHECKED) -ne 0)
+                    if ($desired -ne $isChk) { [void]$target.Acc.accDoDefaultAction($target.ChildId) }
+                }
+                elseif ($role -eq $ROLE_PUSHBUTTON) {
+                    [void]$target.Acc.accDoDefaultAction($target.ChildId)
+                }
+                else {
+                    # text box / combobox - best effort
+                    $target.Acc.accValue($target.ChildId) = $sv
+                }
+            } catch {
+                return [pscustomobject]@{ Ok = $false; Reason = ('set_failed: ' + $_.Exception.Message); Available = @() }
+            }
+            Start-Sleep -Milliseconds 90
+            # Re-read so the event reports the control's resulting state.
+            $now = $null
+            foreach ($c in (Get-FormControls $hwnd)) {
+                if ((Norm $c.Name) -eq $want) { $now = $c; break }
+            }
+            $chk = $false; $vv = ''
+            if ($now) {
+                $ns = [int]$now.State
+                $chk = ((($ns -band $STATE_CHECKED) -ne 0) -or (($ns -band $STATE_SELECTED) -ne 0))
+                $vv = [string]$now.Value
+            }
+            return [pscustomobject]@{ Ok = $true; Reason = $null
+                Role = (Get-RoleName $role); Checked = $chk; Value = $vv }
+        }
+
+        # -------- main loop -------------------------------------------
         while (-not $state.Stop) {
             $dialogs = Find-Dialogs -targetPid $state.ProcessId
             $stillActive = @{}
             foreach ($d in $dialogs) { $stillActive[([IntPtr]$d).ToInt64()] = $true }
 
-            # New dialogs
+            # New windows
             foreach ($d in $dialogs) {
                 $hwnd = [IntPtr]$d
                 $key  = $hwnd.ToInt64()
@@ -279,39 +476,50 @@ namespace XcDialog {
 
                 $caption = Get-WText -h $hwnd
                 $cls     = Get-WClass -h $hwnd
-                $payload = Get-Payload -dlg $hwnd
+                $isForm  = ($cls -eq 'ThunderDFrame')
+
+                $bodyText    = ''
+                $buttonNames = @()
+                $controlList = @()
+                $childButtons = $null
+
+                if ($isForm) {
+                    $formControls = Get-FormControls $hwnd
+                    $controlList  = Format-Controls $formControls
+                    $buttonNames  = @($formControls | Where-Object { [int]$_.Role -eq 43 } | ForEach-Object { $_.Name })
+                    $bodyText     = (@($formControls | Where-Object { [int]$_.Role -eq 41 } | ForEach-Object { $_.Name }) -join ' | ')
+                } else {
+                    $payload      = Get-Payload -dlg $hwnd
+                    $bodyText     = $payload.Body
+                    $buttonNames  = @($payload.Buttons | ForEach-Object { $_.Caption })
+                    $childButtons = $payload.Buttons
+                }
 
                 $id = "d$($state.NextId)"
                 $state.NextId++
                 $state.ActiveDialogs[$key] = $id
                 $state.DialogInfo[$id] = [pscustomobject]@{
                     Hwnd    = $hwnd.ToInt64()
-                    Buttons = $payload.Buttons
+                    Class   = $cls
                     Caption = $caption
+                    Buttons = $childButtons   # #32770 only; $null for forms
                 }
 
-                $buttonNames = @($payload.Buttons | ForEach-Object { $_.Caption })
-                # Classify the dialog. VBA's "Microsoft Visual Basic"
-                # runtime-error dialog has buttons &Continue / &End /
-                # &Debug / &Help. We turn it into a structured
-                # `runtime_error` event AND auto-dispatch End (the macro
-                # is unrecoverable from outside).
-                #
-                # Detection: caption == "Microsoft Visual Basic" is the
-                # strong signal — works for any error format including
-                # negative codes (vbObjectError-based) and the
-                # "N (hexcode)" rendering of those.
-                $isRtError = ($caption -eq 'Microsoft Visual Basic')
+                # The VBA runtime-error dialog is a #32770 captioned
+                # "Microsoft Visual Basic" with &Continue / &End / &Debug.
+                # It is unrecoverable from outside the VBA runtime, so we
+                # emit a structured runtime_error and auto-dispatch End.
+                $isRtError = ((-not $isForm) -and ($caption -eq 'Microsoft Visual Basic'))
                 $rtNum  = 0
-                $rtDesc = $payload.Body
-                if ($isRtError -and $payload.Body -match "Run-time error '(-?\d+)(?:\s*\([0-9A-Fa-f]+\))?'\s*[:\.]?\s*(.*)$") {
+                $rtDesc = $bodyText
+                if ($isRtError -and $bodyText -match "Run-time error '(-?\d+)(?:\s*\([0-9A-Fa-f]+\))?'\s*[:\.]?\s*(.*)$") {
                     $rtNum  = [int64]$Matches[1]
                     $rtDesc = $Matches[2].Trim()
                 }
                 $eventType =
-                    if ($isRtError) { 'runtime_error' }
-                    elseif ($cls -eq 'ThunderDFrame' -or $cls -like 'F3*' -or $cls -like 'bosa*') { 'userform_appeared' }
-                    else { 'dialog_appeared' }
+                    if     ($isRtError) { 'runtime_error' }
+                    elseif ($isForm)    { 'userform_appeared' }
+                    else                { 'dialog_appeared' }
 
                 $shotPath = $null
                 $shotErr  = $null
@@ -322,33 +530,31 @@ namespace XcDialog {
                 } catch { $shotPath = $null; $shotErr = $_.Exception.Message }
 
                 $ev = @{
-                    t = $eventType
-                    id = $id
-                    title = $caption
-                    text = $payload.Body
-                    buttons = $buttonNames
-                    class = $cls
+                    t          = $eventType
+                    id         = $id
+                    title      = $caption
+                    text       = $bodyText
+                    buttons    = $buttonNames
+                    class      = $cls
                     screenshot = $shotPath
                 }
-                if ($shotErr) { $ev.screenshot_error = $shotErr }
+                if ($isForm)   { $ev.controls = $controlList }
+                if ($shotErr)  { $ev.screenshot_error = $shotErr }
                 if ($isRtError) {
                     $ev.number = $rtNum
                     $ev.description = $rtDesc
                 }
                 Write-SessionEvent $ev
 
-                # For runtime errors, immediately dispatch End so the macro
-                # returns to COM and PowerShell unblocks. The agent can't
-                # respond to a runtime-error mid-macro anyway.
                 if ($isRtError) {
                     $info = $state.DialogInfo[$id]
-                    $null = Send-DialogClick -dialogInfo $info -buttonLabel '&End'
+                    $null = Send-DialogClick $info '&End'
                     [void]$state.ActiveDialogs.Remove($key)
                     [void]$state.DialogInfo.Remove($id)
                 }
             }
 
-            # Externally-closed dialogs
+            # Externally-closed windows
             $toRemove = @()
             foreach ($key in @($state.ActiveDialogs.Keys)) {
                 if (-not $stillActive.ContainsKey([int64]$key)) { $toRemove += $key }
@@ -360,23 +566,51 @@ namespace XcDialog {
                 Write-SessionEvent @{ t = 'dialog_closed_externally'; id = $id }
             }
 
-            # respond_dialog commands
-            $cmds = Read-RespondCommands
+            # respond_dialog / set_form_control commands
+            $cmds = Read-WatcherCommands
             foreach ($cmd in $cmds) {
-                Write-SessionEvent @{ t = 'command_ack'; id = $cmd.id; cmd = 'respond_dialog' }
+                Write-SessionEvent @{ t = 'command_ack'; id = $cmd.id; cmd = $cmd.cmd }
                 $dialogId = $cmd.dialog_id
                 $info = $state.DialogInfo[$dialogId]
-                if (-not $info) {
-                    Write-SessionEvent @{ t = 'respond_failed'; id = $cmd.id; dialog_id = $dialogId; reason = 'unknown_or_closed_dialog' }
-                    continue
+
+                if ($cmd.cmd -eq 'respond_dialog') {
+                    if (-not $info) {
+                        Write-SessionEvent @{ t = 'respond_failed'; id = $cmd.id; dialog_id = $dialogId; reason = 'unknown_or_closed_dialog' }
+                        continue
+                    }
+                    if ($info.Class -eq 'ThunderDFrame') {
+                        $r = Send-FormClick ([IntPtr]$info.Hwnd) $cmd.button
+                    } else {
+                        $r = Send-DialogClick $info $cmd.button
+                    }
+                    if ($r.Ok) {
+                        Write-SessionEvent @{ t = 'dialog_dismissed'; id = $cmd.id; dialog_id = $dialogId; button = $cmd.button }
+                        [void]$state.ActiveDialogs.Remove([int64]$info.Hwnd)
+                        [void]$state.DialogInfo.Remove($dialogId)
+                    } else {
+                        $ev = @{ t = 'respond_failed'; id = $cmd.id; dialog_id = $dialogId; reason = $r.Reason }
+                        if ($r.Available -and $r.Available.Count -gt 0) { $ev.available = $r.Available }
+                        Write-SessionEvent $ev
+                    }
                 }
-                $closed = Send-DialogClick -dialogInfo $info -buttonLabel $cmd.button
-                if ($closed) {
-                    Write-SessionEvent @{ t = 'dialog_dismissed'; id = $cmd.id; dialog_id = $dialogId; button = $cmd.button }
-                    [void]$state.ActiveDialogs.Remove([int64]$info.Hwnd)
-                    [void]$state.DialogInfo.Remove($dialogId)
-                } else {
-                    Write-SessionEvent @{ t = 'respond_failed'; id = $cmd.id; dialog_id = $dialogId; reason = 'dialog_did_not_close' }
+                elseif ($cmd.cmd -eq 'set_form_control') {
+                    if (-not $info) {
+                        Write-SessionEvent @{ t = 'form_control_failed'; id = $cmd.id; dialog_id = $dialogId; control = $cmd.control; reason = 'unknown_or_closed_dialog' }
+                        continue
+                    }
+                    if ($info.Class -ne 'ThunderDFrame') {
+                        Write-SessionEvent @{ t = 'form_control_failed'; id = $cmd.id; dialog_id = $dialogId; control = $cmd.control; reason = 'not_a_userform' }
+                        continue
+                    }
+                    $r = Set-FormControl ([IntPtr]$info.Hwnd) $cmd.control $cmd.value
+                    if ($r.Ok) {
+                        Write-SessionEvent @{ t = 'form_control_set'; id = $cmd.id; dialog_id = $dialogId
+                            control = $cmd.control; role = $r.Role; checked = $r.Checked; value = $r.Value }
+                    } else {
+                        $ev = @{ t = 'form_control_failed'; id = $cmd.id; dialog_id = $dialogId; control = $cmd.control; reason = $r.Reason }
+                        if ($r.Available -and $r.Available.Count -gt 0) { $ev.available = $r.Available }
+                        Write-SessionEvent $ev
+                    }
                 }
             }
 

@@ -116,7 +116,7 @@ function Build-UserForm([string]$Path) {
         $designer = $form.Designer
         $form.Properties.Item('Caption').Value = 'Login'
         $form.Properties.Item('Width').Value  = 240
-        $form.Properties.Item('Height').Value = 160
+        $form.Properties.Item('Height').Value = 210
 
         $lblU = $designer.Controls.Add('Forms.Label.1', 'lblUsername')
         $lblU.Left = 12; $lblU.Top = 12; $lblU.Width = 60; $lblU.Caption = 'Username:'
@@ -134,13 +134,22 @@ function Build-UserForm([string]$Path) {
         $chk = $designer.Controls.Add('Forms.CheckBox.1', 'RememberMe')
         $chk.Left = 80; $chk.Top = 66; $chk.Width = 130; $chk.Caption = 'Remember me'
 
+        # Two option buttons (mutually exclusive — same default group). The
+        # MSAA test selects one via set_form_control; option buttons are
+        # windowless MSForms controls, the case the MSAA path exists for.
+        $optU = $designer.Controls.Add('Forms.OptionButton.1', 'optUnits')
+        $optU.Left = 80; $optU.Top = 90; $optU.Width = 130; $optU.Caption = 'Units'
+
+        $optUT = $designer.Controls.Add('Forms.OptionButton.1', 'optUnitsTime')
+        $optUT.Left = 80; $optUT.Top = 112; $optUT.Width = 130; $optUT.Caption = 'Units / Time'
+
         $btnOK = $designer.Controls.Add('Forms.CommandButton.1', 'cmdOK')
-        $btnOK.Left = 50; $btnOK.Top = 100; $btnOK.Width = 70; $btnOK.Height = 24
+        $btnOK.Left = 50; $btnOK.Top = 150; $btnOK.Width = 70; $btnOK.Height = 24
         $btnOK.Caption = 'OK'
         $btnOK.Default = $true
 
         $btnCancel = $designer.Controls.Add('Forms.CommandButton.1', 'cmdCancel')
-        $btnCancel.Left = 130; $btnCancel.Top = 100; $btnCancel.Width = 70; $btnCancel.Height = 24
+        $btnCancel.Left = 130; $btnCancel.Top = 150; $btnCancel.Width = 70; $btnCancel.Height = 24
         $btnCancel.Caption = 'Cancel'
         $btnCancel.Cancel = $true
 

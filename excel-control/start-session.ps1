@@ -193,6 +193,10 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd) {
             # in case the dispatch routing changes.
             return
         }
+        'set_form_control' {
+            # Owned by the dialog watcher (separate runspace) — see above.
+            return
+        }
         'run_macro' {
             $start = [DateTime]::UtcNow
             # Drain the VBE Immediate window before running so we only emit
@@ -830,8 +834,10 @@ try {
         $cmds = Read-NewCommands
         foreach ($entry in $cmds) {
             $cmd = $entry.obj
-            # respond_dialog is owned by the watcher runspace — skip in main
-            if ($cmd.cmd -eq 'respond_dialog') { continue }
+            # respond_dialog / set_form_control are owned by the watcher
+            # runspace (they act on a live modal window while the main
+            # loop is blocked in $Xl.Run) — skip them here.
+            if ($cmd.cmd -eq 'respond_dialog' -or $cmd.cmd -eq 'set_form_control') { continue }
             Write-EventLine @{ t = 'command_ack'; id = $cmd.id; cmd = $cmd.cmd }
             Save-State 'busy'
             Invoke-SessionCommand -Xl $xl -Wb $wb -cmd $cmd

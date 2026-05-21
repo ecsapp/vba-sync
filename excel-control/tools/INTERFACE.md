@@ -72,14 +72,25 @@ and `cmd` (the command name).
 `range` can be a single anchor cell (e.g., `"A1"`) — `write_range`
 auto-resizes to the input dimensions.
 
-### Dialog response
+### Dialog & UserForm response
 
 | Command | Body | Result event |
 |---------|------|--------------|
 | `respond_dialog` | `dialog_id`, `button` | `dialog_dismissed` or `respond_failed` |
+| `set_form_control` | `dialog_id`, `control`, `value` | `form_control_set` or `form_control_failed` |
 
-For UserForms (`class: "ThunderDFrame"`) where `buttons` is empty, the
-VK_RETURN fallback fires the Default button's click handler.
+`respond_dialog` clicks a button by caption — it works for both `#32770`
+dialogs and `ThunderDFrame` UserForms (MSForms controls are windowless,
+so they are driven via MSAA / IAccessible — the accessibility layer, not
+window messages). Match a caption from the `buttons[]` of the
+`dialog_appeared` / `userform_appeared` event; `&` accelerators are
+ignored.
+
+`set_form_control` sets one UserForm control — typically before you
+click OK. A radio button (`control` = its caption) is selected; a
+checkbox is toggled to `value` (`true`/`false`); a text box / combobox
+is set to `value` (best-effort). Read the `controls[]` list on
+`userform_appeared` to see every control's name, role and state.
 
 ### Workbook state
 
@@ -138,10 +149,11 @@ Every command produces a `command_ack` first.
 | `calculated` / `refreshed_all` / `connection_refreshed` / `connection_failed` | varies | calc/refresh |
 | `macros_listed` / `sheets_listed` / `workbook_info` | see above | introspection |
 | `sync_completed` / `sync_failed` | see above | sync_vba |
-| `dialog_appeared` / `userform_appeared` | `id`, `title`, `text`, `buttons[]`, `class`, `screenshot` | unsolicited modal observed |
+| `dialog_appeared` / `userform_appeared` | `id`, `title`, `text`, `buttons[]`, `class`, `screenshot`; UserForms also `controls[]` — each `name`, `role`, `value`, `checked`, `enabled` | unsolicited modal observed |
 | `dialog_dismissed` | `id` (command id), `dialog_id`, `button` | watcher dispatched click |
 | `dialog_closed_externally` | `id` (dialog id) | dialog vanished without `respond_dialog` |
-| `respond_failed` | `id`, `dialog_id`, `reason` | dispatch couldn't close dialog |
+| `respond_failed` | `id`, `dialog_id`, `reason`, on a missing button `available[]` | dispatch couldn't close dialog |
+| `form_control_set` / `form_control_failed` | `id`, `dialog_id`, `control`; on success `role`/`checked`/`value`; on fail `reason` (+ `available[]`) | `set_form_control` result |
 | `runtime_error` | `id` (dialog id), `number`, `description`, `text`, `screenshot` | VBA runtime-error dialog auto-End'd |
 | `closing` / `closed` | `id` (for `closing`) | end-of-session |
 | `session_error` | `error`, `stack` | session crashed |
@@ -161,6 +173,24 @@ Every command produces a `command_ack` first.
 // then:
 {"t":"dialog_dismissed","id":"c2","dialog_id":"d1","button":"Yes"}
 {"t":"macro_completed","id":"c1","name":"AskOverwrite"}
+```
+
+### Drive a UserForm (pick an option, click OK)
+
+```jsonc
+{"id":"c1","cmd":"run_macro","name":"SyncToolPush"}
+// watch for the UserForm, with its controls:
+{"t":"userform_appeared","id":"d1","title":"Resource Units Mode","class":"ThunderDFrame",
+ "buttons":["OK","Cancel"],
+ "controls":[{"name":"Units","role":"radiobutton","checked":false,"enabled":true},
+             {"name":"Units/Time","role":"radiobutton","checked":false,"enabled":true},
+             {"name":"OK","role":"button","checked":false,"enabled":true}]}
+// select the option, then click OK:
+{"id":"c2","cmd":"set_form_control","dialog_id":"d1","control":"Units","value":"true"}
+// → {"t":"form_control_set","id":"c2","dialog_id":"d1","control":"Units","role":"radiobutton","checked":true}
+{"id":"c3","cmd":"respond_dialog","dialog_id":"d1","button":"OK"}
+// → {"t":"dialog_dismissed","id":"c3","dialog_id":"d1","button":"OK"}
+{"t":"macro_completed","id":"c1","name":"SyncToolPush"}
 ```
 
 ### Diagnose a compile error, fix, retry
@@ -201,11 +231,13 @@ what the agent is doing instead of being surprised by stray dialogs.
   output doesn't surface in `VBE.Windows("Immediate").CodePane`. The
   capture code is in place but yields no events in headless mode.
   Use a custom logger that writes to a file if you need runtime output.
-- **UserForm field introspection** — `Controls(name).Value` for a
-  running modal UserForm isn't reachable from outside the VBA runtime.
-  Field-level read/write isn't supported. `respond_dialog` fires the
-  form's Default button via VK_RETURN; for input forms, build a VBA
-  wrapper that pre-fills them before showing.
+- **UserForm text boxes** — buttons, radio buttons and checkboxes on a
+  modal UserForm are fully driven via MSAA (see `set_form_control`).
+  Setting a **text box / combobox** value goes through `accValue`, which
+  some MSForms edit controls expose read-only — `set_form_control`
+  reports `form_control_failed` (`set_failed: …`) when that happens. For
+  a form that must be pre-filled with text, a VBA wrapper that seeds the
+  fields before `.Show` is still the most reliable route.
 - **`.frx` non-determinism** — Excel's UserForm binary writer is
   non-deterministic. Separate work item being tracked outside this
   harness.

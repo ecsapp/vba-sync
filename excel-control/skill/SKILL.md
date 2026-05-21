@@ -99,6 +99,33 @@ macro continues.
 {"t":"macro_completed","id":"c1","name":"RefreshFromDB","result":null}
 ```
 
+### Drive a UserForm
+
+A macro that shows a UserForm (`ThunderDFrame`) emits `userform_appeared`
+with a `controls[]` list. MSForms UserForm controls are **windowless**, so
+the watcher enumerates them via MSAA (the accessibility layer). Select an
+option button / toggle a checkbox / set a text box with `set_form_control`,
+then click a button with `respond_dialog` — resolved by caption.
+
+```jsonc
+{"id":"c1","cmd":"run_macro","name":"ShowResourceForm"}
+// →
+{"t":"userform_appeared","id":"d1","class":"ThunderDFrame","controls":[{"name":"Units","role":"radiobutton","checked":false,"enabled":true},{"name":"Units / Time","role":"radiobutton","checked":false},{"name":"OK","role":"pushbutton"},{"name":"Cancel","role":"pushbutton"}],"screenshot":"..."}
+// select an option button (or toggle a checkbox / set a text box):
+{"id":"c2","cmd":"set_form_control","dialog_id":"d1","control":"Units","value":true}
+// → {"t":"form_control_set","id":"c2","dialog_id":"d1","control":"Units","role":"radiobutton","checked":true}
+// then click a button by caption:
+{"id":"c3","cmd":"respond_dialog","dialog_id":"d1","button":"OK"}
+// → {"t":"dialog_dismissed","id":"c3","dialog_id":"d1","button":"OK"}
+{"t":"macro_completed","id":"c1","name":"ShowResourceForm"}
+```
+
+`set_form_control` `value` is truthy/falsy for radios and checkboxes
+(`true` selects / checks); for a text box it's the string to write. It
+works cross-process while VBA is blocked on the modal form — no
+on-screen position or foreground focus needed. On a miss the watcher
+emits `form_control_failed` with a `reason` and an `available` list.
+
 ### Diagnose and fix a runtime error
 
 When a macro hits an unhandled error, Excel's "Microsoft Visual Basic"
@@ -370,13 +397,6 @@ unused one.
       Close #1
   End Sub
   ```
-
-- **UserForm field introspection** — modal UserForm `Controls(name).Value`
-  isn't reachable from outside the VBA runtime. `respond_dialog` fires
-  the form's Default button via VK_RETURN. For forms with input
-  fields, either (a) wrap the form-show in a VBA Sub that pre-fills
-  fields, or (b) take a screenshot via `screenshot target=form:<id>`
-  and read it visually.
 
 - **`.frx` non-determinism** — Excel's UserForm binary writer is
   non-deterministic; .frx files differ between consecutive saves
