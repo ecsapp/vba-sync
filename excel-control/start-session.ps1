@@ -208,6 +208,69 @@ function Get-AccessibleVBProject($Wb) {
     return $proj
 }
 
+# item 5 — drive vba-sync's own Import/Export (sheet-safe, unlike the
+# naive sync_vba). Runs the addin's arg-less HarnessImport/HarnessExport
+# and pre-arms the addin's success MsgBox so the run needs no round-trip.
+function Invoke-VbaSyncOp($Xl, $Wb, $cmd) {
+    $op = $cmd.cmd   # 'import' or 'export'
+    try {
+        $macro  = if ($op -eq 'export') { 'HarnessExport' } else { 'HarnessImport' }
+        $okText = "$op completed successfully"
+
+        # Ensure VBA Sync.xlam is loaded. Do not trust the Excel addin
+        # registration to locate it — a stale registered path breaks
+        # Application.Run name resolution; open it from the install path.
+        $xlamWb = $null
+        foreach ($w in $Xl.Workbooks) { if ($w.Name -eq 'VBA Sync.xlam') { $xlamWb = $w; break } }
+        if (-not $xlamWb) {
+            $xlamPath = Join-Path $env:APPDATA 'Microsoft\AddIns\VBA Sync.xlam'
+            if (-not (Test-Path -LiteralPath $xlamPath)) {
+                throw "VBA Sync.xlam not found at $xlamPath"
+            }
+            [void]$Xl.Workbooks.Open($xlamPath, [Type]::Missing, $false, [Type]::Missing,
+                                     [Type]::Missing, [Type]::Missing, $true)
+        }
+
+        # The addin targets ActiveWorkbook (TargetWB) — make it the session wb.
+        $Wb.Activate()
+
+        # Pre-arm the addin's completion MsgBox (item 4) so the run is
+        # hands-free. Addin error dialogs are deliberately NOT armed — they
+        # surface as dialog_appeared and the op then reports failure.
+        $armId  = "$($cmd.id)-arm"
+        $armCmd = @{ id = $armId; cmd = 'arm_response'; match = @{ text = $okText }; button = 'OK' } |
+                  ConvertTo-Json -Compress
+        Add-Content -LiteralPath $commandsFile -Value $armCmd -Encoding UTF8
+
+        if ($script:Watcher) { $script:Watcher.State.MacroRunning = $true }
+        $t0 = [DateTime]::UtcNow
+        try {
+            $Xl.Run("'VBA Sync.xlam'!modSync.$macro")
+        } finally {
+            if ($script:Watcher) { $script:Watcher.State.MacroRunning = $false }
+        }
+        $durMs = [int]([DateTime]::UtcNow - $t0).TotalMilliseconds
+
+        # Success iff the armed completion dialog fired during the run.
+        $ok = $false
+        try {
+            foreach ($line in (Get-Content -LiteralPath $eventsFile)) {
+                if ($line -match '"t":"dialog_auto_responded"' -and
+                    $line -match ([regex]::Escape('"rule_id":"' + $armId + '"'))) { $ok = $true; break }
+            }
+        } catch {}
+
+        if ($ok) {
+            Write-EventLine @{ t = "${op}_completed"; id = $cmd.id; duration_ms = $durMs }
+        } else {
+            Write-EventLine @{ t = "${op}_failed"; id = $cmd.id; duration_ms = $durMs
+                error = "vba-sync $op did not report success — an addin error dialog likely surfaced (see dialog_appeared)" }
+        }
+    } catch {
+        Write-EventLine @{ t = "${op}_failed"; id = $cmd.id; error = $_.Exception.Message }
+    }
+}
+
 function Invoke-SessionCommand($Xl, $Wb, $cmd) {
     switch ($cmd.cmd) {
         'respond_dialog' {
@@ -771,6 +834,8 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd) {
                 Write-EventLine @{ t = 'close_workbook_failed'; id = $cmd.id; error = $_.Exception.Message }
             }
         }
+        'import' { Invoke-VbaSyncOp -Xl $Xl -Wb $Wb -cmd $cmd }
+        'export' { Invoke-VbaSyncOp -Xl $Xl -Wb $Wb -cmd $cmd }
         'close' {
             Write-EventLine @{ t = 'closing'; id = $cmd.id }
             $script:Stop = $true

@@ -130,12 +130,24 @@ at machine speed.
 
 | Command | Body | Result event |
 |---------|------|--------------|
+| `import` | — | `import_completed` (`duration_ms`) or `import_failed` |
+| `export` | — | `export_completed` (`duration_ms`) or `export_failed` |
 | `sync_vba` | `source_dir` | `sync_completed` with `imported[]`, `removed[]` |
 
-Strip user VBComponents and re-import `.bas`/`.cls`/`.frm` from
-`source_dir` following the vba-sync convention (`Modules/`,
-`ClassModules/`, `Forms/`, `Objects/`). Pure-PowerShell — no
-`VBA Sync.xlam` runtime dependency.
+`import` / `export` drive the **vba-sync addin's own** ImportProject /
+ExportProject (`VBA Sync.xlam`). This is the **recommended, sheet-safe**
+path: the addin replaces document / worksheet code-behind modules
+line-by-line, so sheet modules survive. The harness loads `VBA Sync.xlam`
+from `%APPDATA%\Microsoft\AddIns\` if it is not already open, activates
+the session workbook, and auto-dismisses the addin's success dialog; an
+addin error dialog (e.g. workbook not saved) instead surfaces as
+`dialog_appeared` and the op reports `*_failed`.
+
+`sync_vba` is a lower-level pure-PowerShell primitive — it strips user
+VBComponents and re-imports `.bas`/`.cls`/`.frm` from `source_dir`
+(`Modules/`, `ClassModules/`, `Forms/`, `Objects/`), no `VBA Sync.xlam`
+dependency. **It imports `Objects/` sheet code-behind as orphan standard
+modules** — use `import` for any workbook with worksheet code.
 
 ### Lifecycle
 
@@ -162,6 +174,8 @@ Every command produces a `command_ack` first. Every event also carries a
 | `calculated` / `refreshed_all` / `connection_refreshed` / `connection_failed` | varies | calc/refresh |
 | `macros_listed` / `sheets_listed` / `workbook_info` | see above | introspection |
 | `sync_completed` / `sync_failed` | see above | sync_vba |
+| `import_completed` / `export_completed` | `id`, `duration_ms` | `import` / `export` |
+| `import_failed` / `export_failed` | `id`, `error`, optional `duration_ms` | `import` / `export` error |
 | `dialog_appeared` / `userform_appeared` | `id`, `title`, `text`, `buttons[]`, `class`, `screenshot`; UserForms also `controls[]` — each `name`, `role`, `value`, `checked`, `enabled` | unsolicited modal observed |
 | `dialog_dismissed` | `id` (command id), `dialog_id`, `button` | watcher dispatched click |
 | `dialog_auto_responded` | `dialog_id`, `rule_id`, `button`, `ok` | a pre-armed rule matched and clicked (follows `dialog_appeared`) |

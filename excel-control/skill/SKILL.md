@@ -185,10 +185,13 @@ drives a VBE **Reset** to end the break.
 
 Fix loop:
 1. Read the offending module to find the error site (you may need to
-   `list_macros` first to know which modules exist, or `sync_vba` from
-   your source-on-disk and then `compile_check`).
+   `list_macros` first to know which modules exist).
 2. Edit the `.bas` / `.cls` on disk.
-3. `sync_vba` to push the fix into the running Excel.
+3. Push the fix into the running Excel: **`import`** drives vba-sync's
+   own importer and is **sheet-safe** (worksheet code-behind survives).
+   `sync_vba` is a lower-level alternative — faster, no `VBA Sync.xlam`
+   dependency — but it mangles `Objects/` sheet modules, so only use it
+   for workbooks with no worksheet code.
 4. `compile_check` — confirm no parse errors.
 5. `run_macro` again.
 

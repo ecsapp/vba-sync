@@ -101,6 +101,16 @@ Public Sub ImportProject(control As Object)
     DoImportProject
 End Sub
 
+' Arg-less entry points for the excel-control harness — run_macro cannot
+' synthesise the ribbon `control` arg of ImportProject / ExportProject.
+Public Sub HarnessExport()
+    DoExportProject
+End Sub
+
+Public Sub HarnessImport()
+    DoImportProject
+End Sub
+
 '====================  MAIN ROUTINES  ======================
 Private Sub DoExportAddin()
     Dim wb As Workbook: Set wb = ThisWorkbook
