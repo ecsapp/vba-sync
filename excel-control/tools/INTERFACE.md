@@ -78,6 +78,8 @@ auto-resizes to the input dimensions.
 |---------|------|--------------|
 | `respond_dialog` | `dialog_id`, `button` | `dialog_dismissed` or `respond_failed` |
 | `set_form_control` | `dialog_id`, `control`, `value` | `form_control_set` or `form_control_failed` |
+| `arm_response` | `match` (`{title?,text?}`), `button`, optional `repeat` | `response_armed` or `arm_failed` |
+| `arm_form_control` | `match`, optional `control`+`value`, optional `button`, optional `repeat` | `response_armed` or `arm_failed` |
 
 `respond_dialog` clicks a button by caption — it works for both `#32770`
 dialogs and `ThunderDFrame` UserForms (MSForms controls are windowless,
@@ -91,6 +93,16 @@ click OK. A radio button (`control` = its caption) is selected; a
 checkbox is toggled to `value` (`true`/`false`); a text box / combobox
 is set to `value` (best-effort). Read the `controls[]` list on
 `userform_appeared` to see every control's name, role and state.
+
+`arm_response` / `arm_form_control` pre-queue a dialog answer. A rule
+matches a future dialog by case-insensitive `title` / `text` substring
+(dialog ids are dynamic, so cannot be pre-targeted); when the watcher
+surfaces a matching dialog it clicks **immediately** — no
+`dialog_appeared` → agent → `respond_dialog` round-trip — and emits
+`dialog_auto_responded`. Rules are one-shot unless `repeat` is given;
+first-armed wins on a tie; an unmatched dialog still falls through to the
+normal agent-driven path. Arm rules up front and a scripted run proceeds
+at machine speed.
 
 ### Workbook state
 
@@ -133,7 +145,8 @@ Strip user VBComponents and re-import `.bas`/`.cls`/`.frm` from
 
 ## Events
 
-Every command produces a `command_ack` first.
+Every command produces a `command_ack` first. Every event also carries a
+`ts` field — a UTC timestamp, `yyyy-MM-ddTHH:mm:ss.fffZ`.
 
 | Event | Fields | When |
 |-------|--------|------|
@@ -151,6 +164,8 @@ Every command produces a `command_ack` first.
 | `sync_completed` / `sync_failed` | see above | sync_vba |
 | `dialog_appeared` / `userform_appeared` | `id`, `title`, `text`, `buttons[]`, `class`, `screenshot`; UserForms also `controls[]` — each `name`, `role`, `value`, `checked`, `enabled` | unsolicited modal observed |
 | `dialog_dismissed` | `id` (command id), `dialog_id`, `button` | watcher dispatched click |
+| `dialog_auto_responded` | `dialog_id`, `rule_id`, `button`, `ok` | a pre-armed rule matched and clicked (follows `dialog_appeared`) |
+| `response_armed` / `arm_failed` | `id`; on success `kind`, `repeat`; on fail `reason` | `arm_response` / `arm_form_control` result |
 | `dialog_closed_externally` | `id` (dialog id) | dialog vanished without `respond_dialog` |
 | `dialog_activated` | `polls` (consecutive deferred polls) | `-Visible` mode only — watcher brought Excel to the foreground to surface a modal it had deferred |
 | `respond_failed` | `id`, `dialog_id`, `reason`, on a missing button `available[]` | dispatch couldn't close dialog |

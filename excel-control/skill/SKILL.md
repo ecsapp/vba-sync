@@ -103,6 +103,31 @@ macro continues.
 {"t":"macro_completed","id":"c1","name":"RefreshFromDB","result":null}
 ```
 
+### Pre-arm dialog responses for a scripted run
+
+When you already know the answers — a Refresh/Diff/Push sequence with
+known prompts — `arm_response` queues them so the watcher clicks the
+instant each dialog surfaces, with no agent round-trip. The run then
+proceeds at machine speed.
+
+```jsonc
+// arm the answers up front, then start the macro:
+{"id":"a1","cmd":"arm_response","match":{"text":"Overwrite existing"},"button":"Yes"}
+{"id":"a2","cmd":"arm_response","match":{"title":"VBA Sync","text":"completed"},"button":"OK"}
+{"id":"c1","cmd":"run_macro","name":"SyncToolPush"}
+// → each armed dialog is clicked the moment it surfaces:
+{"t":"dialog_appeared","id":"d1","title":"Microsoft Excel","text":"Overwrite existing data?"}
+{"t":"dialog_auto_responded","dialog_id":"d1","rule_id":"a1","button":"Yes","ok":true}
+{"t":"macro_completed","id":"c1","name":"SyncToolPush"}
+```
+
+`match` is a case-insensitive substring on the dialog `title` and/or
+`text` — supply either or both. Rules are one-shot (pass `repeat` for a
+fixed count); first-armed wins if two could match. A dialog no rule
+matches still falls through to the normal `respond_dialog` path. For a
+UserForm, `arm_form_control` arms an optional control set plus a button
+click.
+
 ### Drive a UserForm
 
 A macro that shows a UserForm (`ThunderDFrame`) emits `userform_appeared`

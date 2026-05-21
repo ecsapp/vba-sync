@@ -376,6 +376,9 @@ function Start-SessionDialogWatcher {
         }
 
         function Write-SessionEvent([hashtable]$ev) {
+            if (-not $ev.ContainsKey('ts')) {
+                $ev['ts'] = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+            }
             $line = $ev | ConvertTo-Json -Compress -Depth 12
             for ($i = 0; $i -lt 5; $i++) {
                 try { Add-Content -LiteralPath $state.EventsFile -Value $line -Encoding UTF8; return }
@@ -400,7 +403,7 @@ function Start-SessionDialogWatcher {
                     if ($trim) {
                         try {
                             $obj = $trim | ConvertFrom-Json
-                            if ($obj.cmd -eq 'respond_dialog' -or $obj.cmd -eq 'set_form_control') {
+                            if ($obj.cmd -in 'respond_dialog','set_form_control','arm_response','arm_form_control') {
                                 [void]$out.Add($obj)
                             }
                         } catch {}
@@ -518,9 +521,24 @@ function Start-SessionDialogWatcher {
                 Role = (Get-RoleName $role); Checked = $chk; Value = $vv }
         }
 
+        # Does an armed-response rule match a surfaced dialog? (item 4b)
+        function Test-RuleMatch($rule, [string]$caption, [string]$body) {
+            $m = $rule.Match
+            if (-not $m) { return $false }
+            $okTitle = $true; $okText = $true
+            if ($m.title) {
+                $okTitle = ($caption.IndexOf([string]$m.title, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+            }
+            if ($m.text) {
+                $okText = ($body.IndexOf([string]$m.text, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+            }
+            return ($okTitle -and $okText)
+        }
+
         # -------- main loop -------------------------------------------
         $deferredPolls   = 0
         $lastActivateUtc = [DateTime]::MinValue
+        $armedRules      = New-Object System.Collections.ArrayList
         while (-not $state.Stop) {
             $dialogs = Find-Dialogs -targetPid $state.ProcessId
             $stillActive = @{}
@@ -609,6 +627,35 @@ function Start-SessionDialogWatcher {
                     $null = Send-DialogClick $info '&End'
                     [void]$state.ActiveDialogs.Remove($key)
                     [void]$state.DialogInfo.Remove($id)
+                } else {
+                    # Pre-armed response (item 4b): first matching rule
+                    # auto-clicks the dialog, no agent round-trip.
+                    foreach ($rule in @($armedRules)) {
+                        if ($rule.Repeat -le 0) { continue }
+                        if ($rule.Kind -eq 'form_control' -and -not $isForm) { continue }
+                        if (-not (Test-RuleMatch $rule $caption $bodyText)) { continue }
+                        $info = $state.DialogInfo[$id]
+                        if ($rule.Kind -eq 'form_control') {
+                            if ($rule.Control) {
+                                $null = Set-FormControl ([IntPtr]$info.Hwnd) $rule.Control $rule.Value
+                            }
+                            if ($rule.Button) { $ar = Send-FormClick ([IntPtr]$info.Hwnd) $rule.Button }
+                            else              { $ar = [pscustomobject]@{ Ok = $true } }
+                        } elseif ($isForm) {
+                            $ar = Send-FormClick ([IntPtr]$info.Hwnd) $rule.Button
+                        } else {
+                            $ar = Send-DialogClick $info $rule.Button
+                        }
+                        $rule.Repeat = $rule.Repeat - 1
+                        if ($rule.Repeat -le 0) { [void]$armedRules.Remove($rule) }
+                        Write-SessionEvent @{ t = 'dialog_auto_responded'; dialog_id = $id
+                            rule_id = $rule.Id; button = $rule.Button; ok = [bool]$ar.Ok }
+                        if ($ar.Ok) {
+                            [void]$state.ActiveDialogs.Remove($key)
+                            [void]$state.DialogInfo.Remove($id)
+                        }
+                        break
+                    }
                 }
             }
 
@@ -668,6 +715,27 @@ function Start-SessionDialogWatcher {
                         $ev = @{ t = 'form_control_failed'; id = $cmd.id; dialog_id = $dialogId; control = $cmd.control; reason = $r.Reason }
                         if ($r.Available -and $r.Available.Count -gt 0) { $ev.available = $r.Available }
                         Write-SessionEvent $ev
+                    }
+                }
+                elseif ($cmd.cmd -eq 'arm_response' -or $cmd.cmd -eq 'arm_form_control') {
+                    $m = $cmd.match
+                    if (-not $m -or (-not $m.title -and -not $m.text)) {
+                        Write-SessionEvent @{ t = 'arm_failed'; id = $cmd.id; reason = 'match requires title and/or text' }
+                    } else {
+                        $rep = 1
+                        if ($cmd.repeat) { try { $rep = [int]$cmd.repeat } catch {} }
+                        if ($rep -lt 1) { $rep = 1 }
+                        $rule = @{
+                            Id      = $cmd.id
+                            Kind    = $(if ($cmd.cmd -eq 'arm_form_control') { 'form_control' } else { 'response' })
+                            Match   = $m
+                            Button  = $cmd.button
+                            Control = $cmd.control
+                            Value   = $cmd.value
+                            Repeat  = $rep
+                        }
+                        [void]$armedRules.Add($rule)
+                        Write-SessionEvent @{ t = 'response_armed'; id = $cmd.id; kind = $rule.Kind; repeat = $rep }
                     }
                 }
             }

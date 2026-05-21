@@ -96,6 +96,9 @@ if (Test-Path $stateFile) {
 }
 
 function Write-EventLine([hashtable]$EventObj) {
+    if (-not $EventObj.ContainsKey('ts')) {
+        $EventObj['ts'] = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    }
     $line = ConvertTo-Json -Compress -Depth 10 -InputObject $EventObj
     # Retry on transient IO contention — the dialog watcher writes the
     # same events.jsonl from another runspace. Without this a collision
@@ -863,10 +866,11 @@ try {
         $cmds = Read-NewCommands
         foreach ($entry in $cmds) {
             $cmd = $entry.obj
-            # respond_dialog / set_form_control are owned by the watcher
-            # runspace (they act on a live modal window while the main
-            # loop is blocked in $Xl.Run) — skip them here.
-            if ($cmd.cmd -eq 'respond_dialog' -or $cmd.cmd -eq 'set_form_control') { continue }
+            # respond_dialog / set_form_control / arm_response /
+            # arm_form_control are owned by the watcher runspace (they act
+            # on a live modal while the main loop is blocked in $Xl.Run) —
+            # skip them here.
+            if ($cmd.cmd -in 'respond_dialog','set_form_control','arm_response','arm_form_control') { continue }
             Write-EventLine @{ t = 'command_ack'; id = $cmd.id; cmd = $cmd.cmd }
             Save-State 'busy'
             Invoke-SessionCommand -Xl $xl -Wb $wb -cmd $cmd
