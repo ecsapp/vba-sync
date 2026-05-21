@@ -168,6 +168,21 @@ structured `runtime_error` event with the number and description.
 {"t":"macro_failed","id":"c1","name":"BuildReport","error":"..."}
 ```
 
+For the **exact failing line**, add `debug_on_error:true` to `run_macro`
+(use a `-Visible` session — the VBE break window is what gets captured).
+On a runtime error the watcher clicks **Debug** instead of End, drops
+into break mode, emits `runtime_error_break` with the `module`, `line`
+and `source_context` of the error site plus a VBE screenshot, then
+drives a VBE **Reset** to end the break.
+
+```jsonc
+{"id":"c1","cmd":"run_macro","name":"SyncToolPush","debug_on_error":true}
+// →
+{"t":"runtime_error_break","id":"d1","number":10,"description":"This array is fixed or temporarily locked","module":"SyncTool","line":1580,"source_context":">> 1580: ...","screenshot":"..."}
+{"t":"break_recovered","id":"d1","reset":true}
+{"t":"macro_failed","id":"c1","name":"SyncToolPush","error":"..."}
+```
+
 Fix loop:
 1. Read the offending module to find the error site (you may need to
    `list_macros` first to know which modules exist, or `sync_vba` from

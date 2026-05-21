@@ -58,7 +58,7 @@ and `cmd` (the command name).
 
 | Command | Body | Result event |
 |---------|------|--------------|
-| `run_macro` | `name`, optional `args[]` | `macro_completed` with `result`, `duration_ms` |
+| `run_macro` | `name`, optional `args[]`, optional `debug_on_error` | `macro_completed` with `result`, `duration_ms` |
 | `compile_check` | — | `compile_result` with `ok` and on fail: `module`, `line`, `source_context` |
 | `run_tests` | optional `filter` (regex on Test_* name) | one `test_result` per test + `tests_completed` summary |
 
@@ -171,6 +171,8 @@ Every command produces a `command_ack` first. Every event also carries a
 | `respond_failed` | `id`, `dialog_id`, `reason`, on a missing button `available[]` | dispatch couldn't close dialog |
 | `form_control_set` / `form_control_failed` | `id`, `dialog_id`, `control`; on success `role`/`checked`/`value`; on fail `reason` (+ `available[]`) | `set_form_control` result |
 | `runtime_error` | `id` (dialog id), `number`, `description`, `text`, `screenshot` | VBA runtime-error dialog auto-End'd |
+| `runtime_error_break` | `id`, `number`, `description`, VBE `screenshot`; on a successful read `module`, `line`, `source_context` (else `read_error`) | `run_macro` `debug_on_error` — error captured in break mode |
+| `break_recovered` | `id`, `reset` (bool) | break mode ended after a `runtime_error_break` capture |
 | `closing` / `closed` | `id` (for `closing`) | end-of-session |
 | `session_error` | `error`, `stack` | session crashed |
 | `command_error` | `error`, `raw` | invalid JSON in commands.jsonl |

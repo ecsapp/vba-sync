@@ -245,9 +245,13 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd) {
                 # resolution was failing with "Parameter not optional"
                 # when passing args that VBA's Variant parameters
                 # accept. Splat by arity (most macros take 0-5 args).
-                # Flag the macro in flight so the dialog watcher can rescue
-                # a deferred modal in -Visible mode (item 2).
-                if ($script:Watcher) { $script:Watcher.State.MacroRunning = $true }
+                # Flag the macro in flight (item 2 deferred-modal rescue),
+                # and whether a runtime error should drop into break mode
+                # for capture instead of auto-End (item 3 debug_on_error).
+                if ($script:Watcher) {
+                    $script:Watcher.State.MacroRunning = $true
+                    $script:Watcher.State.DebugOnError = [bool]$cmd.debug_on_error
+                }
                 try {
                     $result = switch ($macroArgs.Count) {
                         0 { $Xl.Run($macroRef) }
@@ -259,7 +263,10 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd) {
                         default { Invoke-Macro -Xl $Xl -MacroName $macroRef -MacroArgsArr $macroArgs }
                     }
                 } finally {
-                    if ($script:Watcher) { $script:Watcher.State.MacroRunning = $false }
+                    if ($script:Watcher) {
+                        $script:Watcher.State.MacroRunning = $false
+                        $script:Watcher.State.DebugOnError = $false
+                    }
                 }
                 # Emit one debug_print event per non-empty line.
                 try {
@@ -857,7 +864,8 @@ try {
         -EventsFile   $eventsFile `
         -CommandsFile $commandsFile `
         -CapturesDir  $capturesDir `
-        -Visible      ([bool]$Visible)
+        -Visible      ([bool]$Visible) `
+        -XlApp        $xl
     $script:Watcher     = $watcher
     $script:CapturesDir = $capturesDir
     $script:SessionDir  = $sessionDir

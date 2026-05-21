@@ -78,6 +78,9 @@ namespace XcDialog {
     public const uint WM_NULL = 0x0000;
     public const uint SMTO_ABORTIFHUNG = 0x0002;
     public const int  SW_RESTORE = 9;
+    // item 3 — PID-guarded ROT fallback to reach the harness Excel for
+    // the break-site read (Marshal.GetActiveObject is absent in .NET 6+).
+    [DllImport("oleaut32.dll", PreserveSig = false)] public static extern void GetActiveObject(ref Guid rclsid, IntPtr pvReserved, [MarshalAs(UnmanagedType.IUnknown)] out object ppunk);
   }
 }
 "@
@@ -94,7 +97,8 @@ function Start-SessionDialogWatcher {
         [Parameter(Mandatory=$true)] [string]$CommandsFile,
         [Parameter(Mandatory=$true)] [string]$CapturesDir,
         [int]$PollMs = 200,
-        [bool]$Visible = $false
+        [bool]$Visible = $false,
+        [object]$XlApp = $null
     )
 
     $state = [hashtable]::Synchronized(@{
@@ -106,6 +110,9 @@ function Start-SessionDialogWatcher {
         PollMs        = $PollMs
         MacroRunning  = $false
         Visible       = $Visible
+        BreakMode     = $false
+        DebugOnError  = $false
+        XlApp         = $XlApp
         ActiveDialogs = [hashtable]::Synchronized(@{})
         DialogInfo    = [hashtable]::Synchronized(@{})
         NextId        = 1
@@ -246,6 +253,89 @@ function Start-SessionDialogWatcher {
                     [void][XcDialog.Win32]::AttachThreadInput($ourTid, $fgTid, $false)
                 }
             }
+        }
+
+        # -------- item 3: debug-on-error -----------------------------
+
+        # The VBE top-level window (class wndclass_desked_gsk) for the PID.
+        function Find-VbeMain([uint32]$targetPid) {
+            $found = New-Object System.Collections.ArrayList
+            $cb = {
+                param([IntPtr]$h, [IntPtr]$lp)
+                if ((Get-WClass -h $h) -eq 'wndclass_desked_gsk' -and (Get-WPid -h $h) -eq $targetPid) {
+                    [void]$found.Add($h); return $false
+                }
+                return $true
+            }
+            $del = [XcDialog.Win32+EnumWindowsProc]$cb
+            [XcDialog.Win32]::EnumWindows($del, [IntPtr]::Zero) | Out-Null
+            if ($found.Count -gt 0) { return [IntPtr]$found[0] }
+            return [IntPtr]::Zero
+        }
+
+        # The session's Excel as a COM object: the ref passed at watcher
+        # creation, else a PID-verified ROT lookup. $null rather than ever
+        # return a foreign Excel (the ROT holds every running instance).
+        function Get-WatcherXl {
+            if ($state.XlApp) {
+                try { $null = $state.XlApp.Name; return $state.XlApp } catch {}
+            }
+            try {
+                $clsid = [Guid]'00024500-0000-0000-C000-000000000046'
+                $obj = $null
+                [XcDialog.Win32]::GetActiveObject([ref]$clsid, [IntPtr]::Zero, [ref]$obj)
+                if ($obj) {
+                    $p = [uint32]0
+                    [void][XcDialog.Win32]::GetWindowThreadProcessId([IntPtr][int64]$obj.Hwnd, [ref]$p)
+                    if ($p -eq $state.ProcessId) { return $obj }
+                }
+            } catch {}
+            return $null
+        }
+
+        # Tier A2 — structured break-site read via VBE.ActiveCodePane,
+        # the same GetSelection + CodeModule.Lines compile_check uses.
+        function Read-BreakSite {
+            $xl = Get-WatcherXl
+            if (-not $xl) { return @{ Error = 'no COM ref to the session Excel' } }
+            try {
+                $pane = $xl.VBE.ActiveCodePane
+                if (-not $pane) { return @{ Error = 'no ActiveCodePane' } }
+                $cm = $pane.CodeModule
+                $sL = 0; $sC = 0; $eL = 0; $eC = 0
+                [void]$pane.GetSelection([ref]$sL, [ref]$sC, [ref]$eL, [ref]$eC)
+                $a = [Math]::Max(1, $sL - 3)
+                $b = [Math]::Min($cm.CountOfLines, $sL + 3)
+                $ctx = @()
+                for ($i = $a; $i -le $b; $i++) {
+                    $mark = $(if ($i -eq $sL) { '>>' } else { '  ' })
+                    $ctx += ('{0} {1}: {2}' -f $mark, $i, $cm.Lines($i, 1))
+                }
+                return @{ Module = $cm.Name; Line = $sL; Context = ($ctx -join "`n") }
+            } catch { return @{ Error = $_.Exception.Message } }
+        }
+
+        # The VBE has no Reset method — find and Execute the Reset
+        # command-bar control (toolbar button or Run-menu item).
+        function Find-ResetControl($controls) {
+            foreach ($ctl in $controls) {
+                try { if ((($ctl.Caption -replace '&','').Trim()) -eq 'Reset') { return $ctl } } catch {}
+                $sub = $null
+                try { $sub = $ctl.Controls } catch {}
+                if ($sub) { $r = Find-ResetControl $sub; if ($r) { return $r } }
+            }
+            return $null
+        }
+        function Invoke-VbeReset {
+            $xl = Get-WatcherXl
+            if (-not $xl) { return $false }
+            try {
+                foreach ($bar in $xl.VBE.CommandBars) {
+                    $r = Find-ResetControl $bar.Controls
+                    if ($r) { $r.Execute(); return $true }
+                }
+            } catch {}
+            return $false
         }
 
         # -------- #32770 child-window payload -------------------------
@@ -624,9 +714,39 @@ function Start-SessionDialogWatcher {
 
                 if ($isRtError) {
                     $info = $state.DialogInfo[$id]
-                    $null = Send-DialogClick $info '&End'
                     [void]$state.ActiveDialogs.Remove($key)
                     [void]$state.DialogInfo.Remove($id)
+                    if ($state.DebugOnError) {
+                        # item 3 — click Debug, capture the break site,
+                        # recover via VBE Reset. BreakMode gates off the
+                        # item-2 activation for the duration.
+                        $state.BreakMode = $true
+                        $null = Send-DialogClick $info '&Debug'
+                        Start-Sleep -Milliseconds 700
+                        $vbeShot = $null
+                        $vbeHwnd = Find-VbeMain $state.ProcessId
+                        if ($vbeHwnd -ne [IntPtr]::Zero) {
+                            $vbeShot = Join-Path $state.CapturesDir "$id-vbe.png"
+                            try { [void](Save-DialogPng -Hwnd $vbeHwnd.ToInt64() -Path $vbeShot) }
+                            catch { $vbeShot = $null }
+                            if ($vbeShot -and -not (Test-Path $vbeShot)) { $vbeShot = $null }
+                        }
+                        $brk = Read-BreakSite
+                        $bev = @{ t = 'runtime_error_break'; id = $id
+                                  number = $rtNum; description = $rtDesc; screenshot = $vbeShot }
+                        if ($brk.Module) {
+                            $bev.module         = $brk.Module
+                            $bev.line           = $brk.Line
+                            $bev.source_context = $brk.Context
+                        }
+                        if ($brk.Error) { $bev.read_error = $brk.Error }
+                        Write-SessionEvent $bev
+                        $reset = Invoke-VbeReset
+                        Write-SessionEvent @{ t = 'break_recovered'; id = $id; reset = [bool]$reset }
+                        $state.BreakMode = $false
+                    } else {
+                        $null = Send-DialogClick $info '&End'
+                    }
                 } else {
                     # Pre-armed response (item 4b): first matching rule
                     # auto-clicks the dialog, no agent round-trip.
@@ -748,7 +868,7 @@ function Start-SessionDialogWatcher {
             # window paints and the next poll catches it. WM_NULL times out
             # while the thread computes — that tells computing from
             # blocked-on-modal, so activation never lands mid-computation.
-            if ($dialogs.Count -eq 0 -and $state.Visible -and $state.MacroRunning) {
+            if ($dialogs.Count -eq 0 -and $state.Visible -and $state.MacroRunning -and -not $state.BreakMode) {
                 $xlMain = Find-ExcelMain $state.ProcessId
                 $pumping = $false
                 if ($xlMain -ne [IntPtr]::Zero) {
