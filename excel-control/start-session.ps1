@@ -864,8 +864,7 @@ try {
         -EventsFile   $eventsFile `
         -CommandsFile $commandsFile `
         -CapturesDir  $capturesDir `
-        -Visible      ([bool]$Visible) `
-        -XlApp        $xl
+        -Visible      ([bool]$Visible)
     $script:Watcher     = $watcher
     $script:CapturesDir = $capturesDir
     $script:SessionDir  = $sessionDir

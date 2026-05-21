@@ -1,10 +1,11 @@
 {
-  "version": 3,
+  "version": 4,
   "description": "excel-control harness export manifest. Single source of truth for which files the vba-sync addin ships into a project. Consumed by RefreshHarnessPayload (build time: src files -> CustomXMLPart) and WriteHarness (runtime: CustomXMLPart -> dst). 'src' is relative to excel-control/; 'dst' is relative to the exported repo root. The harness deploys as a self-contained Claude Code skill under .claude/skills/excel-control/; per-session runtime files are created at runtime under <repo>/.excel-control/ and are not deployed.",
   "files": [
     { "src": "skill/SKILL.md",              "dst": ".claude/skills/excel-control/SKILL.md" },
     { "src": "start-session.ps1",           "dst": ".claude/skills/excel-control/tools/start-session.ps1" },
     { "src": "session-dialog-watcher.ps1",  "dst": ".claude/skills/excel-control/tools/session-dialog-watcher.ps1" },
+    { "src": "debug-capture.ps1",           "dst": ".claude/skills/excel-control/tools/debug-capture.ps1" },
     { "src": "capture.ps1",                 "dst": ".claude/skills/excel-control/tools/capture.ps1" },
     { "src": "unlock-vba-project.ps1",      "dst": ".claude/skills/excel-control/tools/unlock-vba-project.ps1" },
     { "src": "tools/INTERFACE.md",          "dst": ".claude/skills/excel-control/tools/INTERFACE.md" },

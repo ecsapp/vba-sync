@@ -78,9 +78,6 @@ namespace XcDialog {
     public const uint WM_NULL = 0x0000;
     public const uint SMTO_ABORTIFHUNG = 0x0002;
     public const int  SW_RESTORE = 9;
-    // item 3 — PID-guarded ROT fallback to reach the harness Excel for
-    // the break-site read (Marshal.GetActiveObject is absent in .NET 6+).
-    [DllImport("oleaut32.dll", PreserveSig = false)] public static extern void GetActiveObject(ref Guid rclsid, IntPtr pvReserved, [MarshalAs(UnmanagedType.IUnknown)] out object ppunk);
   }
 }
 "@
@@ -97,8 +94,7 @@ function Start-SessionDialogWatcher {
         [Parameter(Mandatory=$true)] [string]$CommandsFile,
         [Parameter(Mandatory=$true)] [string]$CapturesDir,
         [int]$PollMs = 200,
-        [bool]$Visible = $false,
-        [object]$XlApp = $null
+        [bool]$Visible = $false
     )
 
     $state = [hashtable]::Synchronized(@{
@@ -112,7 +108,7 @@ function Start-SessionDialogWatcher {
         Visible       = $Visible
         BreakMode     = $false
         DebugOnError  = $false
-        XlApp         = $XlApp
+        DebugHelper   = (Join-Path $PSScriptRoot 'debug-capture.ps1')
         ActiveDialogs = [hashtable]::Synchronized(@{})
         DialogInfo    = [hashtable]::Synchronized(@{})
         NextId        = 1
@@ -273,69 +269,36 @@ function Start-SessionDialogWatcher {
             return [IntPtr]::Zero
         }
 
-        # The session's Excel as a COM object: the ref passed at watcher
-        # creation, else a PID-verified ROT lookup. $null rather than ever
-        # return a foreign Excel (the ROT holds every running instance).
-        function Get-WatcherXl {
-            if ($state.XlApp) {
-                try { $null = $state.XlApp.Name; return $state.XlApp } catch {}
+        # Run the break-site COM read + VBE Reset in a SEPARATE short-lived
+        # process (debug-capture.ps1). Driving COM into a break-mode Excel
+        # from this STA runspace destabilises and crashes it; a separate
+        # process with its own clean apartment is the spike-proven path.
+        # Returns the helper's parsed result (best-effort — a Bug-4-corrupt
+        # Excel may crash anyway, in which case .error explains).
+        function Invoke-DebugCapture {
+            $helper = $state.DebugHelper
+            if (-not $helper -or -not (Test-Path $helper)) {
+                return @{ error = "debug-capture.ps1 not found ($helper)" }
             }
+            $outFile = Join-Path $state.CapturesDir ('dbg-' + [Guid]::NewGuid().ToString('N') + '.json')
             try {
-                $clsid = [Guid]'00024500-0000-0000-C000-000000000046'
-                $obj = $null
-                [XcDialog.Win32]::GetActiveObject([ref]$clsid, [IntPtr]::Zero, [ref]$obj)
-                if ($obj) {
-                    $p = [uint32]0
-                    [void][XcDialog.Win32]::GetWindowThreadProcessId([IntPtr][int64]$obj.Hwnd, [ref]$p)
-                    if ($p -eq $state.ProcessId) { return $obj }
+                # Single quoted arg string — an array ArgumentList does not
+                # quote spaced paths.
+                $argStr = '-NoProfile -File "{0}" -ExcelPid {1} -OutFile "{2}"' -f `
+                    $helper, $state.ProcessId, $outFile
+                $p = Start-Process pwsh -ArgumentList $argStr -PassThru -WindowStyle Hidden
+                $p.WaitForExit(20000) | Out-Null
+                if (-not $p.HasExited) {
+                    try { $p.Kill() } catch {}
+                    return @{ error = 'debug-capture helper timed out (Excel likely crashed)' }
                 }
-            } catch {}
-            return $null
-        }
-
-        # Tier A2 — structured break-site read via VBE.ActiveCodePane,
-        # the same GetSelection + CodeModule.Lines compile_check uses.
-        function Read-BreakSite {
-            $xl = Get-WatcherXl
-            if (-not $xl) { return @{ Error = 'no COM ref to the session Excel' } }
-            try {
-                $pane = $xl.VBE.ActiveCodePane
-                if (-not $pane) { return @{ Error = 'no ActiveCodePane' } }
-                $cm = $pane.CodeModule
-                $sL = 0; $sC = 0; $eL = 0; $eC = 0
-                [void]$pane.GetSelection([ref]$sL, [ref]$sC, [ref]$eL, [ref]$eC)
-                $a = [Math]::Max(1, $sL - 3)
-                $b = [Math]::Min($cm.CountOfLines, $sL + 3)
-                $ctx = @()
-                for ($i = $a; $i -le $b; $i++) {
-                    $mark = $(if ($i -eq $sL) { '>>' } else { '  ' })
-                    $ctx += ('{0} {1}: {2}' -f $mark, $i, $cm.Lines($i, 1))
+                if (Test-Path $outFile) {
+                    $r = Get-Content -LiteralPath $outFile -Raw | ConvertFrom-Json
+                    Remove-Item -LiteralPath $outFile -Force -ErrorAction SilentlyContinue
+                    return $r
                 }
-                return @{ Module = $cm.Name; Line = $sL; Context = ($ctx -join "`n") }
-            } catch { return @{ Error = $_.Exception.Message } }
-        }
-
-        # The VBE has no Reset method — find and Execute the Reset
-        # command-bar control (toolbar button or Run-menu item).
-        function Find-ResetControl($controls) {
-            foreach ($ctl in $controls) {
-                try { if ((($ctl.Caption -replace '&','').Trim()) -eq 'Reset') { return $ctl } } catch {}
-                $sub = $null
-                try { $sub = $ctl.Controls } catch {}
-                if ($sub) { $r = Find-ResetControl $sub; if ($r) { return $r } }
-            }
-            return $null
-        }
-        function Invoke-VbeReset {
-            $xl = Get-WatcherXl
-            if (-not $xl) { return $false }
-            try {
-                foreach ($bar in $xl.VBE.CommandBars) {
-                    $r = Find-ResetControl $bar.Controls
-                    if ($r) { $r.Execute(); return $true }
-                }
-            } catch {}
-            return $false
+                return @{ error = 'debug-capture helper produced no result' }
+            } catch { return @{ error = "debug-capture spawn failed: $($_.Exception.Message)" } }
         }
 
         # -------- #32770 child-window payload -------------------------
@@ -710,39 +673,47 @@ function Start-SessionDialogWatcher {
                     $ev.number = $rtNum
                     $ev.description = $rtDesc
                 }
-                Write-SessionEvent $ev
+                # With debug_on_error the debug branch below emits a single
+                # runtime_error_break — skip the plain runtime_error here so
+                # the same dialog is not reported twice.
+                if (-not ($isRtError -and $state.DebugOnError)) { Write-SessionEvent $ev }
 
                 if ($isRtError) {
                     $info = $state.DialogInfo[$id]
                     [void]$state.ActiveDialogs.Remove($key)
                     [void]$state.DialogInfo.Remove($id)
                     if ($state.DebugOnError) {
-                        # item 3 — click Debug, capture the break site,
-                        # recover via VBE Reset. BreakMode gates off the
-                        # item-2 activation for the duration.
+                        # item 3 — debug-on-error. Click Debug (Win32) and
+                        # screenshot the VBE (Win32); the COM read + VBE
+                        # Reset run in a SEPARATE process (Invoke-DebugCapture)
+                        # — COM into a break-mode Excel from this runspace
+                        # crashes it. Best-effort: a Bug-4-corrupt Excel may
+                        # crash regardless; capture what we can. BreakMode
+                        # gates off the item-2 activation for the duration.
                         $state.BreakMode = $true
                         $null = Send-DialogClick $info '&Debug'
-                        Start-Sleep -Milliseconds 700
+                        $vbeHwnd = [IntPtr]::Zero
+                        for ($w = 0; $w -lt 12 -and $vbeHwnd -eq [IntPtr]::Zero; $w++) {
+                            Start-Sleep -Milliseconds 200
+                            $vbeHwnd = Find-VbeMain $state.ProcessId
+                        }
                         $vbeShot = $null
-                        $vbeHwnd = Find-VbeMain $state.ProcessId
                         if ($vbeHwnd -ne [IntPtr]::Zero) {
                             $vbeShot = Join-Path $state.CapturesDir "$id-vbe.png"
                             try { [void](Save-DialogPng -Hwnd $vbeHwnd.ToInt64() -Path $vbeShot) }
                             catch { $vbeShot = $null }
                             if ($vbeShot -and -not (Test-Path $vbeShot)) { $vbeShot = $null }
                         }
-                        $brk = Read-BreakSite
+                        $brk = Invoke-DebugCapture
                         $bev = @{ t = 'runtime_error_break'; id = $id
-                                  number = $rtNum; description = $rtDesc; screenshot = $vbeShot }
-                        if ($brk.Module) {
-                            $bev.module         = $brk.Module
-                            $bev.line           = $brk.Line
-                            $bev.source_context = $brk.Context
-                        }
-                        if ($brk.Error) { $bev.read_error = $brk.Error }
+                                  number = $rtNum; description = $rtDesc
+                                  title = $caption; text = $bodyText; screenshot = $vbeShot }
+                        if ($brk.module)         { $bev.module = $brk.module }
+                        if ($null -ne $brk.line) { $bev.line = $brk.line }
+                        if ($brk.source_context) { $bev.source_context = $brk.source_context }
+                        if ($brk.error)          { $bev.read_error = $brk.error }
                         Write-SessionEvent $bev
-                        $reset = Invoke-VbeReset
-                        Write-SessionEvent @{ t = 'break_recovered'; id = $id; reset = [bool]$reset }
+                        Write-SessionEvent @{ t = 'break_recovered'; id = $id; reset = [bool]$brk.reset }
                         $state.BreakMode = $false
                     } else {
                         $null = Send-DialogClick $info '&End'
