@@ -66,6 +66,18 @@ namespace XcDialog {
     public const int  WS_VISIBLE = 0x10000000;
     public const uint OBJID_CLIENT = 0xFFFFFFFC;
     public const uint PW_RENDERFULLCONTENT = 0x2;
+    // -Visible mode: bring a background Excel to the foreground so a
+    // modal window it deferred actually surfaces (item 2).
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll", SetLastError = true)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam, uint fuFlags, uint uTimeout, out IntPtr lpdwResult);
+    public const uint WM_NULL = 0x0000;
+    public const uint SMTO_ABORTIFHUNG = 0x0002;
+    public const int  SW_RESTORE = 9;
   }
 }
 "@
@@ -81,7 +93,8 @@ function Start-SessionDialogWatcher {
         [Parameter(Mandatory=$true)] [string]$EventsFile,
         [Parameter(Mandatory=$true)] [string]$CommandsFile,
         [Parameter(Mandatory=$true)] [string]$CapturesDir,
-        [int]$PollMs = 200
+        [int]$PollMs = 200,
+        [bool]$Visible = $false
     )
 
     $state = [hashtable]::Synchronized(@{
@@ -91,6 +104,8 @@ function Start-SessionDialogWatcher {
         CommandsFile  = $CommandsFile
         CapturesDir   = $CapturesDir
         PollMs        = $PollMs
+        MacroRunning  = $false
+        Visible       = $Visible
         ActiveDialogs = [hashtable]::Synchronized(@{})
         DialogInfo    = [hashtable]::Synchronized(@{})
         NextId        = 1
@@ -190,6 +205,47 @@ function Start-SessionDialogWatcher {
             $del = [XcDialog.Win32+EnumWindowsProc]$cb
             [XcDialog.Win32]::EnumWindows($del, [IntPtr]::Zero) | Out-Null
             return $found
+        }
+
+        # Excel's main top-level window (class XLMAIN) for the session.
+        function Find-ExcelMain([uint32]$targetPid) {
+            $found = New-Object System.Collections.ArrayList
+            $cb = {
+                param([IntPtr]$h, [IntPtr]$lp)
+                if ((Get-WClass -h $h) -eq 'XLMAIN' -and (Get-WPid -h $h) -eq $targetPid) {
+                    [void]$found.Add($h); return $false
+                }
+                return $true
+            }
+            $del = [XcDialog.Win32+EnumWindowsProc]$cb
+            [XcDialog.Win32]::EnumWindows($del, [IntPtr]::Zero) | Out-Null
+            if ($found.Count -gt 0) { return [IntPtr]$found[0] }
+            return [IntPtr]::Zero
+        }
+
+        # Bring a window to the foreground, bypassing the foreground lock
+        # via AttachThreadInput (no synthetic ALT key). Surfaces a modal a
+        # background Excel deferred in -Visible mode.
+        function Set-ExcelForeground([IntPtr]$h) {
+            if ($h -eq [IntPtr]::Zero) { return }
+            $fg = [XcDialog.Win32]::GetForegroundWindow()
+            $ourTid = [XcDialog.Win32]::GetCurrentThreadId()
+            $fgPid = [uint32]0
+            $fgTid = [XcDialog.Win32]::GetWindowThreadProcessId($fg, [ref]$fgPid)
+            $attached = $false
+            try {
+                if ($fgTid -ne 0 -and $fgTid -ne $ourTid) {
+                    $attached = [XcDialog.Win32]::AttachThreadInput($ourTid, $fgTid, $true)
+                }
+                if ([XcDialog.Win32]::IsIconic($h)) {
+                    [void][XcDialog.Win32]::ShowWindow($h, [XcDialog.Win32]::SW_RESTORE)
+                }
+                [void][XcDialog.Win32]::SetForegroundWindow($h)
+            } finally {
+                if ($attached) {
+                    [void][XcDialog.Win32]::AttachThreadInput($ourTid, $fgTid, $false)
+                }
+            }
         }
 
         # -------- #32770 child-window payload -------------------------
@@ -463,6 +519,8 @@ function Start-SessionDialogWatcher {
         }
 
         # -------- main loop -------------------------------------------
+        $deferredPolls   = 0
+        $lastActivateUtc = [DateTime]::MinValue
         while (-not $state.Stop) {
             $dialogs = Find-Dialogs -targetPid $state.ProcessId
             $stillActive = @{}
@@ -612,6 +670,42 @@ function Start-SessionDialogWatcher {
                         Write-SessionEvent $ev
                     }
                 }
+            }
+
+            # -Visible deferred-modal rescue. A background Excel can leave a
+            # modal window created-but-not-shown (WS_VISIBLE clear, so
+            # Find-Dialogs misses it) and the macro hangs. When a macro is
+            # running, nothing is surfaced, and Excel's UI thread is pumping
+            # a message loop (a modal IS up), bring Excel forward so the
+            # window paints and the next poll catches it. WM_NULL times out
+            # while the thread computes — that tells computing from
+            # blocked-on-modal, so activation never lands mid-computation.
+            if ($dialogs.Count -eq 0 -and $state.Visible -and $state.MacroRunning) {
+                $xlMain = Find-ExcelMain $state.ProcessId
+                $pumping = $false
+                if ($xlMain -ne [IntPtr]::Zero) {
+                    $res = [IntPtr]::Zero
+                    $rc = [XcDialog.Win32]::SendMessageTimeout($xlMain,
+                              [XcDialog.Win32]::WM_NULL, [IntPtr]::Zero, [IntPtr]::Zero,
+                              [XcDialog.Win32]::SMTO_ABORTIFHUNG, 300, [ref]$res)
+                    $pumping = ($rc -ne [IntPtr]::Zero)
+                }
+                if ($pumping) {
+                    $deferredPolls++
+                    $sinceMs = ([DateTime]::UtcNow - $lastActivateUtc).TotalMilliseconds
+                    # 3 consecutive polls filters a transient pump (a DoEvents
+                    # loop) from a genuinely stuck modal; 750ms throttle bounds
+                    # re-activation when foreground is lost again mid-run.
+                    if ($deferredPolls -ge 3 -and $sinceMs -gt 750) {
+                        Set-ExcelForeground $xlMain
+                        $lastActivateUtc = [DateTime]::UtcNow
+                        Write-SessionEvent @{ t = 'dialog_activated'; polls = $deferredPolls }
+                    }
+                } else {
+                    $deferredPolls = 0
+                }
+            } else {
+                $deferredPolls = 0
             }
 
             Start-Sleep -Milliseconds $state.PollMs

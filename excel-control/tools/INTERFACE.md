@@ -152,6 +152,7 @@ Every command produces a `command_ack` first.
 | `dialog_appeared` / `userform_appeared` | `id`, `title`, `text`, `buttons[]`, `class`, `screenshot`; UserForms also `controls[]` — each `name`, `role`, `value`, `checked`, `enabled` | unsolicited modal observed |
 | `dialog_dismissed` | `id` (command id), `dialog_id`, `button` | watcher dispatched click |
 | `dialog_closed_externally` | `id` (dialog id) | dialog vanished without `respond_dialog` |
+| `dialog_activated` | `polls` (consecutive deferred polls) | `-Visible` mode only — watcher brought Excel to the foreground to surface a modal it had deferred |
 | `respond_failed` | `id`, `dialog_id`, `reason`, on a missing button `available[]` | dispatch couldn't close dialog |
 | `form_control_set` / `form_control_failed` | `id`, `dialog_id`, `control`; on success `role`/`checked`/`value`; on fail `reason` (+ `available[]`) | `set_form_control` result |
 | `runtime_error` | `id` (dialog id), `number`, `description`, `text`, `screenshot` | VBA runtime-error dialog auto-End'd |

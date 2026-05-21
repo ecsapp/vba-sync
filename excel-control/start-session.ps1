@@ -37,7 +37,7 @@ param(
     # -VbaPassword: password for a locked VBA project. Without it the
     # harness cannot sync/compile/test a password-protected VBA project.
     # Precedence: this param > $env:XC_VBA_PASSWORD > a gitignored
-    # <tools>/.vba-password file. Never commit the secret.
+    # .vba-password file beside the harness scripts. Never commit it.
     [string]$VbaPassword
 )
 
@@ -199,7 +199,7 @@ function Get-AccessibleVBProject($Wb) {
     if ($locked -or $null -eq $proj.VBComponents) {
         throw "VBA project is password-locked (Protection=vbext_pp_locked) " +
               "- VBComponents is inaccessible over COM. Supply the password " +
-              "via -VbaPassword / `$env:XC_VBA_PASSWORD / tools/.vba-password " +
+              "via -VbaPassword / `$env:XC_VBA_PASSWORD / a .vba-password file " +
               "so the session auto-unlocks the project at startup."
     }
     return $proj
@@ -242,14 +242,21 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd) {
                 # resolution was failing with "Parameter not optional"
                 # when passing args that VBA's Variant parameters
                 # accept. Splat by arity (most macros take 0-5 args).
-                $result = switch ($macroArgs.Count) {
-                    0 { $Xl.Run($macroRef) }
-                    1 { $Xl.Run($macroRef, $macroArgs[0]) }
-                    2 { $Xl.Run($macroRef, $macroArgs[0], $macroArgs[1]) }
-                    3 { $Xl.Run($macroRef, $macroArgs[0], $macroArgs[1], $macroArgs[2]) }
-                    4 { $Xl.Run($macroRef, $macroArgs[0], $macroArgs[1], $macroArgs[2], $macroArgs[3]) }
-                    5 { $Xl.Run($macroRef, $macroArgs[0], $macroArgs[1], $macroArgs[2], $macroArgs[3], $macroArgs[4]) }
-                    default { Invoke-Macro -Xl $Xl -MacroName $macroRef -MacroArgsArr $macroArgs }
+                # Flag the macro in flight so the dialog watcher can rescue
+                # a deferred modal in -Visible mode (item 2).
+                if ($script:Watcher) { $script:Watcher.State.MacroRunning = $true }
+                try {
+                    $result = switch ($macroArgs.Count) {
+                        0 { $Xl.Run($macroRef) }
+                        1 { $Xl.Run($macroRef, $macroArgs[0]) }
+                        2 { $Xl.Run($macroRef, $macroArgs[0], $macroArgs[1]) }
+                        3 { $Xl.Run($macroRef, $macroArgs[0], $macroArgs[1], $macroArgs[2]) }
+                        4 { $Xl.Run($macroRef, $macroArgs[0], $macroArgs[1], $macroArgs[2], $macroArgs[3]) }
+                        5 { $Xl.Run($macroRef, $macroArgs[0], $macroArgs[1], $macroArgs[2], $macroArgs[3], $macroArgs[4]) }
+                        default { Invoke-Macro -Xl $Xl -MacroName $macroRef -MacroArgsArr $macroArgs }
+                    }
+                } finally {
+                    if ($script:Watcher) { $script:Watcher.State.MacroRunning = $false }
                 }
                 # Emit one debug_print event per non-empty line.
                 try {
@@ -632,7 +639,9 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd) {
                     $errObj = $null
                     try {
                         $ref = "'$($Wb.Name)'!$($t.module).$($t.name)"
-                        $null = $Xl.Run($ref)
+                        if ($script:Watcher) { $script:Watcher.State.MacroRunning = $true }
+                        try { $null = $Xl.Run($ref) }
+                        finally { if ($script:Watcher) { $script:Watcher.State.MacroRunning = $false } }
                     } catch {
                         $msg = $_.Exception.Message
                         $cur = $_.Exception
@@ -836,7 +845,7 @@ try {
                 Write-EventLine @{ t = 'vba_unlock_failed'; error = 'Unlock-VbaProject returned false — wrong password, or the password dialog could not be driven.' }
             }
         } else {
-            Write-EventLine @{ t = 'vba_unlock_failed'; error = 'VBA project is password-locked but no password was supplied (-VbaPassword / $env:XC_VBA_PASSWORD / tools/.vba-password). sync_vba / compile_check / run_tests / list_macros will fail.' }
+            Write-EventLine @{ t = 'vba_unlock_failed'; error = 'VBA project is password-locked but no password was supplied (-VbaPassword / $env:XC_VBA_PASSWORD / a .vba-password file beside the harness scripts). sync_vba / compile_check / run_tests / list_macros will fail.' }
         }
     }
 
@@ -844,7 +853,8 @@ try {
         -ProcessId    $excelPid `
         -EventsFile   $eventsFile `
         -CommandsFile $commandsFile `
-        -CapturesDir  $capturesDir
+        -CapturesDir  $capturesDir `
+        -Visible      ([bool]$Visible)
     $script:Watcher     = $watcher
     $script:CapturesDir = $capturesDir
     $script:SessionDir  = $sessionDir
