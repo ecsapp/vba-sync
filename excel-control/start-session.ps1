@@ -105,7 +105,14 @@ function Save-State([string]$Status) {
         started_at          = $script:StartedAt
         last_command_offset = $script:LastOffset
     }
-    Set-Content -LiteralPath $stateFile -Value (ConvertTo-Json -Depth 5 -InputObject $s) -Encoding UTF8
+    # Write temp then rename — a reader must never catch state.json
+    # empty, which a direct Set-Content leaves it while writing.
+    $tmp = "$stateFile.tmp"
+    Set-Content -LiteralPath $tmp -Value (ConvertTo-Json -Depth 5 -InputObject $s) -Encoding UTF8
+    for ($i = 0; $i -lt 25; $i++) {
+        try { [System.IO.File]::Move($tmp, $stateFile, $true); return }
+        catch { Start-Sleep -Milliseconds 20 }
+    }
 }
 
 # Reads new lines from commands.jsonl starting at $LastOffset. Returns
@@ -857,7 +864,13 @@ finally {
     if ($watcher) { try { Stop-SessionDialogWatcher $watcher } catch {} }
     try { if ($wb) { $wb.Close($false) } } catch {}
     try { $xl.Quit() } catch {}
-    try { [System.Runtime.InteropServices.Marshal]::ReleaseComObject($xl) | Out-Null } catch {}
+    # Release every COM ref now; leaving any (the workbook was) to the GC
+    # finalizer makes EXCEL.EXE teardown stall when another Excel is open.
+    foreach ($o in @($wb, $xl)) {
+        if ($o) { try { [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($o) | Out-Null } catch {} }
+    }
+    $wb = $null; $xl = $null
+    [GC]::Collect(); [GC]::WaitForPendingFinalizers()
     [GC]::Collect(); [GC]::WaitForPendingFinalizers()
     Save-State 'closed'
     Write-EventLine @{ t = 'closed' }

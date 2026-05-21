@@ -65,17 +65,28 @@ function Clear-OrphanSessionExcels {
         if (-not (Test-Path $stateFile)) { return }
         try {
             $state = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
-            if ($state.excel_pid -and [int]$state.excel_pid -gt 0) {
-                $proc = Get-Process -Id ([int]$state.excel_pid) -ErrorAction SilentlyContinue
-                if ($proc -and $proc.ProcessName -eq 'EXCEL') {
-                    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-                }
+            # A cleanly-closed session has no orphan, and its recorded PIDs
+            # may since have been recycled by unrelated processes. Prune the
+            # dir so the pile cannot grow into a stale-PID kill hazard.
+            if ($state.status -eq 'closed') {
+                Remove-Item -Recurse -Force -LiteralPath $_.FullName -ErrorAction SilentlyContinue
+                return
             }
-            if ($state.pid -and [int]$state.pid -gt 0) {
-                $hostProc = Get-Process -Id ([int]$state.pid) -ErrorAction SilentlyContinue
-                if ($hostProc -and $hostProc.ProcessName -eq 'pwsh') {
-                    Stop-Process -Id $hostProc.Id -Force -ErrorAction SilentlyContinue
-                }
+            # Kill a recorded PID only if the live process is plausibly this
+            # session's: a recycled PID starts well after the session did.
+            $startedAt = $null
+            try { $startedAt = [datetime]$state.started_at } catch {}
+            if (-not $startedAt) { return }
+            $cutoff = $startedAt.AddMinutes(2)
+            foreach ($pair in @(
+                @{ Id = $state.excel_pid; Name = 'EXCEL' },
+                @{ Id = $state.pid;       Name = 'pwsh'  }
+            )) {
+                if (-not $pair.Id -or [int]$pair.Id -le 0) { continue }
+                $proc = Get-Process -Id ([int]$pair.Id) -ErrorAction SilentlyContinue
+                if (-not $proc -or $proc.ProcessName -ne $pair.Name) { continue }
+                try { if ($proc.StartTime -gt $cutoff) { continue } } catch { continue }
+                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
             }
         } catch {}
     }
