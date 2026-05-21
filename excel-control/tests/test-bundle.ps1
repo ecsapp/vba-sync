@@ -1,4 +1,4 @@
-# Phase 9 test — vba-sync Export bundles excel-control into tools/.
+# Phase 9 test — vba-sync Export bundles excel-control as a skill.
 #
 # Eat-your-own-dogfood: drive vba-sync's ExportProject THROUGH the
 # excel-control session protocol. The session's dialog watcher catches
@@ -20,7 +20,7 @@ $AddinPath = 'C:\Users\ArnaudLavignolle\AppData\Roaming\Microsoft\AddIns\VBA Syn
 if (-not (Test-Path $AddinPath)) { throw "VBA Sync.xlam not found at $AddinPath" }
 
 # Stage a fresh copy of the fixture in a temp workdir so we can verify
-# the export creates tools/ next to it
+# the export bundles the harness skill next to it
 $fixtureSrc = Join-Path $here 'fixtures\msgbox.xlsm'
 $workDir = Join-Path $env:TEMP "vba-sync-bundle-test-$(Get-Random -Maximum 99999)"
 New-Item -ItemType Directory -Force -Path $workDir | Out-Null
@@ -113,30 +113,31 @@ End Sub
     if (-not (Wait-ForEvent $eventsFile 'closed' 15)) { throw "no closed" }
     $proc.WaitForExit(8000) | Out-Null
 
-    # Verify tools/ contents — bundled at the repoPath (next to the xlsm)
+    # Verify the harness bundled as a self-contained skill under
+    # .claude/skills/excel-control/ next to the exported xlsm.
     $exportFolder = Join-Path $workDir 'msgbox'
-    $toolsFolder  = Join-Path $workDir 'tools'
+    $skillFolder  = Join-Path $workDir '.claude\skills\excel-control'
     if (-not (Test-Path $exportFolder)) { throw "per-workbook export folder not created at $exportFolder" }
-    if (-not (Test-Path $toolsFolder))  { throw "tools/ not bundled at $toolsFolder" }
+    if (-not (Test-Path $skillFolder))  { throw "skill not bundled at $skillFolder" }
 
     $expected = @(
-        'start-session.ps1',
-        'session-dialog-watcher.ps1',
-        'capture.ps1',
-        'INTERFACE.md',
-        'clsAssert.cls',
-        '.claude\settings.json'
+        'SKILL.md',
+        'tools\start-session.ps1',
+        'tools\session-dialog-watcher.ps1',
+        'tools\capture.ps1',
+        'tools\unlock-vba-project.ps1',
+        'tools\INTERFACE.md',
+        'tools\clsAssert.cls'
     )
     foreach ($rel in $expected) {
-        $p = Join-Path $toolsFolder $rel
-        if (-not (Test-Path -LiteralPath $p)) { throw "missing in bundle: tools/$rel" }
-        Write-Host "  bundled: tools/$rel  ($((Get-Item -LiteralPath $p).Length) bytes)" -ForegroundColor Green
+        $p = Join-Path $skillFolder $rel
+        if (-not (Test-Path -LiteralPath $p)) { throw "missing in bundle: .claude/skills/excel-control/$rel" }
+        Write-Host "  bundled: .claude/skills/excel-control/$rel  ($((Get-Item -LiteralPath $p).Length) bytes)" -ForegroundColor Green
     }
 
-    # Also verify Claude Code skill at <repo>/.claude/skills/excel-control/SKILL.md
-    $skillPath = Join-Path $workDir '.claude\skills\excel-control\SKILL.md'
-    if (-not (Test-Path -LiteralPath $skillPath)) { throw "missing in bundle: .claude/skills/excel-control/SKILL.md" }
-    Write-Host "  bundled: .claude/skills/excel-control/SKILL.md  ($((Get-Item -LiteralPath $skillPath).Length) bytes)" -ForegroundColor Green
+    # The harness must no longer land under a repo-root tools/.
+    if (Test-Path (Join-Path $workDir 'tools')) { throw "stale repo-root tools/ should not be bundled" }
+    Write-Host "  no stale repo-root tools/" -ForegroundColor Green
     Remove-Item -Recurse -Force $workDir
 
     Write-Host "PASS test-bundle" -ForegroundColor Green

@@ -9,27 +9,31 @@ This workbook ships with a PowerShell session harness that lets you
 drive Excel programmatically. Long-running PS process holds a COM
 instance open; you communicate via two append-only JSONL files:
 
-- `tools/sessions/<id>/commands.jsonl` — you append, harness consumes
-- `tools/sessions/<id>/events.jsonl` — harness appends, you watch
+- `.excel-control/sessions/<id>/commands.jsonl` — you append, harness consumes
+- `.excel-control/sessions/<id>/events.jsonl` — harness appends, you watch
 
-`tools/INTERFACE.md` is the full API reference. This file is the guide:
-how to do common things.
+`.claude/skills/excel-control/tools/INTERFACE.md` is the full API
+reference. This file is the guide: how to do common things.
 
 ## Paths
 
 All paths in this guide are **relative to the workbook root** — the
-folder vba-sync Export wrote, where the harness lives at `./tools/`. If
-you are working in the **excel-control dev tree** instead (the source
-repo), the scripts are at `excel-control/` and sessions at
-`excel-control/sessions/` — substitute accordingly. The `pwsh` launch
-runs from the workbook root.
+folder vba-sync Export wrote. The harness skill lives at
+`.claude/skills/excel-control/` with its scripts under `tools/` there;
+per-session runtime files are written to a gitignored `.excel-control/`
+at the workbook root — deliberately kept out of `.claude/`, which
+prompts for permission on every access. If you are working in the
+**excel-control dev tree** instead (the source repo), the scripts are
+at `excel-control/` and sessions default to `.excel-control/` beside
+the workbook — substitute accordingly. The `pwsh` launch runs from the
+workbook root.
 
 ## Quickstart
 
 1. **Launch the session** (Bash, `run_in_background: true`). Headless by
    default — Excel runs invisibly:
    ```
-   pwsh tools/start-session.ps1 -Workbook X.xlsm -SessionId s1
+   pwsh .claude/skills/excel-control/tools/start-session.ps1 -Workbook X.xlsm -SessionId s1
    ```
    Add `-Visible` to show Excel on the desktop — useful when you need
    meaningful worksheet screenshots (a headless automation Excel renders
@@ -37,15 +41,15 @@ runs from the workbook root.
    command, Export included.
 2. **Wait for readiness.** The harness emits
    `{"t":"started","pid":...,"excel_pid":...,"session_id":...}` to
-   `tools/sessions/s1/events.jsonl` once Excel has opened the workbook —
+   `.excel-control/sessions/s1/events.jsonl` once Excel has opened the workbook —
    this takes a few seconds. **Do not send a command before `started`
    arrives.** If it has not arrived in ~15s, read
-   `tools/sessions/s1/state.json`: `status:crashed` means startup failed
+   `.excel-control/sessions/s1/state.json`: `status:crashed` means startup failed
    — check the `events.jsonl` tail for a `session_error`.
 3. **Watch events** — point the Monitor tool at
-   `tools/sessions/s1/events.jsonl` (one notification per appended line).
+   `.excel-control/sessions/s1/events.jsonl` (one notification per appended line).
 4. **Send commands** — append one JSON object per line to
-   `tools/sessions/s1/commands.jsonl` (append only; never rewrite it).
+   `.excel-control/sessions/s1/commands.jsonl` (append only; never rewrite it).
 5. **End the session** — append `{"id":"cN","cmd":"close"}`.
 
 **Concurrent Excel use**: the session creates a separate `EXCEL.EXE`
@@ -90,7 +94,7 @@ macro continues.
 {"id":"c1","cmd":"run_macro","name":"RefreshFromDB"}
 // →
 {"t":"command_ack","id":"c1","cmd":"run_macro"}
-{"t":"dialog_appeared","id":"d1","title":"Microsoft Excel","text":"Overwrite existing data?","buttons":["Yes","No","Cancel"],"screenshot":"tools/sessions/s1/captures/d1.png"}
+{"t":"dialog_appeared","id":"d1","title":"Microsoft Excel","text":"Overwrite existing data?","buttons":["Yes","No","Cancel"],"screenshot":".excel-control/sessions/s1/captures/d1.png"}
 // you read the screenshot if needed, then:
 {"id":"c2","cmd":"respond_dialog","dialog_id":"d1","button":"Yes"}
 // →
@@ -171,7 +175,8 @@ The harness has a discover-and-run convention for VBA tests:
 - A test **fails** if it raises any error (via `Err.Raise` or an
   unhandled runtime error).
 
-The shipped `tools/clsAssert.cls` is a minimal assertion library. Import
+The shipped `.claude/skills/excel-control/tools/clsAssert.cls` is a
+minimal assertion library. Import
 it into your workbook (via `sync_vba`) and use its `Assert.AreEqual`,
 `Assert.IsTrue`, `Assert.IsFalse`, `Assert.IsNothing`, `Assert.Fail`
 methods. Each raises a vbObjectError on mismatch, which the test
@@ -260,7 +265,8 @@ the land:
 The event payloads above are **abridged** — the emitters send more
 fields than shown (`workbook_info` adds `full_name`, `file_format`,
 `named_range_count`, …; `list_sheets` adds `index`; `list_macros` adds
-`line`). See `tools/INTERFACE.md` for the full shape of every event.
+`line`). See `.claude/skills/excel-control/tools/INTERFACE.md` for the
+full shape of every event.
 
 ### Refresh data and verify
 
@@ -319,7 +325,7 @@ Single-cell anchor (`A1`) auto-resizes to the input dimensions.
 
 ## Debugging stuck or unhappy sessions
 
-Look at `tools/sessions/<id>/state.json`:
+Look at `.excel-control/sessions/<id>/state.json`:
 
 ```json
 {
@@ -361,7 +367,7 @@ Look at `tools/sessions/<id>/state.json`:
 **Resuming after a crash:** a session directory persists after the host
 dies. `start-session.ps1` resumes from `last_command_offset` if you
 reuse an existing `SessionId`. To pick up where a crashed session left
-off, reuse its id; to start clean, `ls tools/sessions/` and choose an
+off, reuse its id; to start clean, `ls .excel-control/sessions/` and choose an
 unused one.
 
 **Commands not being processed:**
@@ -404,6 +410,6 @@ unused one.
 
 ## Reference
 
-Full command and event reference: [tools/INTERFACE.md](../../../tools/INTERFACE.md)
+Full command and event reference: [INTERFACE.md](tools/INTERFACE.md)
 
 Source: [excel-control](https://github.com/ecsapp/vba-sync/tree/main/excel-control) in the vba-sync repo.

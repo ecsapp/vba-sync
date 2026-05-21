@@ -636,23 +636,31 @@ Private Sub WriteGitIgnore(basePath As String)
     Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
     Dim iPath As String: iPath = basePath & GIT_IGNORE
 
-    ' The excel-control harness writes the project's VBA password to
-    ' tools/.vba-password (the -VbaPassword file fallback). It must never
-    ' be committed — guarantee the rule is present even on repos whose
-    ' .gitignore was written before this entry existed.
-    Const SECRET_LINE As String = "tools/.vba-password"
+    ' Harness rules every exported repo must ignore: the per-session
+    ' runtime dir, and the optional VBA-password file (the -VbaPassword
+    ' file fallback). Bare names so they match wherever the harness puts
+    ' them. Appended even to a .gitignore written before these existed.
+    Const RUNTIME_DIR As String = ".excel-control/"
+    Const SECRET_LINE As String = ".vba-password"
 
     If fso.FileExists(iPath) Then
         Dim existing As String: existing = ReadAllText(iPath)
-        If InStr(1, existing, SECRET_LINE, vbTextCompare) > 0 Then
-            Debug.Print "VBA Sync: .gitignore already exists, skipping"
+        Dim addLines As String: addLines = ""
+        If InStr(1, existing, RUNTIME_DIR, vbTextCompare) = 0 Then
+            addLines = addLines & "# excel-control harness runtime/session data" & vbCrLf & _
+                       RUNTIME_DIR & vbCrLf
+        End If
+        If InStr(1, existing, SECRET_LINE, vbTextCompare) = 0 Then
+            addLines = addLines & "# excel-control harness VBA password (never commit)" & vbCrLf & _
+                       SECRET_LINE & vbCrLf
+        End If
+        If Len(addLines) = 0 Then
+            Debug.Print "VBA Sync: .gitignore already has harness rules, skipping"
         Else
-            Debug.Print "VBA Sync: appending harness secret rule to .gitignore"
+            Debug.Print "VBA Sync: appending harness rules to .gitignore"
             Dim ap
             Set ap = fso.OpenTextFile(iPath, 8, True)   ' 8 = ForAppending
-            ap.Write vbCrLf & vbCrLf & _
-                     "# excel-control harness VBA password (never commit)" & vbCrLf & _
-                     SECRET_LINE & vbCrLf
+            ap.Write vbCrLf & addLines
             ap.Close
         End If
         Exit Sub
@@ -685,8 +693,10 @@ Private Sub WriteGitIgnore(basePath As String)
           ".vs/" & vbCrLf & _
           ".idea/" & vbCrLf
     ' Second statement: VBA caps line-continuations at 25 per logical
-    ' statement — keep the harness-secret rule split off from the block above.
+    ' statement — keep the harness rules split off from the block above.
     txt = txt & vbCrLf & _
+          "# excel-control harness runtime/session data" & vbCrLf & _
+          RUNTIME_DIR & vbCrLf & vbCrLf & _
           "# excel-control harness VBA password (never commit)" & vbCrLf & _
           SECRET_LINE & vbCrLf
 
@@ -740,13 +750,14 @@ Private Sub WriteReadme(basePath As String, wb As Workbook)
           "|   |       data.tsv, formulas.json, styles.json, _meta.json" & vbCrLf & _
           "|   |       tables/<TableName>/{definition.json, data.tsv}" & vbCrLf & _
           "|   |       drawings/{shapes.json, _assets/}" & vbCrLf & _
-          "|   `-- STRUCTURE_SUMMARY.md  # Human-readable data model overview" & vbCrLf & _
-          "|-- tools/                # excel-control: PowerShell agent harness" & vbCrLf & _
-          "|   |-- start-session.ps1     # Spawn a long-running Excel session" & vbCrLf & _
-          "|   |-- INTERFACE.md          # Full command + event reference for agents" & vbCrLf & _
-          "|   `-- clsAssert.cls         # Optional assertion lib for run_tests" & vbCrLf & _
-          "|-- .claude/" & vbCrLf & _
-          "|   `-- skills/excel-control/SKILL.md  # Claude Code auto-discovery" & vbCrLf & _
+          "|   `-- STRUCTURE_SUMMARY.md  # Human-readable data model overview" & vbCrLf
+    txt = txt & _
+          "|-- .claude/skills/excel-control/  # excel-control: AI agent harness" & vbCrLf & _
+          "|   |-- SKILL.md              # Claude Code auto-discovers this skill" & vbCrLf & _
+          "|   `-- tools/                # PowerShell session harness" & vbCrLf & _
+          "|       |-- start-session.ps1     # Spawn a long-running Excel session" & vbCrLf & _
+          "|       |-- INTERFACE.md          # Full command + event reference" & vbCrLf & _
+          "|       `-- clsAssert.cls         # Optional assertion lib for run_tests" & vbCrLf & _
           "|-- .gitattributes        # Git configuration for VBA files" & vbCrLf & _
           "|-- .gitignore            # Excludes temp files from version control" & vbCrLf & _
           "`-- README.md             # This file" & vbCrLf
@@ -758,13 +769,13 @@ Private Sub WriteReadme(basePath As String, wb As Workbook)
           "- **Git**: Use branches (`git checkout -b feature-name`) for development" & vbCrLf
     
     txt = txt & vbCrLf & _
-          "## AGENT HARNESS (tools/)" & vbCrLf & _
+          "## AGENT HARNESS" & vbCrLf & _
           "An AI agent (Claude Code, MCP client, bash script) can drive this" & vbCrLf & _
           "workbook end-to-end via the bundled PowerShell session harness:" & vbCrLf & _
           "run macros, read/write cells, respond to dialogs, capture runtime" & vbCrLf & _
-          "errors, run a discovered Test_* suite. See ``tools/INTERFACE.md`` for" & vbCrLf & _
-          "the full reference, and ``.claude/skills/excel-control/SKILL.md`` for" & vbCrLf & _
-          "agent-facing usage patterns (Claude Code auto-discovers it)." & vbCrLf & vbCrLf & _
+          "errors, run a discovered Test_* suite. The harness skill lives at" & vbCrLf & _
+          "``.claude/skills/excel-control/`` — see SKILL.md there for usage" & vbCrLf & _
+          "patterns and tools/INTERFACE.md for the full reference." & vbCrLf & vbCrLf & _
           "## NOTES" & vbCrLf & _
           "- Edit code files directly, then import back to Excel" & vbCrLf & _
           "- Form design must be done in Excel (only code imports)" & vbCrLf & _

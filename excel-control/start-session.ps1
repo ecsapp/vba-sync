@@ -23,7 +23,11 @@
 param(
     [Parameter(Mandatory=$true)] [string]$Workbook,
     [Parameter(Mandatory=$true)] [string]$SessionId,
-    [string]$SessionsRoot = (Join-Path $PSScriptRoot 'sessions'),
+    # -SessionsRoot: where per-session runtime files live. When omitted the
+    # default is computed below from the workbook path — a gitignored dir
+    # beside the workbook, deliberately NOT under .claude/ (every read/write
+    # under .claude/ triggers a permission prompt that cannot be allowlisted).
+    [string]$SessionsRoot,
     [int]$PollMs = 250,
     # -Visible: show Excel on the desktop so you can watch the agent
     # work. Worksheet screenshots become meaningful (headless mode
@@ -54,6 +58,15 @@ namespace XcSession {
   }
 }
 "@
+}
+
+$resolvedWb = (Resolve-Path -LiteralPath $Workbook).Path
+if (-not $SessionsRoot) {
+    # Beside the workbook (the repo root in the vba-sync layout), never
+    # under .claude/. Workbook-relative is layout-independent — it does not
+    # care whether this script runs from the deployed skill tree or the dev
+    # tree.
+    $SessionsRoot = Join-Path (Split-Path -Parent $resolvedWb) '.excel-control\sessions'
 }
 
 $sessionDir   = Join-Path $SessionsRoot $SessionId
@@ -751,7 +764,6 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd) {
 
 # ---------- main ----------
 
-$resolvedWb = (Resolve-Path -LiteralPath $Workbook).Path
 # Snapshot existing EXCEL.EXE PIDs so we can identify the one we create
 # even when $xl.Hwnd is unavailable (a hidden COM Excel can report Hwnd 0).
 $excelPidsBefore = @(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id)
