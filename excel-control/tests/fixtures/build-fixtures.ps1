@@ -210,6 +210,40 @@ function Build-Obscured([string]$SrcPath, [string]$Path) {
     Write-Host "  $Path (copy of msgbox.xlsm)" -ForegroundColor Green
 }
 
+function Build-SheetCode([string]$Path) {
+    # A workbook with worksheet code-behind — a function in a sheet's
+    # document module — plus one plain standard module. Exercises the
+    # excel-control `import` command's sheet-safety: the naive sync_vba
+    # imports Objects/ sheet code as orphan standard modules.
+    $xl = New-Excel
+    try {
+        $wb = $xl.Workbooks.Add()
+        $sheetComp = $null
+        foreach ($c in $wb.VBProject.VBComponents) {
+            if ($c.Type -eq 100 -and $c.Name -ne 'ThisWorkbook') { $sheetComp = $c; break }
+        }
+        if (-not $sheetComp) { throw "no worksheet code module found" }
+        $scm = $sheetComp.CodeModule
+        if ($scm.CountOfLines -gt 0) { $scm.DeleteLines(1, $scm.CountOfLines) }
+        $scm.AddFromString(@'
+Option Explicit
+
+Public Function SheetGreeting() As String
+    SheetGreeting = "hello from " & Me.Name
+End Function
+'@)
+        Add-StdModule $wb 'modPlain' @'
+Option Explicit
+
+Public Sub Noop()
+End Sub
+'@
+        Save-Macro-Workbook $wb $Path
+        $wb.Close($false)
+    } finally { $xl.Quit() | Out-Null }
+    Write-Host "  $Path" -ForegroundColor Green
+}
+
 # ---------- run ----------
 
 Write-Host "Building fixtures into $OutDir" -ForegroundColor Cyan
@@ -224,6 +258,7 @@ $paths = @{
     Form     = Join-Path $OutDir 'userform.xlsm'
     Locked   = Join-Path $OutDir 'password-locked.xlsm'
     Obscured = Join-Path $OutDir 'obscured.xlsm'
+    SheetCode = Join-Path $OutDir 'sheetcode.xlsm'
 }
 
 Build-Empty               $paths.Empty
@@ -232,6 +267,7 @@ Build-RuntimeError        $paths.Runtime
 Build-UserForm            $paths.Form
 Build-PasswordLockedSource $paths.Locked
 Build-Obscured            $paths.MsgBox $paths.Obscured
+Build-SheetCode           $paths.SheetCode
 
 # Final sweep — any orphan Excel left over from automation
 Start-Sleep -Milliseconds 400

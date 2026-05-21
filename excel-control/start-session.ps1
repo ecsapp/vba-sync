@@ -251,14 +251,20 @@ function Invoke-VbaSyncOp($Xl, $Wb, $cmd) {
         }
         $durMs = [int]([DateTime]::UtcNow - $t0).TotalMilliseconds
 
-        # Success iff the armed completion dialog fired during the run.
+        # Success iff the armed completion dialog fired. Poll — the watcher
+        # writes dialog_auto_responded around the moment Xl.Run returns, so
+        # a single scan here can race ahead of that write.
         $ok = $false
-        try {
-            foreach ($line in (Get-Content -LiteralPath $eventsFile)) {
-                if ($line -match '"t":"dialog_auto_responded"' -and
-                    $line -match ([regex]::Escape('"rule_id":"' + $armId + '"'))) { $ok = $true; break }
-            }
-        } catch {}
+        $deadline = [DateTime]::UtcNow.AddSeconds(6)
+        while (-not $ok -and [DateTime]::UtcNow -lt $deadline) {
+            try {
+                foreach ($line in (Get-Content -LiteralPath $eventsFile)) {
+                    if ($line -match '"t":"dialog_auto_responded"' -and
+                        $line -match ([regex]::Escape('"rule_id":"' + $armId + '"'))) { $ok = $true; break }
+                }
+            } catch {}
+            if (-not $ok) { Start-Sleep -Milliseconds 200 }
+        }
 
         if ($ok) {
             Write-EventLine @{ t = "${op}_completed"; id = $cmd.id; duration_ms = $durMs }
