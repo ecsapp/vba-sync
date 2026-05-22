@@ -108,9 +108,11 @@ function Start-SessionHost {
         [Parameter(Mandatory)][string]$StartSession,
         [Parameter(Mandatory)][string]$Workbook,
         [Parameter(Mandatory)][string]$SessionId,
-        [Parameter(Mandatory)][string]$SessionsRoot
+        [Parameter(Mandatory)][string]$SessionsRoot,
+        [string]$VbaPassword
     )
     $argStr = '-NoProfile -File "{0}" -Workbook "{1}" -SessionId "{2}" -SessionsRoot "{3}"' -f `
         $StartSession, $Workbook, $SessionId, $SessionsRoot
+    if ($VbaPassword) { $argStr += ' -VbaPassword "{0}"' -f $VbaPassword }
     return Start-Process pwsh -ArgumentList $argStr -PassThru -WindowStyle Hidden
 }

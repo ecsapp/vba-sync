@@ -188,11 +188,29 @@ function Unlock-VbaProject {
     [VbaUnlock.Win32]::PostMessage($dlg, [VbaUnlock.Win32]::WM_COMMAND, [IntPtr][VbaUnlock.Win32]::IDOK, [IntPtr]::Zero) | Out-Null
     Start-Sleep -Milliseconds 600
 
-    # The Properties dialog is now visible beneath; close it.
-    $propDlg = Find-VbaPropertiesDialog -ProcId $xlPid
-    if ($propDlg -ne [IntPtr]::Zero) {
-      [VbaUnlock.Win32]::PostMessage($propDlg, [VbaUnlock.Win32]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
-      Start-Sleep -Milliseconds 300
+    # The Properties dialog surfaces once the password is accepted — it
+    # can lag, so poll for it rather than search once; then close it and
+    # confirm it is gone. A single fixed-delay search missed it and left
+    # the dialog on the desktop stealing foreground.
+    $waited = 0
+    while ($waited -lt 4000) {
+      $propDlg = Find-VbaPropertiesDialog -ProcId $xlPid
+      if ($propDlg -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 200; $waited += 200; continue }
+      # Found it — WM_CLOSE, escalating to a Cancel click if that does
+      # not take, and confirm the dialog actually closed.
+      $gone = $false
+      foreach ($attempt in 1..3) {
+        if ($attempt -eq 1) {
+          [VbaUnlock.Win32]::PostMessage($propDlg, [VbaUnlock.Win32]::WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+        } else {
+          # IDCANCEL = 2 — click the Properties dialog's Cancel button.
+          [VbaUnlock.Win32]::PostMessage($propDlg, [VbaUnlock.Win32]::WM_COMMAND, [IntPtr]2, [IntPtr]::Zero) | Out-Null
+        }
+        Start-Sleep -Milliseconds 300
+        if ((Find-VbaPropertiesDialog -ProcId $xlPid) -eq [IntPtr]::Zero) { $gone = $true; break }
+      }
+      _trace ("properties dialog closed: $gone")
+      break
     }
 
     $protAfter = $Xl.ActiveWorkbook.VBProject.Protection
