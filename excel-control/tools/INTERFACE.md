@@ -180,7 +180,7 @@ Every command produces a `command_ack` first. Every event also carries a
 
 | Event | Fields | When |
 |-------|--------|------|
-| `started` | `pid`, `workbook`, `session_id` | Session opened the workbook |
+| `started` | `pid` (host pwsh), `excel_pid` (spawned EXCEL.EXE), `workbook`, `session_id`, `visible` | Session opened the workbook. `excel_pid` is the deterministic PID the watcher / crash detection target — read it from the event rather than racing state.json. |
 | `command_ack` | `id`, `cmd` | Command received and parsed |
 | `macro_completed` / `macro_failed` | `id`, `name`, `result` / `error` | run_macro result |
 | `compile_result` | `id`, `ok`, on fail: `module`, `line`, `column`, `source_context` | compile_check |

@@ -55,12 +55,13 @@ try {
     $commandsFile = Join-Path $sessionDir 'commands.jsonl'
     $stateFile    = Join-Path $sessionDir 'state.json'
 
-    # 1. Wait for started, then grab the spawned Excel PID
+    # 1. Wait for started — carries excel_pid directly so the test does
+    # not race state.json. (Post-merge p6 review caught a fast-reader
+    # race on the previous state.json-read approach.)
     $started = Wait-ForEvent $eventsFile 'started' 30
     if (-not $started) { throw "no 'started' event" }
-    $state = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
-    $excelPid = [int]$state.excel_pid
-    if ($excelPid -le 0) { throw "no excel_pid in state.json" }
+    $excelPid = [int]$started.excel_pid
+    if ($excelPid -le 0) { throw "started event has no excel_pid (got '$($started.excel_pid)')" }
     Write-Host "  started, excel_pid=$excelPid" -ForegroundColor Green
 
     # 2. Kill the session's Excel — simulates the bug4b/bug4c crash mode
