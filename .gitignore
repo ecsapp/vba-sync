@@ -25,5 +25,12 @@ Thumbs.db
 .idea/
 .scratch/
 
-# excel-control runtime session data (per-session JSONL + screenshots)
+# Claude Code per-project state — personal, not for the repo
+.claude/
+
+# excel-control runtime session data (per-session JSONL + screenshots).
+# Both locations: excel-control/sessions/ is the dev-tree default;
+# .excel-control/ is what start-session.ps1 creates beside any workbook
+# that isn't in this repo.
 excel-control/sessions/
+.excel-control/
