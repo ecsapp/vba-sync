@@ -135,6 +135,15 @@ function Start-SessionDialogWatcher {
         # session_status so the agent can tell whether a scripted run
         # still has its dialog responders queued.
         ArmedRulesCount      = 0
+        # run_macro_loop loop-scoped armed_response support. Main loop
+        # appends pre-armed rules (carrying loop_owner) here on loop
+        # entry, then appends a loop_id on LoopDisarmQueue at loop exit.
+        # Watcher drains both on each tick. Routing through queues keeps
+        # $armedRules mutation single-threaded in the watcher runspace
+        # (a scriptblock invoked from the main runspace would not see
+        # the watcher's local $armedRules variable).
+        LoopArmQueue         = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]@())
+        LoopDisarmQueue      = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]@())
     })
 
     $rs = [runspacefactory]::CreateRunspace()
@@ -614,7 +623,35 @@ function Start-SessionDialogWatcher {
         $lastActivateUtc = [DateTime]::MinValue
         $armedRules      = New-Object System.Collections.ArrayList
         $strangerTick    = 0
+
         while (-not $state.Stop) {
+            # Drain LoopArmQueue — pre-armed rules from a run_macro_loop.
+            # Emits response_armed per rule so the agent sees them queued
+            # like a regular arm_response.
+            while ($state.LoopArmQueue.Count -gt 0) {
+                $rule = $state.LoopArmQueue[0]
+                [void]$state.LoopArmQueue.RemoveAt(0)
+                [void]$armedRules.Add($rule)
+                $state.ArmedRulesCount = $armedRules.Count
+                $armEv = @{ t = 'response_armed'; id = $rule.Id; kind = $rule.Kind; repeat = $rule.Repeat }
+                if ($rule.loop_owner) { $armEv['loop_owner'] = $rule.loop_owner }
+                Write-SessionEvent $armEv
+            }
+
+            # Drain LoopDisarmQueue — loop-exit signals from the main loop.
+            # For each loop_id, remove every rule carrying that loop_owner
+            # and emit response_disarmed reason:loop_exit.
+            while ($state.LoopDisarmQueue.Count -gt 0) {
+                $loopId = $state.LoopDisarmQueue[0]
+                [void]$state.LoopDisarmQueue.RemoveAt(0)
+                $toRemove = @($armedRules | Where-Object { $_.loop_owner -eq $loopId })
+                foreach ($r in $toRemove) {
+                    [void]$armedRules.Remove($r)
+                    Write-SessionEvent @{ t = 'response_disarmed'; rule_id = $r.Id; reason = 'loop_exit' }
+                }
+                $state.ArmedRulesCount = $armedRules.Count
+            }
+
             $dialogs = Find-Dialogs -targetPid $state.ProcessId
             $stillActive = @{}
             foreach ($d in $dialogs) { $stillActive[([IntPtr]$d).ToInt64()] = $true }
@@ -763,6 +800,7 @@ function Start-SessionDialogWatcher {
                         if ($rule.Repeat -le 0) {
                             [void]$armedRules.Remove($rule)
                             $state.ArmedRulesCount = $armedRules.Count
+                            Write-SessionEvent @{ t = 'response_disarmed'; rule_id = $rule.Id; reason = 'repeat_exhausted' }
                         }
                         Write-SessionEvent @{ t = 'dialog_auto_responded'; dialog_id = $id
                             rule_id = $rule.Id; button = $rule.Button; ok = [bool]$ar.Ok }

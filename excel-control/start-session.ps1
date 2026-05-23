@@ -339,7 +339,235 @@ function Test-ExcelAlive($Xl, [switch]$ComHeartbeat) {
     return $true
 }
 
-function Invoke-SessionCommand($Xl, $Wb, $cmd) {
+# run_macro_loop support — three helpers + the loop driver itself.
+
+# Deep-clone a command object substituting {{i}} and {{n}} with the
+# current 1-indexed iteration number on every string value. Uses a JSON
+# round-trip so nested arrays/objects come out as a clean independent
+# copy (no shared references between iterations).
+function Expand-LoopVars($obj, [int]$Iter) {
+    if ($null -eq $obj) { return $obj }
+    $json = ConvertTo-Json -Compress -Depth 20 -InputObject $obj
+    $json = $json -replace '\{\{i\}\}', [string]$Iter
+    $json = $json -replace '\{\{n\}\}', [string]$Iter
+    return ($json | ConvertFrom-Json)
+}
+
+# Scan events.jsonl from a given byte offset forward for any event whose
+# t-field matches the supplied type list OR (when -AnyFailedSuffix) any
+# t ending in '_failed'. Returns the first matching event as a
+# pscustomobject, or $null. Glob-prefilters the raw line so we only
+# parse-to-JSON on a hit. Same I/O pattern as Read-NewCommands.
+function Find-StopOnEvent {
+    param(
+        [Parameter(Mandatory)] [string]$EventsFile,
+        [Parameter(Mandatory)] [long]$FromOffset,
+        [string[]]$StopTypes = @(),
+        [switch]$AnyFailedSuffix
+    )
+    if (-not (Test-Path $EventsFile)) { return $null }
+    $fs = [System.IO.File]::Open($EventsFile, 'Open', 'Read', 'ReadWrite')
+    try {
+        if ($FromOffset -gt $fs.Length) { return $null }
+        $fs.Position = $FromOffset
+        $sr = New-Object System.IO.StreamReader($fs, [System.Text.Encoding]::UTF8, $true, 1024, $true)
+        while (-not $sr.EndOfStream) {
+            $line = $sr.ReadLine()
+            if (-not $line) { continue }
+            $hit = $false
+            foreach ($t in $StopTypes) {
+                if ($line -like ('*"t":"' + $t + '"*')) { $hit = $true; break }
+            }
+            # *_failed pattern: agreed with p6 (collab seq 10) — hardcoding a
+            # list goes stale; the harness convention is *_failed for every
+            # failure event, so one regex stays current as new commands ship.
+            if (-not $hit -and $AnyFailedSuffix -and $line -match '"t":"[a-z_]+_failed"') {
+                $hit = $true
+            }
+            if ($hit) {
+                try { return ($line | ConvertFrom-Json) } catch { return $null }
+            }
+        }
+        $sr.Dispose()
+        return $null
+    } finally { $fs.Dispose() }
+}
+
+# Run-macro-loop driver. Key invariants (full design notes in the
+# cross-project-primitives collab PLAN-run-macro-loop.md):
+# - One macro_loop_progress per iteration (streaming); terminal
+#   macro_loop_completed with per_iteration[].
+# - Loop-scoped armed_responses via state.LoopArmQueue / LoopDisarmQueue
+#   (watcher owns $armedRules; queues route mutation through it).
+# - {{i}}/{{n}} interpolation per-iteration via Expand-LoopVars.
+# - stop_on matched via Find-StopOnEvent's offset-based scan.
+# - between_iterations failure detection uses *_failed pattern (any new
+#   harness command's failure event surfaces automatically).
+# - Mid-loop Test-ExcelAlive — a crashed Excel exits with
+#   stop_reason:session_crashed (not stop_on, even if excel_crashed is
+#   listed — the crash check runs FIRST per iteration).
+function Invoke-MacroLoop($Xl, $Wb, $cmd) {
+    $loopId      = $cmd.id
+    $iterations  = 0
+    try { $iterations = [int]$cmd.iterations } catch {}
+    if ($iterations -lt 1) {
+        Write-EventLine @{ t = 'macro_loop_failed'; id = $loopId
+            error = 'iterations must be a positive integer' }
+        return
+    }
+    $name         = [string]$cmd.name
+    if (-not $name) {
+        Write-EventLine @{ t = 'macro_loop_failed'; id = $loopId; error = 'name is required' }
+        return
+    }
+    $betweenCmds    = @()
+    if ($cmd.between_iterations) { $betweenCmds = @($cmd.between_iterations) }
+    $betweenOnError = if ($cmd.between_iterations_on_error) { [string]$cmd.between_iterations_on_error } else { 'stop' }
+    $stopOn         = @()
+    if ($cmd.stop_on) { $stopOn = @($cmd.stop_on) }
+    $armed          = @()
+    if ($cmd.armed_responses) { $armed = @($cmd.armed_responses) }
+    $argsArr        = @()
+    if ($null -ne $cmd.args) { $argsArr = @($cmd.args) }
+
+    # Queue loop-scoped armed_responses through the watcher's LoopArmQueue.
+    if ($armed.Count -gt 0 -and $script:Watcher) {
+        $armIdx = 0
+        foreach ($a in $armed) {
+            $armIdx++
+            $rep = 1
+            if ($a.repeat) { try { $rep = [int]$a.repeat } catch {} }
+            if ($rep -lt 1) { $rep = 1 }
+            $rule = @{
+                Id         = "${loopId}-arm-${armIdx}"
+                Kind       = $(if ($a.control) { 'form_control' } else { 'response' })
+                Match      = $a.match
+                Button     = $a.button
+                Control    = $a.control
+                Value      = $a.value
+                Repeat     = $rep
+                loop_owner = $loopId
+            }
+            [void]$script:Watcher.State.LoopArmQueue.Add($rule)
+        }
+    }
+
+    $perIter    = New-Object System.Collections.ArrayList
+    $stopReason = 'completed'
+    $stopEvent  = $null
+    $stopAtIter = $null
+    $loopStart  = [DateTime]::UtcNow
+
+    for ($i = 1; $i -le $iterations; $i++) {
+        $script:LastCommandTime = [DateTime]::UtcNow
+
+        # Mid-loop crash check — bail if the spawned Excel went away.
+        if (-not (Test-ExcelAlive -Xl $Xl)) {
+            $stopReason = 'session_crashed'
+            $stopAtIter = $i
+            break
+        }
+
+        $preMacroOffset = 0
+        try { $preMacroOffset = (Get-Item -LiteralPath $eventsFile).Length } catch {}
+
+        $iterStart  = [DateTime]::UtcNow
+        $iterRecord = [ordered]@{ i = $i }
+        $expandedArgs = @()
+        if ($argsArr.Count -gt 0) {
+            $expandedArgs = @(Expand-LoopVars -obj $argsArr -Iter $i)
+        }
+        $macroRef = if ($name -like '*!*') { $name } else { "'$($Wb.Name)'!$name" }
+        try {
+            $result = switch ($expandedArgs.Count) {
+                0 { $Xl.Run($macroRef) }
+                1 { $Xl.Run($macroRef, $expandedArgs[0]) }
+                2 { $Xl.Run($macroRef, $expandedArgs[0], $expandedArgs[1]) }
+                3 { $Xl.Run($macroRef, $expandedArgs[0], $expandedArgs[1], $expandedArgs[2]) }
+                4 { $Xl.Run($macroRef, $expandedArgs[0], $expandedArgs[1], $expandedArgs[2], $expandedArgs[3]) }
+                5 { $Xl.Run($macroRef, $expandedArgs[0], $expandedArgs[1], $expandedArgs[2], $expandedArgs[3], $expandedArgs[4]) }
+                default { Invoke-Macro -Xl $Xl -MacroName $macroRef -MacroArgsArr $expandedArgs }
+            }
+            $iterRecord.result      = $result
+            $iterRecord.duration_ms = [int]([DateTime]::UtcNow - $iterStart).TotalMilliseconds
+        } catch {
+            $iterRecord.error       = $_.Exception.Message
+            $iterRecord.duration_ms = [int]([DateTime]::UtcNow - $iterStart).TotalMilliseconds
+        }
+
+        # stop_on scan: events emitted since the macro started.
+        if ($stopOn.Count -gt 0) {
+            $match = Find-StopOnEvent -EventsFile $eventsFile -FromOffset $preMacroOffset -StopTypes $stopOn
+            if ($match) {
+                $iterRecord.stop = $true
+                [void]$perIter.Add($iterRecord)
+                Write-EventLine @{ t = 'macro_loop_progress'; id = $loopId; i = $i; of = $iterations
+                    duration_ms = $iterRecord.duration_ms; result = $iterRecord.result; error = $iterRecord.error
+                    stop = $true }
+                $stopReason = 'stop_on'
+                $stopEvent  = $match
+                $stopAtIter = $i
+                break
+            }
+        }
+
+        [void]$perIter.Add($iterRecord)
+        Write-EventLine @{ t = 'macro_loop_progress'; id = $loopId; i = $i; of = $iterations
+            duration_ms = $iterRecord.duration_ms; result = $iterRecord.result; error = $iterRecord.error }
+
+        # between_iterations — runs between but not after the last iteration.
+        if ($i -lt $iterations -and $betweenCmds.Count -gt 0) {
+            $betweenFailed = $false
+            foreach ($subCmdRaw in $betweenCmds) {
+                $expandedSub = Expand-LoopVars -obj $subCmdRaw -Iter $i
+                $preBetweenOffset = 0
+                try { $preBetweenOffset = (Get-Item -LiteralPath $eventsFile).Length } catch {}
+                try { Invoke-SessionCommand -Xl $Xl -Wb $Wb -cmd $expandedSub -Suppress } catch {}
+                if ($betweenOnError -eq 'stop') {
+                    $betweenMatch = Find-StopOnEvent -EventsFile $eventsFile `
+                        -FromOffset $preBetweenOffset -AnyFailedSuffix
+                    if ($betweenMatch) {
+                        $betweenFailed = $true
+                        $stopEvent     = $betweenMatch
+                        break
+                    }
+                }
+            }
+            if ($betweenFailed) {
+                $stopReason = 'between_error'
+                $stopAtIter = $i
+                break
+            }
+        }
+    }
+
+    # Signal disarm to the watcher; the response_disarmed events will
+    # stream on the watcher's next tick(s).
+    if ($script:Watcher) {
+        try { [void]$script:Watcher.State.LoopDisarmQueue.Add($loopId) } catch {}
+    }
+
+    $report = [ordered]@{
+        t                         = 'macro_loop_completed'
+        id                        = $loopId
+        iterations_requested      = $iterations
+        iterations_completed      = $perIter.Count
+        stop_reason               = $stopReason
+        stop_event                = $stopEvent
+        stop_at_iteration         = $stopAtIter
+        duration_ms               = [int]([DateTime]::UtcNow - $loopStart).TotalMilliseconds
+        per_iteration             = $perIter
+    }
+    Write-EventLine $report
+}
+
+function Invoke-SessionCommand($Xl, $Wb, $cmd, [switch]$Suppress) {
+    # -Suppress: caller (run_macro_loop) owns the outer command_ack +
+    # Save-State busy/ready boundary. The switch body still emits its
+    # natural events (range_written, calculated, …) so the agent sees
+    # every sub-step; only the dispatcher-layer ack + state churn is
+    # skipped. The switch body itself does not read $Suppress — it is
+    # the caller's flag.
     switch ($cmd.cmd) {
         'respond_dialog' {
             # Owned by the dialog watcher (separate runspace). Main loop
@@ -438,6 +666,9 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd) {
                     hresult = $ex.HResult
                 }
             }
+        }
+        'run_macro_loop' {
+            Invoke-MacroLoop -Xl $Xl -Wb $Wb -cmd $cmd
         }
         'screenshot' {
             try {
