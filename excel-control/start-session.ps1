@@ -93,6 +93,14 @@ $script:StartedAt       = (Get-Date).ToUniversalTime().ToString('o')
 $script:ExcelDead       = $false
 $script:LastCommandTime = [DateTime]::UtcNow
 $script:CrashedIdleTimeoutMs = 600000  # 10 min
+# session_status bookkeeping. Each Write-EventLine snaps the last event;
+# the dispatch loop snaps the last command + the events-since counter
+# at command_ack time. Test-ExcelAlive snaps the excel_crashed payload
+# so session_status can surface it inline when excel_alive:false.
+$script:LastCommandSnapshot    = $null
+$script:LastEventSnapshot      = $null
+$script:EventsSinceLastCommand = 0
+$script:LastCrashedEvent       = $null
 
 # Resume offset if state.json says so (allows restart-after-crash to skip
 # already-consumed commands)
@@ -107,6 +115,11 @@ function Write-EventLine([hashtable]$EventObj) {
     if (-not $EventObj.ContainsKey('ts')) {
         $EventObj['ts'] = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
     }
+    # session_status bookkeeping (sub-microsecond — script-scope assigns).
+    # command_ack resets the since-counter; everything else bumps it.
+    $script:LastEventSnapshot = @{ t = $EventObj.t; at = $EventObj.ts }
+    if ($EventObj.t -eq 'command_ack') { $script:EventsSinceLastCommand = 0 }
+    else                                { $script:EventsSinceLastCommand++ }
     $line = ConvertTo-Json -Compress -Depth 10 -InputObject $EventObj
     # Retry on transient IO contention — the dialog watcher writes the
     # same events.jsonl from another runspace. Without this a collision
@@ -305,11 +318,19 @@ function Test-ExcelAlive($Xl, [switch]$ComHeartbeat) {
     }
     if ($reason) {
         $script:ExcelDead = $true
+        $crashedAt = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+        # Snap for session_status (surfaced inline when excel_alive:false
+        # so the agent does not have to grep events.jsonl backward).
+        $script:LastCrashedEvent = @{
+            pid = $script:ExcelPid
+            reason = $reason
+            detected_at = $crashedAt
+        }
         Write-EventLine @{
             t = 'excel_crashed'
             pid = $script:ExcelPid
             reason = $reason
-            detected_at = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+            detected_at = $crashedAt
         }
         Save-State 'crashed'
         return $false
@@ -883,6 +904,55 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd) {
         }
         'import' { Invoke-VbaSyncOp -Xl $Xl -Wb $Wb -cmd $cmd }
         'export' { Invoke-VbaSyncOp -Xl $Xl -Wb $Wb -cmd $cmd }
+        'session_status' {
+            # Single-call health snapshot. Consolidates state.json + watcher
+            # state + a fresh COM-heartbeat liveness probe so an agent that
+            # "feels something is off" gets one coherent view in one round
+            # trip rather than tailing events.jsonl + reading state.json +
+            # running Get-Process.
+            #
+            # Re-probe liveness fresh — Test-ExcelAlive emits excel_crashed
+            # as a side effect if the probe flips, and snaps LastCrashedEvent.
+            # The report below then reflects the just-updated state.
+            [void](Test-ExcelAlive -Xl $Xl -ComHeartbeat)
+
+            $strangers  = @()
+            $armedCount = 0
+            if ($script:Watcher) {
+                try { $strangers  = @($script:Watcher.State.ReportedStrangerPids) } catch {}
+                try { $armedCount = [int]$script:Watcher.State.ArmedRulesCount }   catch {}
+            }
+
+            $eventsSincePrev = 0
+            if ($script:LastCommandSnapshot -and $null -ne $script:LastCommandSnapshot.events_since_prev) {
+                $eventsSincePrev = [int]$script:LastCommandSnapshot.events_since_prev
+            }
+
+            $report = [ordered]@{
+                t                          = 'session_status_report'
+                id                         = $cmd.id
+                report_version             = 1
+                status                     = $(if ($script:ExcelDead) { 'crashed' } else { 'ready' })
+                host_alive                 = $true
+                excel_alive                = -not $script:ExcelDead
+                host_pid                   = $PID
+                excel_pid                  = $script:ExcelPid
+                workbook                   = $resolvedWb
+                session_id                 = $SessionId
+                started_at                 = $script:StartedAt
+                last_command               = $script:LastCommandSnapshot
+                last_event                 = $script:LastEventSnapshot
+                events_since_last_command  = $eventsSincePrev
+                stranger_excel_pids        = $strangers
+                armed_responses_active     = $armedCount
+                idle_seconds               = [int]([DateTime]::UtcNow - $script:LastCommandTime).TotalSeconds
+                last_excel_check_ts        = $script:LastExcelCheckTs
+            }
+            if ($script:ExcelDead -and $script:LastCrashedEvent) {
+                $report['crashed_event'] = $script:LastCrashedEvent
+            }
+            Write-EventLine $report
+        }
         'close_recovery' {
             # Terminate a stranger EXCEL.EXE the watcher surfaced via
             # `recovery_instance_detected`. Validation gate: pid must be in
@@ -1037,7 +1107,18 @@ try {
                 continue
             }
 
-            Write-EventLine @{ t = 'command_ack'; id = $cmd.id; cmd = $cmd.cmd }
+            # Snap the events-since counter BEFORE command_ack zeroes it,
+            # then build LastCommandSnapshot so session_status can report
+            # "events between the previous command and this one".
+            $snappedEventsSincePrev = $script:EventsSinceLastCommand
+            $ackAt = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+            $script:LastCommandSnapshot = @{
+                id = $cmd.id
+                cmd = $cmd.cmd
+                at = $ackAt
+                events_since_prev = $snappedEventsSincePrev
+            }
+            Write-EventLine @{ t = 'command_ack'; id = $cmd.id; cmd = $cmd.cmd; ts = $ackAt }
             Save-State 'busy'
             Invoke-SessionCommand -Xl $xl -Wb $wb -cmd $cmd
             if ($script:ExcelDead) { Save-State 'crashed' } else { Save-State 'ready' }

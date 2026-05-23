@@ -133,6 +133,42 @@ at machine speed.
 | `list_macros` | — | `macros_listed` with `macros[]` (`module`, `kind`, `name`, `args`, `public`, `line`) |
 | `list_sheets` | — | `sheets_listed` with `sheets[]` (`name`, `index`, `used_range`, `tables`, `hidden`, `protected`) |
 | `get_workbook_info` | — | `workbook_info` with `info` (size, sheet count, has_vba, has_pivots, has_connections, …) |
+| `session_status` | — | `session_status_report` with the consolidated snapshot below |
+
+`session_status` is the **single command to call when something feels off**.
+It re-probes Excel liveness (so a freshly-dead Excel surfaces in the report,
+emitting `excel_crashed` as a side effect), then consolidates `state.json` +
+the watcher's tracked state + a few lightweight bookkeeping counters into
+one event. Cheaper than tailing `events.jsonl` + reading `state.json` +
+running `Get-Process`; complements but does not replace the
+`excel_crashed` / `recovery_instance_detected` push events.
+
+Report shape:
+
+```jsonc
+{"t":"session_status_report","id":"c1",
+ "report_version":1,
+ "status":"ready",                         // "ready" | "crashed" (mirrors state.json)
+ "host_alive":true,                        // always true if you got this event
+ "excel_alive":true,                       // freshly re-probed
+ "host_pid":12345,
+ "excel_pid":67890,
+ "workbook":"C:\\...\\X.xlsm",
+ "session_id":"s1",
+ "started_at":"...",
+ "last_command":{"id":"c42","cmd":"run_macro","at":"...","events_since_prev":2},
+ "last_event":{"t":"macro_completed","at":"..."},
+ "events_since_last_command":2,
+ "stranger_excel_pids":[],                 // populated by the stranger sweep
+ "armed_responses_active":3,
+ "idle_seconds":7,
+ "last_excel_check_ts":"...",
+ "crashed_event":{"pid":67890,"reason":"process exited","detected_at":"..."}}
+```
+
+`crashed_event` is present only when `excel_alive:false` — it carries
+the same payload as the most recent `excel_crashed` push event so the
+agent does not have to grep `events.jsonl` backward to find why.
 
 ### VBA source
 
@@ -215,6 +251,7 @@ Every command produces a `command_ack` first. Every event also carries a
 | `recovery_close_failed` | `id`, `pid`, `reason` (`unknown_or_unreported_pid` / `missing_or_invalid_pid` / Stop-Process message) | `close_recovery` rejected or failed |
 | `command_rejected` | `id`, `cmd`, `reason` (currently only `excel_crashed`) | command refused because the session is in `crashed` and the command is not `close` / `close_recovery` |
 | `crashed_idle_timeout` | `idle_ms` | `crashed` session self-tearing down after 10 min of agent silence — `closed` follows |
+| `session_status_report` | the consolidated snapshot (see `session_status` command above) | response to `session_status` |
 
 ## Patterns
 
