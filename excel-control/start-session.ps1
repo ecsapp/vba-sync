@@ -561,6 +561,146 @@ function Invoke-MacroLoop($Xl, $Wb, $cmd) {
     Write-EventLine $report
 }
 
+# analyze_vba support — walks the live VBE once per call (no disk
+# fallback, per the collab seq-4 contract), returns a flat catalogue
+# of every Sub/Function definition. Consumed by definition_of and
+# callers_of; v2 callees_of / references_to will reuse it.
+function Get-VbaProcedures($Proj) {
+    $procs = New-Object System.Collections.ArrayList
+    foreach ($comp in $Proj.VBComponents) {
+        if ($comp.CodeModule.CountOfLines -le 0) { continue }
+        $kindStr = switch ([int]$comp.Type) {
+            1   { 'standard' } 2 { 'class' } 3 { 'userform' } 100 { 'document' }
+            default { "type$([int]$comp.Type)" }
+        }
+        $cm    = $comp.CodeModule
+        $total = [int]$cm.CountOfLines
+        $headers = New-Object System.Collections.ArrayList
+        for ($ln = 1; $ln -le $total; $ln++) {
+            $line = $cm.Lines($ln, 1)
+            if ($line -match '^\s*(Public\s+|Private\s+|Friend\s+)?(Sub|Function)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)') {
+                $vis = "$($Matches[1])".Trim()
+                $isPublic = ($vis -eq '') -or ($vis -ieq 'Public')
+                [void]$headers.Add(@{
+                    Module        = $comp.Name
+                    Kind          = $Matches[2].ToLower()
+                    Name          = $Matches[3]
+                    Line          = $ln
+                    Signature     = $line.Trim()
+                    Args          = $Matches[4].Trim()
+                    Public        = $isPublic
+                    ComponentKind = $kindStr
+                })
+            }
+        }
+        # Assign body_start / body_end (line before next header, or end of module)
+        for ($i = 0; $i -lt $headers.Count; $i++) {
+            $h = $headers[$i]
+            $h.BodyStart = $h.Line
+            $h.BodyEnd   = if ($i -lt $headers.Count - 1) { $headers[$i + 1].Line - 1 } else { $total }
+            [void]$procs.Add([pscustomobject]$h)
+        }
+    }
+    return $procs
+}
+
+function Invoke-VbaDefinitionOf($Proj, [string]$Name, $Cmd) {
+    $procs = Get-VbaProcedures $Proj
+    # NOT $matches — that's a PowerShell automatic variable set by -match
+    # / regex operators; reusing the name would silently clobber the
+    # implicit match groups inside this function and is undefined behaviour
+    # for the assignment.
+    $defs = @($procs | Where-Object { $_.Name -ieq $Name } | ForEach-Object {
+        [ordered]@{
+            module    = $_.Module
+            kind      = $_.Kind
+            name      = $_.Name           # canonical casing from the VBE
+            line      = $_.Line
+            signature = $_.Signature
+            public    = $_.Public
+            args      = $_.Args
+        }
+    })
+    Write-EventLine @{ t = 'vba_analysis_result'; id = $Cmd.id
+        op = 'definition_of'; query = $Name; matches = $defs }
+}
+
+function Invoke-VbaReadModule($Proj, [string]$Name, $Cmd) {
+    $comp = $null
+    foreach ($c in $Proj.VBComponents) {
+        if ($c.Name -ieq $Name) { $comp = $c; break }
+    }
+    if (-not $comp) {
+        Write-EventLine @{ t = 'vba_analysis_result'; id = $Cmd.id
+            op = 'read_module'; query = $Name; module = $null
+            note = "no module named '$Name'" }
+        return
+    }
+    $cm  = $comp.CodeModule
+    $src = if ($cm.CountOfLines -gt 0) { $cm.Lines(1, $cm.CountOfLines) } else { '' }
+    $kindStr = switch ([int]$comp.Type) {
+        1   { 'standard' } 2 { 'class' } 3 { 'userform' } 100 { 'document' }
+        default { "type$([int]$comp.Type)" }
+    }
+    Write-EventLine @{ t = 'vba_analysis_result'; id = $Cmd.id
+        op = 'read_module'; query = $Name
+        module = [ordered]@{
+            name       = $comp.Name
+            kind       = $kindStr
+            line_count = [int]$cm.CountOfLines
+            source     = $src
+        } }
+}
+
+function Invoke-VbaCallersOf($Proj, [string]$Name, $Cmd) {
+    $procs  = Get-VbaProcedures $Proj
+    $needle = [regex]::Escape($Name)
+    $callPat = [regex]::new('\b' + $needle + '\b', 'IgnoreCase')
+
+    # Cache CodeModule per module name — catalogue stays pure-data,
+    # body-scan looks the component up once per module via name.
+    $modCache = @{}
+    foreach ($p in $procs) {
+        if (-not $modCache.ContainsKey($p.Module)) {
+            $cm = $null
+            foreach ($c in $Proj.VBComponents) { if ($c.Name -eq $p.Module) { $cm = $c.CodeModule; break } }
+            $modCache[$p.Module] = $cm
+        }
+    }
+
+    $callers = New-Object System.Collections.ArrayList
+    foreach ($p in $procs) {
+        # A procedure is never reported as a caller of itself. The
+        # function return-value assignment (`BuildSql = expr` inside
+        # the `BuildSql` function body) would otherwise count as a
+        # match, as would the defining `Sub Foo(...)` line itself.
+        # Trade-off: this suppresses true recursion detection — rare
+        # in business VBA, and `callers_of` is intended to answer "who
+        # else uses this", not "does it recurse".
+        if ($p.Name -ieq $Name) { continue }
+        $cm = $modCache[$p.Module]
+        if (-not $cm) { continue }
+        $hits = @()
+        for ($ln = $p.BodyStart; $ln -le $p.BodyEnd; $ln++) {
+            $line = $cm.Lines($ln, 1)
+            $trim = $line.TrimStart()
+            if ($trim.StartsWith("'")) { continue }      # comment-only line
+            if ($callPat.IsMatch($line)) { $hits += $ln }
+        }
+        if ($hits.Count -gt 0) {
+            [void]$callers.Add([ordered]@{
+                module     = $p.Module
+                kind       = $p.Kind
+                name       = $p.Name
+                line       = $p.Line
+                call_lines = $hits
+            })
+        }
+    }
+    Write-EventLine @{ t = 'vba_analysis_result'; id = $Cmd.id
+        op = 'callers_of'; query = $Name; callers = $callers }
+}
+
 function Invoke-SessionCommand($Xl, $Wb, $cmd, [switch]$Suppress) {
     # -Suppress: caller (run_macro_loop) owns the outer command_ack +
     # Save-State busy/ready boundary. The switch body still emits its
@@ -892,6 +1032,39 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd, [switch]$Suppress) {
                 }
             } catch {
                 Write-EventLine @{ t = 'range_write_failed'; id = $cmd.id; error = $_.Exception.Message; trace = $_.ScriptStackTrace }
+            }
+        }
+        'analyze_vba' {
+            try {
+                $op   = [string]$cmd.op
+                $name = [string]$cmd.name
+                if (-not $op) {
+                    Write-EventLine @{ t = 'analyze_vba_failed'; id = $cmd.id; reason = 'missing_op' }
+                    break
+                }
+                if ($op -ne 'definition_of' -and $op -ne 'read_module' -and $op -ne 'callers_of') {
+                    Write-EventLine @{ t = 'analyze_vba_failed'; id = $cmd.id; reason = 'unknown_op'; op = $op }
+                    break
+                }
+                if (-not $name) {
+                    Write-EventLine @{ t = 'analyze_vba_failed'; id = $cmd.id; reason = 'missing_name'; op = $op }
+                    break
+                }
+                $proj = $null
+                try { $proj = Get-AccessibleVBProject $Wb }
+                catch {
+                    $msg = $_.Exception.Message
+                    $reason = if ($msg -match 'password-locked') { 'vba_project_locked' } else { $msg }
+                    Write-EventLine @{ t = 'analyze_vba_failed'; id = $cmd.id; reason = $reason }
+                    break
+                }
+                switch ($op) {
+                    'definition_of' { Invoke-VbaDefinitionOf -Proj $proj -Name $name -Cmd $cmd }
+                    'read_module'   { Invoke-VbaReadModule   -Proj $proj -Name $name -Cmd $cmd }
+                    'callers_of'    { Invoke-VbaCallersOf    -Proj $proj -Name $name -Cmd $cmd }
+                }
+            } catch {
+                Write-EventLine @{ t = 'analyze_vba_failed'; id = $cmd.id; reason = $_.Exception.Message }
             }
         }
         'list_macros' {

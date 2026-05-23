@@ -170,7 +170,59 @@ at machine speed.
 | `list_macros` | — | `macros_listed` with `macros[]` (`module`, `kind`, `name`, `args`, `public`, `line`) |
 | `list_sheets` | — | `sheets_listed` with `sheets[]` (`name`, `index`, `used_range`, `tables`, `hidden`, `protected`) |
 | `get_workbook_info` | — | `workbook_info` with `info` (size, sheet count, has_vba, has_pivots, has_connections, …) |
+| `analyze_vba` | `op` (`definition_of` / `read_module` / `callers_of`), `name` | `vba_analysis_result` (see below) or `analyze_vba_failed` |
 | `session_status` | — | `session_status_report` with the consolidated snapshot below |
+
+`analyze_vba` is static inspection of the live VBA project — bypasses
+the `import` + grep round-trip an agent today uses to navigate an
+unfamiliar workbook or find refactor targets. All ops match
+**case-insensitively** on `name` and return the canonical casing
+from the VBE (VBA convention). The project is read straight from
+Excel's running VBE; if the project is password-locked beyond the
+session's auto-unlock the call emits
+`analyze_vba_failed reason:vba_project_locked` (use `import`/`export`
++ disk grep as a fallback).
+
+`op` shapes:
+
+```jsonc
+// definition_of — every Sub/Function whose name matches
+{"id":"c1","cmd":"analyze_vba","op":"definition_of","name":"DoIt"}
+// → vba_analysis_result with matches[]:
+//   {"module":"modA","kind":"sub","name":"DoIt","line":47,
+//    "signature":"Public Sub DoIt(byVal i As Long)","public":true,"args":"byVal i As Long"}
+// Multiple matches are surfaced (VBA permits same-name across modules).
+
+// read_module — full source of a module (code body only — VBE's
+//   CodeModule.Lines does NOT include the `Attribute VB_Name`
+//   header or other Attribute metadata that vba-sync's .bas export
+//   prepends. This is the same text you would see in the VBE
+//   editor pane.)
+{"id":"c2","cmd":"analyze_vba","op":"read_module","name":"modSales"}
+// → vba_analysis_result with module:
+//   {"name":"modSales","kind":"standard|class|userform|document",
+//    "line_count":142,"source":"Option Explicit\n..."}
+
+// callers_of — every Sub/Function with at least one body line
+//   that references <name> (case-insensitive \bname\b)
+{"id":"c3","cmd":"analyze_vba","op":"callers_of","name":"BuildUpdateSql"}
+// → vba_analysis_result with callers[]:
+//   {"module":"modSync","kind":"sub","name":"SyncToolPush","line":124,"call_lines":[151,168]}
+```
+
+`callers_of` matching: case-insensitive `\bname\b` regex over each
+caller's body lines; **excludes** comment-only lines (`'`) and the
+definition line itself (so a Sub is never reported as a caller of
+itself). Searches every component including sheet code-behind /
+ThisWorkbook — sheet events can call standard-module Subs and vice
+versa. **v1 caveat**: string-literal false positives are not filtered
+(a `"Name"` literal inside another Sub will appear as a call). In
+practice these are rare in real VBA; v2 may add a tokenizer.
+
+Empty `matches[]` / `callers[]` (or `module: null` for `read_module`)
+is the normal "not found" result — `analyze_vba_failed` is reserved
+for genuine errors (missing/unknown op, locked project, unexpected
+exception).
 
 `session_status` is the **single command to call when something feels off**.
 It re-probes Excel liveness (so a freshly-dead Excel surfaces in the report,
@@ -268,6 +320,8 @@ Every command produces a `command_ack` first. Every event also carries a
 | `workbook_*` events | varies | workbook lifecycle |
 | `calculated` / `refreshed_all` / `connection_refreshed` / `connection_failed` | varies | calc/refresh |
 | `macros_listed` / `sheets_listed` / `workbook_info` | see above | introspection |
+| `vba_analysis_result` | `op`, `query`, and one of `matches[]` (definition_of), `module` object (read_module), `callers[]` (callers_of) | `analyze_vba` result |
+| `analyze_vba_failed` | `reason` (`missing_op` / `missing_name` / `unknown_op` / `vba_project_locked` / exception message), optional `op` | `analyze_vba` failed |
 | `sync_completed` / `sync_failed` | see above | sync_vba |
 | `import_completed` / `export_completed` | `id`, `duration_ms` | `import` / `export` |
 | `import_failed` / `export_failed` | `id`, `error`, optional `duration_ms` | `import` / `export` error |
