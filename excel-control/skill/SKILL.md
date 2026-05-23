@@ -339,6 +339,33 @@ setting up test inputs or scenario assumptions:
 
 Single-cell anchor (`A1`) auto-resizes to the input dimensions.
 
+## When something feels off — `session_status`
+
+One round-trip health snapshot. Faster than tailing `events.jsonl`,
+reading `state.json`, and running `Get-Process` to piece together what
+state the session is in. Re-probes Excel liveness fresh — if Excel
+just died, the report carries `excel_alive:false` AND `crashed_event`
+inline, and an `excel_crashed` push fires as a side effect.
+
+```jsonc
+{"id":"c?","cmd":"session_status"}
+// →
+{"t":"session_status_report","id":"c?",
+ "report_version":1,
+ "status":"ready","host_alive":true,"excel_alive":true,
+ "excel_pid":12345,"workbook":"...","session_id":"s1",
+ "last_command":{"id":"c42","cmd":"run_macro","at":"..."},
+ "last_event":{"t":"macro_completed","at":"..."},
+ "events_since_last_command":2,
+ "stranger_excel_pids":[],"armed_responses_active":3,
+ "idle_seconds":7,"last_excel_check_ts":"..."}
+```
+
+Use when: a command is taking unexpectedly long, a `macro_completed`
+hasn't fired, you came back from another task and want to know if the
+session is still healthy before sending the next command. Cheap —
+the report data lives in memory and updates as events flow.
+
 ## When Excel crashes
 
 Excel can die mid-session — most often after a VBA runtime error the

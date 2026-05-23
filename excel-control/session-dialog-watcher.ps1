@@ -131,6 +131,10 @@ function Start-SessionDialogWatcher {
         # primary safety risk for an arm_response click on a stranger; 2s
         # caps the race at one missed poll.
         StrangerSweepEveryNthPoll = [int]([Math]::Max(1, [Math]::Round(2000 / $PollMs)))
+        # Live count of active armed_response rules. Surfaced via
+        # session_status so the agent can tell whether a scripted run
+        # still has its dialog responders queued.
+        ArmedRulesCount      = 0
     })
 
     $rs = [runspacefactory]::CreateRunspace()
@@ -756,7 +760,10 @@ function Start-SessionDialogWatcher {
                             $ar = Send-DialogClick $info $rule.Button
                         }
                         $rule.Repeat = $rule.Repeat - 1
-                        if ($rule.Repeat -le 0) { [void]$armedRules.Remove($rule) }
+                        if ($rule.Repeat -le 0) {
+                            [void]$armedRules.Remove($rule)
+                            $state.ArmedRulesCount = $armedRules.Count
+                        }
                         Write-SessionEvent @{ t = 'dialog_auto_responded'; dialog_id = $id
                             rule_id = $rule.Id; button = $rule.Button; ok = [bool]$ar.Ok }
                         if ($ar.Ok) {
@@ -844,6 +851,7 @@ function Start-SessionDialogWatcher {
                             Repeat  = $rep
                         }
                         [void]$armedRules.Add($rule)
+                        $state.ArmedRulesCount = $armedRules.Count
                         Write-SessionEvent @{ t = 'response_armed'; id = $cmd.id; kind = $rule.Kind; repeat = $rep }
                     }
                 }
