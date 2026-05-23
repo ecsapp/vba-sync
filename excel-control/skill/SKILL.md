@@ -339,6 +339,56 @@ setting up test inputs or scenario assumptions:
 
 Single-cell anchor (`A1`) auto-resizes to the input dimensions.
 
+## When Excel crashes
+
+Excel can die mid-session — most often after a VBA runtime error the
+harness auto-End'd, or any time `EXCEL.EXE` exits without warning. The
+harness now detects this and emits a clean signal instead of leaving
+`status: ready` lying about a dead Excel.
+
+You see one or both of:
+
+```jsonc
+// the spawned Excel exited or its COM ref disconnected
+{"t":"excel_crashed","pid":38684,"reason":"process exited","detected_at":"..."}
+
+// a brand-new EXCEL.EXE appeared on the desktop — typically Excel's
+// Document Recovery panel for the workbook it just lost
+{"t":"recovery_instance_detected","pid":99999,
+ "main_window_title":"P6 Tools (version 1).xlsb - Repaired - Excel",
+ "looks_like_recovery":true,
+ "screenshot":".excel-control/sessions/s1/captures/stranger-99999.png"}
+```
+
+State machine after `excel_crashed`:
+
+- `state.json.status` → `"crashed"`.
+- Only `close` and `close_recovery` are accepted; anything else emits
+  `{"t":"command_rejected","id":...,"cmd":"...","reason":"excel_crashed"}`.
+- After 10 min with no commands the host self-tears-down
+  (`crashed_idle_timeout` → `closed`).
+
+Recommended response:
+
+1. Stop sending normal commands as soon as you see `excel_crashed`.
+2. If a `recovery_instance_detected` follows, **tell the user** — open
+   the screenshot, show the title. The recovery file may carry unsaved
+   data the user cares about; do not auto-close it.
+3. After the user OKs, dismiss the stranger:
+   `{"id":"c?","cmd":"close_recovery","pid":<pid from the event>}`
+   → `recovery_closed` or `recovery_close_failed`. The harness only
+   accepts PIDs it previously reported a `recovery_instance_detected`
+   for (so it cannot kill arbitrary processes).
+4. End the dead session: `{"id":"cN","cmd":"close"}` → `closed`.
+
+`recovery_instance_detected` also fires for **any** stranger
+`EXCEL.EXE` (not just recovery panels) — e.g. the user opened Excel for
+something else mid-session. `looks_like_recovery: false` distinguishes
+those from real recovery panels.
+
+`last_excel_check_ts` in `state.json` is updated after every successful
+liveness probe — read it to see how stale a `ready` status is.
+
 ## When NOT to use the harness
 
 - **Just reading VBA source** — that's a vba-sync Export; no session

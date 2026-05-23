@@ -82,9 +82,17 @@ foreach ($f in @($commandsFile, $eventsFile)) {
     if (-not (Test-Path $f)) { Set-Content -LiteralPath $f -Value '' -Encoding UTF8 -NoNewline }
 }
 
-$script:LastOffset = 0
-$script:Stop       = $false
-$script:StartedAt  = (Get-Date).ToUniversalTime().ToString('o')
+$script:LastOffset      = 0
+$script:Stop            = $false
+$script:StartedAt       = (Get-Date).ToUniversalTime().ToString('o')
+# Crash-detection state. ExcelDead flips once when either the per-loop
+# Get-Process check or a pre-dispatch COM heartbeat sees the spawned Excel
+# gone; the dispatch loop then accepts only `close` / `close_recovery` and
+# emits `command_rejected` for anything else. LastCommandTime drives the
+# zombie-host idle timeout in `crashed` (no agent reads => self-tear-down).
+$script:ExcelDead       = $false
+$script:LastCommandTime = [DateTime]::UtcNow
+$script:CrashedIdleTimeoutMs = 600000  # 10 min
 
 # Resume offset if state.json says so (allows restart-after-crash to skip
 # already-consumed commands)
@@ -112,14 +120,15 @@ function Write-EventLine([hashtable]$EventObj) {
 
 function Save-State([string]$Status) {
     $s = [ordered]@{
-        pid                 = $PID
-        excel_pid           = $script:ExcelPid
-        workbook            = $Workbook
-        session_id          = $SessionId
-        status              = $Status
-        visible             = [bool]$Visible
-        started_at          = $script:StartedAt
-        last_command_offset = $script:LastOffset
+        pid                  = $PID
+        excel_pid            = $script:ExcelPid
+        workbook             = $Workbook
+        session_id           = $SessionId
+        status               = $Status
+        visible              = [bool]$Visible
+        started_at           = $script:StartedAt
+        last_command_offset  = $script:LastOffset
+        last_excel_check_ts  = $script:LastExcelCheckTs
     }
     # Write temp then rename — a reader must never catch state.json
     # empty, which a direct Set-Content leaves it while writing.
@@ -275,6 +284,38 @@ function Invoke-VbaSyncOp($Xl, $Wb, $cmd) {
     } catch {
         Write-EventLine @{ t = "${op}_failed"; id = $cmd.id; error = $_.Exception.Message }
     }
+}
+
+# Crash detection — both gates of items A and C in the design.
+# Returns $true when Excel is gone (either path), flipping $script:ExcelDead
+# and emitting `excel_crashed` exactly once. Cheap: a Get-Process by PID and
+# (optionally) a single `$xl.Hwnd` get; the COM read is what catches a race
+# where the process is up but the COM ref has gone disconnected.
+function Test-ExcelAlive($Xl, [switch]$ComHeartbeat) {
+    if ($script:ExcelDead) { return $false }
+    $reason = $null
+    if ($script:ExcelPid) {
+        $p = $null
+        try { $p = Get-Process -Id $script:ExcelPid -ErrorAction SilentlyContinue } catch {}
+        if (-not $p) { $reason = 'process exited' }
+    }
+    if (-not $reason -and $ComHeartbeat -and $Xl) {
+        try { $null = $Xl.Hwnd }
+        catch { $reason = "com disconnected: $($_.Exception.Message)" }
+    }
+    if ($reason) {
+        $script:ExcelDead = $true
+        Write-EventLine @{
+            t = 'excel_crashed'
+            pid = $script:ExcelPid
+            reason = $reason
+            detected_at = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+        }
+        Save-State 'crashed'
+        return $false
+    }
+    $script:LastExcelCheckTs = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+    return $true
 }
 
 function Invoke-SessionCommand($Xl, $Wb, $cmd) {
@@ -842,6 +883,32 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd) {
         }
         'import' { Invoke-VbaSyncOp -Xl $Xl -Wb $Wb -cmd $cmd }
         'export' { Invoke-VbaSyncOp -Xl $Xl -Wb $Wb -cmd $cmd }
+        'close_recovery' {
+            # Terminate a stranger EXCEL.EXE the watcher surfaced via
+            # `recovery_instance_detected`. Validation gate: pid must be in
+            # the watcher's ReportedStrangerPids — refuses to kill arbitrary
+            # processes (only Excels we already told the agent about).
+            $targetPid = $null
+            try { $targetPid = [int]$cmd.pid } catch {}
+            if (-not $targetPid) {
+                Write-EventLine @{ t = 'recovery_close_failed'; id = $cmd.id; pid = $cmd.pid; reason = 'missing_or_invalid_pid' }
+                break
+            }
+            $reported = $false
+            if ($script:Watcher -and $script:Watcher.State.ReportedStrangerPids) {
+                $reported = $script:Watcher.State.ReportedStrangerPids.Contains($targetPid)
+            }
+            if (-not $reported) {
+                Write-EventLine @{ t = 'recovery_close_failed'; id = $cmd.id; pid = $targetPid; reason = 'unknown_or_unreported_pid' }
+                break
+            }
+            try {
+                Stop-Process -Id $targetPid -Force -ErrorAction Stop
+                Write-EventLine @{ t = 'recovery_closed'; id = $cmd.id; pid = $targetPid; ok = $true }
+            } catch {
+                Write-EventLine @{ t = 'recovery_close_failed'; id = $cmd.id; pid = $targetPid; reason = $_.Exception.Message }
+            }
+        }
         'close' {
             Write-EventLine @{ t = 'closing'; id = $cmd.id }
             $script:Stop = $true
@@ -931,16 +998,21 @@ try {
     }
 
     $watcher = Start-SessionDialogWatcher `
-        -ProcessId    $excelPid `
-        -EventsFile   $eventsFile `
-        -CommandsFile $commandsFile `
-        -CapturesDir  $capturesDir `
-        -Visible      ([bool]$Visible)
+        -ProcessId         $excelPid `
+        -EventsFile        $eventsFile `
+        -CommandsFile      $commandsFile `
+        -CapturesDir       $capturesDir `
+        -Visible           ([bool]$Visible) `
+        -BaselineExcelPids $excelPidsBefore
     $script:Watcher     = $watcher
     $script:CapturesDir = $capturesDir
     $script:SessionDir  = $sessionDir
 
     while (-not $script:Stop) {
+        # Per-loop process-liveness check (item A). On exit it flips
+        # ExcelDead and emits excel_crashed exactly once.
+        if (-not $script:ExcelDead) { [void](Test-ExcelAlive -Xl $xl) }
+
         $cmds = Read-NewCommands
         foreach ($entry in $cmds) {
             $cmd = $entry.obj
@@ -949,13 +1021,38 @@ try {
             # on a live modal while the main loop is blocked in $Xl.Run) —
             # skip them here.
             if ($cmd.cmd -in 'respond_dialog','set_form_control','arm_response','arm_form_control') { continue }
+            $script:LastCommandTime = [DateTime]::UtcNow
+
+            # Pre-dispatch COM heartbeat (item C). Catches a race where the
+            # process survives the per-loop check but the COM ref is gone.
+            if (-not $script:ExcelDead) { [void](Test-ExcelAlive -Xl $xl -ComHeartbeat) }
+
+            # In `crashed`, only close / close_recovery are accepted.
+            # Anything else emits command_rejected (single new event shape,
+            # not per-<cmd>_failed variants — agreed on the collab channel).
+            if ($script:ExcelDead -and $cmd.cmd -notin 'close','close_recovery') {
+                Write-EventLine @{ t = 'command_rejected'; id = $cmd.id; cmd = $cmd.cmd; reason = 'excel_crashed' }
+                continue
+            }
+
             Write-EventLine @{ t = 'command_ack'; id = $cmd.id; cmd = $cmd.cmd }
             Save-State 'busy'
             Invoke-SessionCommand -Xl $xl -Wb $wb -cmd $cmd
-            Save-State 'ready'
+            if ($script:ExcelDead) { Save-State 'crashed' } else { Save-State 'ready' }
             if ($script:Stop) { break }
         }
-        Save-State 'ready'
+        if (-not $script:ExcelDead) { Save-State 'ready' }
+
+        # Zombie-host idle timeout in `crashed` (10 min). Prevents a dead
+        # session lingering forever if no agent reads the channel.
+        if ($script:ExcelDead) {
+            $idleMs = ([DateTime]::UtcNow - $script:LastCommandTime).TotalMilliseconds
+            if ($idleMs -gt $script:CrashedIdleTimeoutMs) {
+                Write-EventLine @{ t = 'crashed_idle_timeout'; idle_ms = [int]$idleMs }
+                $script:Stop = $true
+            }
+        }
+
         if (-not $script:Stop) { Start-Sleep -Milliseconds $PollMs }
     }
 }
