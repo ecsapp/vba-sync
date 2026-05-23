@@ -48,6 +48,8 @@ workbook root.
    — check the `events.jsonl` tail for a `session_error`.
 3. **Watch events** — point the Monitor tool at
    `.excel-control/sessions/s1/events.jsonl` (one notification per appended line).
+   **Filter must include every `*_failed` event you could plausibly see** —
+   silence is not success. See [Monitor filter recommendations](#monitor-filter-recommendations) below.
 4. **Send commands** — append one JSON object per line to
    `.excel-control/sessions/s1/commands.jsonl` (append only; never rewrite it).
 5. **End the session** — append `{"id":"cN","cmd":"close"}`.
@@ -127,6 +129,48 @@ fixed count); first-armed wins if two could match. A dialog no rule
 matches still falls through to the normal `respond_dialog` path. For a
 UserForm, `arm_form_control` arms an optional control set plus a button
 click.
+
+### Navigate an unfamiliar workbook — `analyze_vba`
+
+Cold-start discovery on a workbook with hundreds of Subs; refactoring
+without leaving the session; "where is X used?" without exporting +
+grepping. Three ops, all case-insensitive on `name` (the response
+carries the canonical casing from the VBE):
+
+```jsonc
+// "Where is BuildUpdateSql defined?"
+{"id":"c1","cmd":"analyze_vba","op":"definition_of","name":"BuildUpdateSql"}
+// → {"t":"vba_analysis_result","op":"definition_of","query":"BuildUpdateSql",
+//    "matches":[{"module":"modSync","kind":"function","name":"BuildUpdateSql",
+//                "line":472,"signature":"Private Function BuildUpdateSql(...)",
+//                "public":false,"args":"keyCol As String, valCol As String"}]}
+
+// "What's in modSync?"
+{"id":"c2","cmd":"analyze_vba","op":"read_module","name":"modSync"}
+// → {"t":"vba_analysis_result","op":"read_module","query":"modSync",
+//    "module":{"name":"modSync","kind":"standard","line_count":823,
+//              "source":"Option Explicit\n..."}}
+// (code body only — Attribute VB_Name and other metadata are not
+//  in CodeModule.Lines; this is what the VBE editor shows.)
+
+// "Who calls BuildUpdateSql?"
+{"id":"c3","cmd":"analyze_vba","op":"callers_of","name":"BuildUpdateSql"}
+// → {"t":"vba_analysis_result","op":"callers_of","query":"BuildUpdateSql",
+//    "callers":[{"module":"modSync","kind":"sub","name":"SyncToolPush",
+//                "line":124,"call_lines":[151,168]},
+//               {"module":"modSync","kind":"function","name":"BuildResourceSql",
+//                "line":401,"call_lines":[412]}]}
+```
+
+`callers_of` excludes comment-only lines and the definition line
+itself; searches sheet code-behind / ThisWorkbook too. **v1 caveat**:
+string-literal false positives (e.g. `"Name"` inside another Sub) are
+not filtered — rare in practice, documented in INTERFACE.md.
+
+Empty `matches[]` / `callers[]` (or `module:null`) is the normal "not
+found" result. `analyze_vba_failed` only fires on a real error
+(missing/unknown op, password-locked project beyond the harness's
+auto-unlock, unexpected exception).
 
 ### Reproduce an intermittent bug — `run_macro_loop`
 
@@ -491,6 +535,45 @@ liveness probe — read it to see how stale a `ready` status is.
 - **Don't open the same workbook twice** — use one session per
   workbook (multi-workbook within a session is fine via
   `open_workbook` / `close_workbook`).
+
+## Monitor filter recommendations
+
+The harness emits failure events as `<verb>_failed` — `range_read_failed`,
+`macro_failed`, `compile_failed`, `analyze_vba_failed`, etc. Every
+command type has at least one failure event; some have several. **A
+Monitor filter that matches only success events will silently stall
+when a command fails** — the agent waits forever for an event that
+never comes (this happened in production: a 66-minute stall before
+the operator noticed an unmatched `range_read_failed`).
+
+Two reliable patterns:
+
+1. **Match all `*_failed`** (preferred):
+   `grep -E --line-buffered '"t":"[a-z_]+_failed"|"t":"<success-type>"'`
+2. **Match every success event you care about, AND keep a wildcard
+   for `_failed`** — same as above but with an explicit allowlist of
+   success types. Catches typos in command names too (an unrecognised
+   command emits `unknown_command`).
+
+Specific failure events worth knowing about:
+
+- `command_error` — invalid JSON in `commands.jsonl`. The harness
+  scrapes the `id` field if present so the agent can correlate.
+- `unknown_command` — command name not recognised. Often a typo.
+- `command_rejected` — only in `crashed` state; pairs with the
+  `excel_crashed` push event.
+- `<verb>_failed` for every verb — `range_read_failed`,
+  `range_write_failed`, `macro_failed`, `compile_failed`,
+  `sync_failed`, `import_failed`, `export_failed`, `save_failed`,
+  `open_failed`, `close_workbook_failed`, `calculate_failed`,
+  `refresh_failed`, `connection_failed`, `screenshot_failed`,
+  `analyze_vba_failed`, `respond_failed`, `form_control_failed`,
+  `arm_failed`, `recovery_close_failed`, `tests_failed`,
+  `macros_list_failed`, `sheets_list_failed`, `workbook_info_failed`.
+
+The wildcard pattern future-proofs against new failure events shipping
+with later harness versions — every new command will follow the
+`<verb>_failed` convention.
 
 ## Debugging stuck or unhappy sessions
 
