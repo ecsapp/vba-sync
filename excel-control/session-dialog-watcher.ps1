@@ -94,26 +94,43 @@ function Start-SessionDialogWatcher {
         [Parameter(Mandatory=$true)] [string]$CommandsFile,
         [Parameter(Mandatory=$true)] [string]$CapturesDir,
         [int]$PollMs = 200,
-        [bool]$Visible = $false
+        [bool]$Visible = $false,
+        # EXCEL.EXE PIDs snapshotted at session start (before we created our
+        # own Excel). Used by the stranger-sweep to exclude pre-existing
+        # user Excels — only Excels that appeared *during* the session
+        # count as strangers worth surfacing (recovery panel etc.).
+        [int[]]$BaselineExcelPids = @()
     )
 
+    # ReportedStrangerPids — synchronized hashset of stranger PIDs we've
+    # already emitted recovery_instance_detected for, so subsequent polls
+    # do not spam duplicates. Also doubles as the close_recovery validation
+    # gate in start-session: only PIDs we told the agent about can be killed.
+    $reportedStrangers = [System.Collections.Generic.HashSet[int]]::new()
+
     $state = [hashtable]::Synchronized(@{
-        Stop          = $false
-        ProcessId     = $ProcessId
-        EventsFile    = $EventsFile
-        CommandsFile  = $CommandsFile
-        CapturesDir   = $CapturesDir
-        PollMs        = $PollMs
-        MacroRunning  = $false
-        Visible       = $Visible
-        BreakMode     = $false
-        DebugOnError  = $false
-        DebugHelper   = (Join-Path $PSScriptRoot 'debug-capture.ps1')
-        ActiveDialogs = [hashtable]::Synchronized(@{})
-        DialogInfo    = [hashtable]::Synchronized(@{})
-        NextId        = 1
-        CmdOffset     = 0
-        Cs            = $script:XcWatcherCs
+        Stop                 = $false
+        ProcessId            = $ProcessId
+        EventsFile           = $EventsFile
+        CommandsFile         = $CommandsFile
+        CapturesDir          = $CapturesDir
+        PollMs               = $PollMs
+        MacroRunning         = $false
+        Visible              = $Visible
+        BreakMode            = $false
+        DebugOnError         = $false
+        DebugHelper          = (Join-Path $PSScriptRoot 'debug-capture.ps1')
+        ActiveDialogs        = [hashtable]::Synchronized(@{})
+        DialogInfo           = [hashtable]::Synchronized(@{})
+        NextId               = 1
+        CmdOffset            = 0
+        Cs                   = $script:XcWatcherCs
+        BaselineExcelPids    = @($BaselineExcelPids)
+        ReportedStrangerPids = $reportedStrangers
+        # Throttle the stranger sweep — ~2s, recovery-panel detection is the
+        # primary safety risk for an arm_response click on a stranger; 2s
+        # caps the race at one missed poll.
+        StrangerSweepEveryNthPoll = [int]([Math]::Max(1, [Math]::Round(2000 / $PollMs)))
     })
 
     $rs = [runspacefactory]::CreateRunspace()
@@ -592,6 +609,7 @@ function Start-SessionDialogWatcher {
         $deferredPolls   = 0
         $lastActivateUtc = [DateTime]::MinValue
         $armedRules      = New-Object System.Collections.ArrayList
+        $strangerTick    = 0
         while (-not $state.Stop) {
             $dialogs = Find-Dialogs -targetPid $state.ProcessId
             $stillActive = @{}
@@ -865,6 +883,58 @@ function Start-SessionDialogWatcher {
                 }
             } else {
                 $deferredPolls = 0
+            }
+
+            # Stranger-Excel sweep (item B). Throttled to ~2s by counting
+            # poll ticks; any EXCEL.EXE not in baseline + our spawned PID
+            # is a stranger. The recovery panel surfaces in a NEW Excel
+            # instance, so a PID-set diff is the deterministic detector
+            # (MSAA/window class is only used as a payload qualifier).
+            $strangerTick++
+            if ($strangerTick -ge $state.StrangerSweepEveryNthPoll) {
+                $strangerTick = 0
+                $known = New-Object System.Collections.Generic.HashSet[int]
+                foreach ($p in @($state.BaselineExcelPids)) { [void]$known.Add([int]$p) }
+                [void]$known.Add([int]$state.ProcessId)
+                $current = @(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+                foreach ($xpid in $current) {
+                    $ipid = [int]$xpid
+                    if ($known.Contains($ipid)) { continue }
+                    if ($state.ReportedStrangerPids.Contains($ipid)) { continue }
+                    $proc = $null
+                    try { $proc = Get-Process -Id $ipid -ErrorAction SilentlyContinue } catch {}
+                    $title = ''
+                    $hwnd  = [int64]0
+                    if ($proc) {
+                        try { $title = [string]$proc.MainWindowTitle } catch {}
+                        try { $hwnd  = [int64]$proc.MainWindowHandle } catch {}
+                    }
+                    # Recovery classifier (qualifier, not a gate). Title
+                    # pattern from p6's bug4b/bug4c data:
+                    #   <file> - Repaired - Excel
+                    $isRecovery = ($title -match ' - Repaired ' -and $title -like '* - Excel')
+
+                    # Screenshot the stranger's main window (+1 ask). Skip
+                    # silently when there is no HWND (handle = 0 for a
+                    # not-yet-painted top-level window).
+                    $shot = $null
+                    if ($hwnd -ne 0) {
+                        try {
+                            $shotPath = Join-Path $state.CapturesDir ("stranger-$ipid.png")
+                            [void](Save-DialogPng -Hwnd $hwnd -Path $shotPath)
+                            if (Test-Path $shotPath) { $shot = $shotPath }
+                        } catch {}
+                    }
+
+                    Write-SessionEvent @{
+                        t                    = 'recovery_instance_detected'
+                        pid                  = $ipid
+                        main_window_title    = $title
+                        looks_like_recovery  = [bool]$isRecovery
+                        screenshot           = $shot
+                    }
+                    [void]$state.ReportedStrangerPids.Add($ipid)
+                }
             }
 
             Start-Sleep -Milliseconds $state.PollMs

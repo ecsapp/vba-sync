@@ -40,14 +40,22 @@ Write/Edit append: tools/sessions/s1/commands.jsonl
 
 ```
 sessions/<id>/
-├── state.json          pid, workbook, status, last_command_offset
+├── state.json          pid, workbook, status, last_command_offset, last_excel_check_ts
 ├── commands.jsonl      agent appends; harness consumes in order
 ├── events.jsonl        harness appends; agent watches
 └── captures/           PNG screenshots referenced by events
 ```
 
 `state.json` is the agent's source of truth for session health.
-`status` is one of `ready`, `busy`, `closed`, `crashed`.
+`status` is one of `starting`, `ready`, `busy`, `closed`, `crashed`.
+`ready` means **host AND Excel are alive** — the host re-probes Excel
+(per-loop `Get-Process` on the spawned PID + pre-dispatch COM heartbeat)
+and writes `last_excel_check_ts` after every successful probe, so a stale
+`ready` is observable. Once Excel exits, the host transitions to `crashed`
+and **only** `close` and `close_recovery` are accepted; everything else is
+refused with a `command_rejected` event (`reason: excel_crashed`). A
+`crashed` session that sees no commands for 10 minutes self-tears-down via
+`crashed_idle_timeout` → `closed`.
 
 ## Commands
 
@@ -154,6 +162,16 @@ modules** — use `import` for any workbook with worksheet code.
 | Command | Body | Result event |
 |---------|------|--------------|
 | `close` | — | `closing` → `closed` |
+| `close_recovery` | `pid` (int — must be a PID previously reported via `recovery_instance_detected`) | `recovery_closed` or `recovery_close_failed` |
+
+`close_recovery` terminates a stranger `EXCEL.EXE` the watcher surfaced
+(typically a Document Recovery panel that appeared in a new Excel
+instance after the session's Excel crashed). The harness will only kill
+PIDs it has previously emitted a `recovery_instance_detected` for —
+arbitrary processes are refused with `unknown_or_unreported_pid`. Use
+this **after user confirmation** (the recovery file may carry unsaved
+data the user cares about). Accepted in both `ready` and `crashed`
+states.
 
 ## Events
 
@@ -191,6 +209,12 @@ Every command produces a `command_ack` first. Every event also carries a
 | `session_error` | `error`, `stack` | session crashed |
 | `command_error` | `error`, `raw` | invalid JSON in commands.jsonl |
 | `unknown_command` | `id`, `cmd` | command name not recognised |
+| `excel_crashed` | `pid`, `reason` (`process exited` or `com disconnected: …`), `detected_at` | spawned Excel exited OR COM ref disconnected — `status` transitions to `crashed` |
+| `recovery_instance_detected` | `pid`, `main_window_title`, `looks_like_recovery` (bool — title matches `… - Repaired - Excel`), optional `screenshot` | stranger `EXCEL.EXE` (not in startup baseline, not the session's spawned PID) appeared — typically a Document Recovery panel |
+| `recovery_closed` | `id`, `pid`, `ok:true` | `close_recovery` succeeded |
+| `recovery_close_failed` | `id`, `pid`, `reason` (`unknown_or_unreported_pid` / `missing_or_invalid_pid` / Stop-Process message) | `close_recovery` rejected or failed |
+| `command_rejected` | `id`, `cmd`, `reason` (currently only `excel_crashed`) | command refused because the session is in `crashed` and the command is not `close` / `close_recovery` |
+| `crashed_idle_timeout` | `idle_ms` | `crashed` session self-tearing down after 10 min of agent silence — `closed` follows |
 
 ## Patterns
 
