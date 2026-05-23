@@ -172,6 +172,64 @@ found" result. `analyze_vba_failed` only fires on a real error
 (missing/unknown op, password-locked project beyond the harness's
 auto-unlock, unexpected exception).
 
+### Diagnose a heap crash — `pre_crash_log`
+
+When a macro crashes Excel mid-run (the heap-corruption class —
+runtime_error → macro_failed → Excel dies → recovery panel), the
+state you actually need is "what was happening just before the
+crash". The harness ships a file-append logger `xcHarness_Log(s)`
+that the agent can call from VBA, plus an auto-vacuum that emits
+the tail of that log as a `pre_crash_log` event on failure.
+
+```jsonc
+// 1) Run the macro with instrument: enables xcHarness_Log + arms vacuum
+{"id":"c1","cmd":"run_macro","name":"SyncToolPush",
+ "instrument":{"log":true,"tail_lines":200}}
+// 2) The agent's VBA calls xcHarness_Log at key points:
+//      xcHarness_Log "before BuildSql with k=" & k
+//      xcHarness_Log "after BuildSql, sql len=" & Len(sql)
+//      xcHarness_Log "before ADODB.Execute"
+// 3) Macro crashes. Events stream:
+{"t":"instrument_active","id":"c1","log_file":"...macro.log","injected":true,"tail_lines":200}
+{"t":"runtime_error","number":10,"description":"This array is fixed or temporarily locked"}
+{"t":"macro_failed","id":"c1","error":"..."}
+{"t":"pre_crash_log","id":"c1","macro":"SyncToolPush","trigger":"macro_failed",
+ "log_file":"...macro.log",
+ "log_lines":[
+   "2026-05-23 02:14:33.107 before BuildSql with k=cch-cse",
+   "2026-05-23 02:14:33.108 after BuildSql, sql len=487",
+   "2026-05-23 02:14:33.109 before ADODB.Execute"
+ ],
+ "lines_returned":3,"total_lines":3,"tail_truncated":false}
+{"t":"excel_crashed","pid":12345,"reason":"process exited"}
+// pre_crash_log does NOT fire a second time on excel_crashed —
+// once per active instrument, even when both triggers happen.
+```
+
+Key invariants:
+
+- **Lazy injection** — without `instrument:{log:true}` the harness
+  never modifies the workbook's VBA project. Workbooks that don't
+  opt in stay clean.
+- **`xcHarness_` namespace** — collision-proof with user code; the
+  module survives a workbook save if the agent saves mid-session.
+  `sync_vba` strips it on the next call if leave-no-trace is needed.
+- **Once-per-failure vacuum** — the heap-corruption sequence fires
+  both `macro_failed` AND `excel_crashed`; `pre_crash_log` emits on
+  the first only.
+- **Stale-path warning** — re-opening a workbook from a prior
+  session surfaces `instrument_stale_path` with the old + intended
+  log paths so the agent isn't blind to the mismatch (module is
+  left immutable; agent decides).
+- **VBA call site** — direct call `xcHarness_Log "message"` works
+  at runtime (VBA compiles-on-demand). If your flow runs
+  `compile_check` *before* a `run_macro` with `instrument:`, the
+  module isn't injected yet and the direct call won't compile —
+  use late-bound `Application.Run "xcHarness_Log", "message"`
+  instead (always compiles, the procedure is resolved at runtime).
+  The Sub uses `FreeFile` + `On Error Resume Next` so a logging
+  miss never crashes the macro.
+
 ### Reproduce an intermittent bug — `run_macro_loop`
 
 When a bug only fires every Nth run, or you want a soak test, drive
@@ -569,7 +627,8 @@ Specific failure events worth knowing about:
   `refresh_failed`, `connection_failed`, `screenshot_failed`,
   `analyze_vba_failed`, `respond_failed`, `form_control_failed`,
   `arm_failed`, `recovery_close_failed`, `tests_failed`,
-  `macros_list_failed`, `sheets_list_failed`, `workbook_info_failed`.
+  `macros_list_failed`, `sheets_list_failed`, `workbook_info_failed`,
+  `instrument_failed`, `macro_loop_failed`.
 
 The wildcard pattern future-proofs against new failure events shipping
 with later harness versions — every new command will follow the

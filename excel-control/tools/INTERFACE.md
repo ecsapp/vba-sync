@@ -66,7 +66,7 @@ and `cmd` (the command name).
 
 | Command | Body | Result event |
 |---------|------|--------------|
-| `run_macro` | `name`, optional `args[]`, optional `debug_on_error` | `macro_completed` with `result`, `duration_ms` |
+| `run_macro` | `name`, optional `args[]`, optional `debug_on_error`, optional `instrument` (`{log:true, tail_lines?, vacuum_on?[]}` — see below) | `macro_completed` with `result`, `duration_ms` |
 | `run_macro_loop` | `name`, `iterations`, optional `args[]`, `between_iterations[]`, `between_iterations_on_error` (`stop`/`continue`, default `stop`), `stop_on[]`, `armed_responses[]` | one `macro_loop_progress` per iteration + terminal `macro_loop_completed` |
 | `compile_check` | — | `compile_result` with `ok` and on fail: `module`, `line`, `source_context` |
 | `run_tests` | optional `filter` (regex on Test_* name) | one `test_result` per test + `tests_completed` summary |
@@ -106,6 +106,56 @@ queue via the watcher's normal `arm_response` path (carrying
 reason) — the watcher emits `response_disarmed reason:loop_exit` per
 rule. If you want a rule to persist across the loop, send it as a
 plain `arm_response` *before* the `run_macro_loop` command.
+
+#### Pre-crash logging — `run_macro` `instrument`
+
+For heap-corruption-class diagnosis (a macro that crashes Excel
+mid-run) `run_macro` accepts an optional `instrument` arg:
+
+```jsonc
+{"id":"c1","cmd":"run_macro","name":"SyncToolPush",
+ "instrument":{"log":true,"tail_lines":200,"vacuum_on":["macro_failed","excel_crashed"]}}
+```
+
+`instrument.log:true` is the gate. When set, the harness:
+
+1. **Lazily injects** a hidden `xcHarnessLog` standard module
+   (containing the `xcHarness_Log` Sub) into the workbook's VBProject
+   (idempotent — already injected ⇒ skip; no `instrument` flag
+   ever ⇒ no VBA modification). The injected module bakes the log
+   path as a `Private Const xcHarness_LogPath` so the Sub needs no
+   per-call argument plumbing. (Note: the module name differs from
+   the Sub name on purpose — a same-name module + sub causes
+   `Application.Run` to ambiguate.)
+2. **Exposes `xcHarness_Log(s As String)`** for the agent's VBA to
+   call: `xcHarness_Log "entering BuildSql with k=" & k`. The Sub
+   file-appends one line per call (with a ms-resolution timestamp);
+   `FreeFile` + `On Error Resume Next` so a logging miss never
+   crashes the macro.
+3. **Emits `instrument_active`** on success or `instrument_failed`
+   on VBProject access trouble (locked beyond auto-unlock).
+   `run_macro` proceeds with or without the instrument depending.
+4. **Auto-vacuums on failure** — when `macro_failed` OR
+   `excel_crashed` fires for an active instrument, the harness reads
+   the last `tail_lines` (default 200) of the log file and emits
+   them as a `pre_crash_log` event. **Once per failure**: a
+   heap-corruption sequence fires both `macro_failed` AND
+   `excel_crashed`; the second is a no-op so the agent sees one
+   coherent dump, not two overlapping ones.
+
+Log file: `<session-dir>/macro.log` — predictable, the agent can
+also tail it directly while the macro runs. The injected module
+**survives a workbook save** (the agent might not save; if they do,
+the `xcHarness_` namespace prefix avoids collisions with user
+code). `sync_vba` strips it on the next call if leave-no-trace is
+needed.
+
+**Stale-path note** — if a session re-opens a workbook that already
+has the `xcHarnessLog` module from a PRIOR session, the baked
+`xcHarness_LogPath` const points at the old session's log file. The
+module is left immutable; an `instrument_stale_path` warning event
+surfaces both paths so the agent can decide (read the old log path,
+or `sync_vba` to strip and re-inject).
 
 ### Cell I/O
 
@@ -308,6 +358,10 @@ Every command produces a `command_ack` first. Every event also carries a
 | `started` | `pid` (host pwsh), `excel_pid` (spawned EXCEL.EXE), `workbook`, `session_id`, `visible` | Session opened the workbook. `excel_pid` is the deterministic PID the watcher / crash detection target — read it from the event rather than racing state.json. |
 | `command_ack` | `id`, `cmd` | Command received and parsed |
 | `macro_completed` / `macro_failed` | `id`, `name`, `result` / `error` | run_macro result |
+| `instrument_active` | `id`, `log_file`, `injected` (bool), `tail_lines`, `vacuum_on[]` | a `run_macro` with `instrument:{log:true}` has injected (or found) the `xcHarnessLog` module (Sub `xcHarness_Log`) and armed the auto-vacuum |
+| `instrument_failed` | `id`, `error` | `xcHarnessLog` module injection failed (e.g. locked VBProject); `run_macro` still proceeds without instrumentation |
+| `instrument_stale_path` | `id`, `old_path`, `intended_path`, `note` | a re-opened workbook's existing `xcHarnessLog` module bakes a path from a prior session; module left immutable, paths surfaced for the agent |
+| `pre_crash_log` | `id` (run_macro id), `macro`, `trigger` (`macro_failed` / `excel_crashed`), `log_file`, `log_lines[]`, `lines_returned`, `total_lines`, `tail_truncated` | auto-vacuum of the `xcHarness_Log` output file on failure — once per active instrument, even if both macro_failed and excel_crashed fire |
 | `macro_loop_progress` | `id` (loop id), `i`, `of`, `duration_ms`, `result` or `error`, optional `stop:true` | per-iteration progress during run_macro_loop |
 | `macro_loop_completed` | `id`, `iterations_requested`, `iterations_completed`, `stop_reason`, `stop_event`, `stop_at_iteration`, `duration_ms`, `per_iteration[]` | terminal event for run_macro_loop |
 | `macro_loop_failed` | `id`, `error` | invalid run_macro_loop input (e.g. missing `name`, non-positive `iterations`) |

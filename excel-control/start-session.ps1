@@ -101,6 +101,11 @@ $script:LastCommandSnapshot    = $null
 $script:LastEventSnapshot      = $null
 $script:EventsSinceLastCommand = 0
 $script:LastCrashedEvent       = $null
+# instrument tracking — populated by an instrument-flagged run_macro so
+# Test-ExcelAlive can auto-vacuum the log on excel_crashed. emitted gates
+# the once-per-failure invariant (a heap-corruption sequence fires both
+# macro_failed AND excel_crashed; both should not emit pre_crash_log).
+$script:LogVacuumActive        = $null
 
 # Resume offset if state.json says so (allows restart-after-crash to skip
 # already-consumed commands)
@@ -332,6 +337,8 @@ function Test-ExcelAlive($Xl, [switch]$ComHeartbeat) {
             reason = $reason
             detected_at = $crashedAt
         }
+        # Pre-crash log auto-vacuum (once per active instrument).
+        Invoke-PreCrashLogEmit -TriggerEvent 'excel_crashed'
         Save-State 'crashed'
         return $false
     }
@@ -701,6 +708,125 @@ function Invoke-VbaCallersOf($Proj, [string]$Name, $Cmd) {
         op = 'callers_of'; query = $Name; callers = $callers }
 }
 
+# Pre-crash logger support — xcHarness_Log VBA module is injected
+# lazily, only when an agent flags a run_macro with instrument:{...}.
+# Workbooks the agent never instruments stay unmutated; xlam regression
+# tests stay clean.
+
+# Module is named xcHarnessLog (no underscore) so the contained Sub
+# xcHarness_Log (with underscore) is unambiguous to Application.Run.
+# Same-name module + sub trips Excel's "Cannot run the macro" error
+# because the lookup ambiguates module vs procedure.
+$script:XcHarnessLogModuleName  = 'xcHarnessLog'
+$script:XcHarnessLogVbaTemplate = @'
+Attribute VB_Name = "xcHarnessLog"
+Option Explicit
+
+' Injected by excel-control harness (lazy, on first instrumented
+' run_macro). Do not edit manually. File-append logger for pre-crash
+' state capture. Agent VBA calls: xcHarness_Log "any message".
+
+Private Const xcHarness_LogPath As String = "{{LOG_PATH}}"
+
+Public Sub xcHarness_Log(ByVal s As String)
+    On Error Resume Next
+    Dim fn As Integer
+    fn = FreeFile
+    Open xcHarness_LogPath For Append As #fn
+    Print #fn, Format(Now, "yyyy-mm-dd hh:nn:ss"); "."; _
+               Format(Timer * 1000 Mod 1000, "000"); " "; s
+    Close #fn
+End Sub
+'@
+
+# Read the const value from an existing xcHarness_Log module — needed
+# for stale-path detection when a workbook is re-opened in a new session.
+function Get-XcLogConstPath($Component) {
+    if (-not $Component) { return $null }
+    $cm = $Component.CodeModule
+    if (-not $cm -or $cm.CountOfLines -le 0) { return $null }
+    for ($ln = 1; $ln -le [int]$cm.CountOfLines; $ln++) {
+        $line = $cm.Lines($ln, 1)
+        if ($line -match 'Private\s+Const\s+xcHarness_LogPath\s+As\s+String\s*=\s*"([^"]*)"') {
+            return $Matches[1]
+        }
+    }
+    return $null
+}
+
+# Inject the module if not already present. Idempotent. Returns
+# @{ path; injected; stale_path? } — stale_path is the OLD baked-in
+# path when the module already existed with a different path (a
+# re-opened workbook from a prior session). Caller surfaces that as an
+# instrument_stale_path warning event.
+function Ensure-XcHarnessLogModule($Wb) {
+    $intendedPath = Join-Path $script:SessionDir 'macro.log'
+    try {
+        $proj = Get-AccessibleVBProject $Wb
+    } catch {
+        throw "xcHarness_Log injection requires VBProject access: $($_.Exception.Message)"
+    }
+    foreach ($c in $proj.VBComponents) {
+        if ($c.Name -eq $script:XcHarnessLogModuleName) {
+            $oldPath = Get-XcLogConstPath -Component $c
+            $stale = $null
+            if ($oldPath -and $oldPath -ne $intendedPath) { $stale = $oldPath }
+            return @{ path = $oldPath; injected = $false; stale_path = $stale }
+        }
+    }
+    # Inject via VBComponents.Import on a temp .bas file — same path
+    # sync_vba uses, proven to work. The earlier Add(1) +
+    # CodeModule.AddFromString sequence left Application.Run unable to
+    # resolve other macros in the project ("macro may not be available")
+    # — likely a VBE compile-state interaction; Import does not trip it.
+    $src = $script:XcHarnessLogVbaTemplate -replace '\{\{LOG_PATH\}\}', ($intendedPath -replace '\\', '\\')
+    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString('N') + '_xcHarness_Log.bas')
+    Set-Content -LiteralPath $tmp -Value $src -Encoding ASCII
+    try {
+        [void]$proj.VBComponents.Import($tmp)
+    } finally {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    }
+    return @{ path = $intendedPath; injected = $true; stale_path = $null }
+}
+
+# Read the last $TailLines lines of the log file. Returns
+# @{ lines, total, truncated }. Missing/empty file yields empty array.
+function Read-XcLogTail([string]$Path, [int]$TailLines) {
+    if (-not (Test-Path -LiteralPath $Path)) { return @{ lines = @(); total = 0; truncated = $false } }
+    $all = @()
+    try { $all = @(Get-Content -LiteralPath $Path -Encoding UTF8 -ErrorAction SilentlyContinue) } catch {}
+    $total = $all.Count
+    if ($total -le $TailLines) { return @{ lines = $all; total = $total; truncated = $false } }
+    return @{ lines = $all[($total - $TailLines)..($total - 1)]; total = $total; truncated = $true }
+}
+
+# Emit pre_crash_log if instrumentation is active for $TriggerEvent and
+# this active-instrument hasn't already emitted (once-per-failure
+# invariant — a heap-corruption sequence fires both macro_failed AND
+# excel_crashed; the second is a no-op). Clears
+# $script:LogVacuumActive.emitted to true; caller is responsible for
+# nulling the whole active-instrument record on macro completion.
+function Invoke-PreCrashLogEmit([string]$TriggerEvent) {
+    $a = $script:LogVacuumActive
+    if (-not $a)          { return }
+    if ($a.emitted)       { return }
+    if ($TriggerEvent -notin @($a.vacuum_on)) { return }
+    $tail = Read-XcLogTail -Path $a.path -TailLines $a.tail_lines
+    Write-EventLine @{
+        t              = 'pre_crash_log'
+        id             = $a.id
+        macro          = $a.macro
+        trigger        = $TriggerEvent
+        log_file       = $a.path
+        log_lines      = $tail.lines
+        lines_returned = $tail.lines.Count
+        total_lines    = $tail.total
+        tail_truncated = $tail.truncated
+    }
+    $script:LogVacuumActive.emitted = $true
+}
+
 function Invoke-SessionCommand($Xl, $Wb, $cmd, [switch]$Suppress) {
     # -Suppress: caller (run_macro_loop) owns the outer command_ack +
     # Save-State busy/ready boundary. The switch body still emits its
@@ -727,6 +853,45 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd, [switch]$Suppress) {
                 $cm = $Xl.VBE.Windows.Item('Immediate').CodePane.CodeModule
                 if ($cm.CountOfLines -gt 0) { $cm.DeleteLines(1, $cm.CountOfLines) }
             } catch {}
+
+            # Pre-crash instrumentation (item 4 of cross-project-primitives).
+            # cmd.instrument:{log:true, tail_lines?, vacuum_on?[]} → inject
+            # xcHarness_Log if absent + track active-instrument so the
+            # post-fail / excel_crashed paths can auto-vacuum the log file.
+            if ($cmd.instrument -and $cmd.instrument.log) {
+                $tail = if ($cmd.instrument.tail_lines) { [int]$cmd.instrument.tail_lines } else { 200 }
+                $vac  = if ($cmd.instrument.vacuum_on)  { @($cmd.instrument.vacuum_on) }
+                         else { @('macro_failed','excel_crashed') }
+                try {
+                    $inj = Ensure-XcHarnessLogModule -Wb $Wb
+                    if ($inj.stale_path) {
+                        Write-EventLine @{ t = 'instrument_stale_path'; id = $cmd.id
+                            old_path = $inj.stale_path; intended_path = (Join-Path $script:SessionDir 'macro.log')
+                            note = "xcHarness_Log module already present from a prior session; the baked xcHarness_LogPath const still points at the old log file. Module left unchanged (immutable contract)." }
+                    }
+                    $script:LogVacuumActive = @{
+                        id         = $cmd.id
+                        macro      = $cmd.name
+                        path       = $inj.path
+                        tail_lines = $tail
+                        vacuum_on  = $vac
+                        emitted    = $false
+                    }
+                    if ($inj.injected) {
+                        Write-EventLine @{ t = 'instrument_active'; id = $cmd.id
+                            log_file = $inj.path; injected = $true; tail_lines = $tail
+                            vacuum_on = $vac }
+                    } else {
+                        Write-EventLine @{ t = 'instrument_active'; id = $cmd.id
+                            log_file = $inj.path; injected = $false; tail_lines = $tail
+                            vacuum_on = $vac }
+                    }
+                } catch {
+                    Write-EventLine @{ t = 'instrument_failed'; id = $cmd.id; error = $_.Exception.Message }
+                    $script:LogVacuumActive = $null
+                }
+            }
+
             try {
                 $macroArgs = @()
                 if ($null -ne $cmd.args) { $macroArgs = @($cmd.args) }
@@ -786,6 +951,10 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd, [switch]$Suppress) {
                     result = $result
                     duration_ms = [int]([DateTime]::UtcNow - $start).TotalMilliseconds
                 }
+                # Clean macro success — instrument's done its job; clear
+                # the active record so the next failure (if any) is not
+                # mis-attributed to this run_macro.
+                $script:LogVacuumActive = $null
             } catch {
                 # If the dialog watcher already emitted a runtime_error
                 # for this macro, that's the structured signal. The
@@ -805,6 +974,11 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd, [switch]$Suppress) {
                     error_type = $ex.GetType().FullName
                     hresult = $ex.HResult
                 }
+                # Auto-vacuum (once per active instrument — if excel_crashed
+                # fires next via Test-ExcelAlive the Invoke-PreCrashLogEmit
+                # there is a no-op because emitted is now true).
+                Invoke-PreCrashLogEmit -TriggerEvent 'macro_failed'
+                $script:LogVacuumActive = $null
             }
         }
         'run_macro_loop' {
