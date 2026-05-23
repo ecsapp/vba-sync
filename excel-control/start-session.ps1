@@ -937,16 +937,15 @@ try {
     $wb = $xl.Workbooks.Open($resolvedWb, [Type]::Missing, $false, [Type]::Missing,
                              [Type]::Missing, [Type]::Missing, $true)
 
-    Save-State 'ready'
-    Write-EventLine @{ t = 'started'; pid = $PID; workbook = $resolvedWb; session_id = $SessionId; visible = [bool]$Visible }
-    Write-Host "Session $SessionId started (pid=$PID, workbook=$resolvedWb, visible=$([bool]$Visible))" -ForegroundColor Cyan
-
     # Determine Excel's PID (not our $PID) so the watcher targets the right process.
     # Recorded in state.json so tests / cleanup scripts can identify which
     # EXCEL.EXE belongs to this session — never blanket-kill all Excel.
     # A hidden COM Excel can report Hwnd = 0/null, so [IntPtr]$xl.Hwnd would
     # throw "Cannot convert null to type System.IntPtr" — guard it and fall
     # back to diffing the EXCEL.EXE process list captured before creation.
+    #
+    # MUST happen before the started event + Save-State below, so that any
+    # consumer reading state.json on `started` sees a populated excel_pid.
     $excelPid = [uint32]0
     $xlHwnd = $null
     try { $xlHwnd = $xl.Hwnd } catch {}
@@ -960,7 +959,10 @@ try {
         if ($excelPidNew.Count -ge 1) { $excelPid = [uint32]$excelPidNew[0] }
     }
     $script:ExcelPid = [int]$excelPid
-    Save-State 'ready'  # re-save now that we know excel_pid
+
+    Save-State 'ready'
+    Write-EventLine @{ t = 'started'; pid = $PID; excel_pid = $script:ExcelPid; workbook = $resolvedWb; session_id = $SessionId; visible = [bool]$Visible }
+    Write-Host "Session $SessionId started (pid=$PID, excel_pid=$($script:ExcelPid), workbook=$resolvedWb, visible=$([bool]$Visible))" -ForegroundColor Cyan
 
     # Bug C: a password-locked VBA project is inaccessible over COM
     # (VBComponents is null) until unlocked, and there is no object-model
