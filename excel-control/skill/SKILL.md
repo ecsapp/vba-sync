@@ -128,6 +128,55 @@ matches still falls through to the normal `respond_dialog` path. For a
 UserForm, `arm_form_control` arms an optional control set plus a button
 click.
 
+### Reproduce an intermittent bug — `run_macro_loop`
+
+When a bug only fires every Nth run, or you want a soak test, drive
+the macro through `run_macro_loop` and let the harness babysit:
+
+```jsonc
+{"id":"c1","cmd":"run_macro_loop",
+ "name":"SyncToolPush",
+ "iterations":10,
+ "between_iterations":[
+   {"cmd":"write_range","sheet":"Sync Tool","range":"H7",
+    "values":[["CCH-CSE [{{i}}]"]]}
+ ],
+ "stop_on":["runtime_error","macro_failed","excel_crashed"],
+ "armed_responses":[
+   {"match":{"title":"Sync Tool - Push"},"button":"Yes","repeat":99}
+ ]}
+// streaming, one per iteration:
+{"t":"macro_loop_progress","id":"c1","i":1,"of":10,"duration_ms":4200}
+{"t":"macro_loop_progress","id":"c1","i":2,"of":10,"duration_ms":3900}
+{"t":"runtime_error","number":10,...}
+{"t":"macro_loop_progress","id":"c1","i":3,"of":10,"duration_ms":1800,"error":"...","stop":true}
+// terminal:
+{"t":"macro_loop_completed","id":"c1","iterations_completed":3,
+ "stop_reason":"stop_on","stop_at_iteration":3,
+ "stop_event":{"t":"runtime_error",...},"per_iteration":[...]}
+{"t":"response_disarmed","rule_id":"c1-arm-1","reason":"loop_exit"}
+```
+
+Key points:
+
+- **`{{i}}` / `{{n}}` interpolation** — 1-indexed iteration number,
+  substituted into any string in `args` or `between_iterations`. Use
+  `[[ "row {{i}}" ]]` to vary cell content per iteration.
+- **`between_iterations` runs between (not before #1, not after the
+  last)** — and is itself a list of normal harness commands; the
+  sub-commands' natural events still emit. By default a `*_failed`
+  in a sub-command stops the loop with `stop_reason:between_error`;
+  pass `between_iterations_on_error:"continue"` to soldier on.
+- **`stop_on`** matches event types — first match in the iteration's
+  event window wins (so `runtime_error` typically lands before its
+  sibling `macro_failed`).
+- **`armed_responses` are loop-scoped** — auto-disarmed on loop exit
+  via `response_disarmed reason:loop_exit`. For session-wide rules,
+  send `arm_response` *before* the `run_macro_loop`.
+- **Mid-loop crash** — `Test-ExcelAlive` runs at the top of every
+  iteration; a dead Excel exits with `stop_reason:session_crashed`
+  alongside the normal `excel_crashed` push event.
+
 ### Drive a UserForm
 
 A macro that shows a UserForm (`ThunderDFrame`) emits `userform_appeared`

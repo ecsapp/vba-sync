@@ -67,8 +67,45 @@ and `cmd` (the command name).
 | Command | Body | Result event |
 |---------|------|--------------|
 | `run_macro` | `name`, optional `args[]`, optional `debug_on_error` | `macro_completed` with `result`, `duration_ms` |
+| `run_macro_loop` | `name`, `iterations`, optional `args[]`, `between_iterations[]`, `between_iterations_on_error` (`stop`/`continue`, default `stop`), `stop_on[]`, `armed_responses[]` | one `macro_loop_progress` per iteration + terminal `macro_loop_completed` |
 | `compile_check` | — | `compile_result` with `ok` and on fail: `module`, `line`, `source_context` |
 | `run_tests` | optional `filter` (regex on Test_* name) | one `test_result` per test + `tests_completed` summary |
+
+`run_macro_loop` runs a macro N times unattended — for soak tests,
+intermittent-bug reproduction, and parameterised runs. Streams one
+`macro_loop_progress` event per iteration (carrying `i`, `of`,
+`duration_ms`, `result`, optional `error`) so a long loop is observable
+in real time; terminates with `macro_loop_completed` (carrying
+`iterations_requested`, `iterations_completed`, `stop_reason`,
+`stop_event`, `stop_at_iteration`, `duration_ms`, `per_iteration[]`).
+
+`stop_reason` is one of:
+- `completed` — all `iterations` ran cleanly.
+- `stop_on` — an event matching any `stop_on[]` type appeared during
+  an iteration; `stop_event` carries the triggering event. First match
+  in the offset window wins, so e.g. `runtime_error` typically lands
+  before its sibling `macro_failed` for the same root cause.
+- `between_error` — a command in `between_iterations[]` emitted a
+  `*_failed` event and `between_iterations_on_error` was `stop`
+  (default). The pattern matches any `*_failed` event the harness
+  emits, so a future failure event surfaces automatically.
+- `session_crashed` — the spawned Excel died mid-loop (re-probed at
+  the top of each iteration; `excel_crashed` push event fires
+  separately via the existing crash-detection path).
+
+`between_iterations` sub-commands accept any harness command (route
+through the same dispatcher as a normal command; their natural events
+still emit). `{{i}}` and `{{n}}` (synonyms, 1-indexed) interpolate the
+current iteration index into any string value of `args[]` or
+`between_iterations[]` — e.g. `"values":[["row {{i}}"]]` writes
+`row 1`, `row 2`, ….
+
+`armed_responses` on a `run_macro_loop` are **loop-scoped**: they
+queue via the watcher's normal `arm_response` path (carrying
+`loop_owner` on the event), and are auto-disarmed on loop exit (any
+reason) — the watcher emits `response_disarmed reason:loop_exit` per
+rule. If you want a rule to persist across the loop, send it as a
+plain `arm_response` *before* the `run_macro_loop` command.
 
 ### Cell I/O
 
@@ -219,6 +256,10 @@ Every command produces a `command_ack` first. Every event also carries a
 | `started` | `pid` (host pwsh), `excel_pid` (spawned EXCEL.EXE), `workbook`, `session_id`, `visible` | Session opened the workbook. `excel_pid` is the deterministic PID the watcher / crash detection target — read it from the event rather than racing state.json. |
 | `command_ack` | `id`, `cmd` | Command received and parsed |
 | `macro_completed` / `macro_failed` | `id`, `name`, `result` / `error` | run_macro result |
+| `macro_loop_progress` | `id` (loop id), `i`, `of`, `duration_ms`, `result` or `error`, optional `stop:true` | per-iteration progress during run_macro_loop |
+| `macro_loop_completed` | `id`, `iterations_requested`, `iterations_completed`, `stop_reason`, `stop_event`, `stop_at_iteration`, `duration_ms`, `per_iteration[]` | terminal event for run_macro_loop |
+| `macro_loop_failed` | `id`, `error` | invalid run_macro_loop input (e.g. missing `name`, non-positive `iterations`) |
+| `response_disarmed` | `rule_id`, `reason` (`loop_exit` / `repeat_exhausted`) | an armed_response rule was removed; loop_exit fires on `run_macro_loop` exit for loop-scoped rules, repeat_exhausted fires when a normal rule's `repeat` counter reaches 0 |
 | `compile_result` | `id`, `ok`, on fail: `module`, `line`, `column`, `source_context` | compile_check |
 | `test_result` | `module`, `name`, `status` (pass/fail), `duration_ms`, on fail: `error` | per test in run_tests |
 | `tests_completed` | `id`, `total`, `passed`, `failed`, `duration_ms` | end of run_tests |
