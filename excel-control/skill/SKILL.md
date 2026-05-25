@@ -115,7 +115,6 @@ proceeds at machine speed.
 ```jsonc
 // arm the answers up front, then start the macro:
 {"id":"a1","cmd":"arm_response","match":{"text":"Overwrite existing"},"button":"Yes"}
-{"id":"a2","cmd":"arm_response","match":{"title":"VBA Sync","text":"completed"},"button":"OK"}
 {"id":"c1","cmd":"run_macro","name":"SyncToolPush"}
 // → each armed dialog is clicked the moment it surfaces:
 {"t":"dialog_appeared","id":"d1","title":"Microsoft Excel","text":"Overwrite existing data?"}
@@ -129,6 +128,24 @@ fixed count); first-armed wins if two could match. A dialog no rule
 matches still falls through to the normal `respond_dialog` path. For a
 UserForm, `arm_form_control` arms an optional control set plus a button
 click.
+
+**Do not pre-arm dialogs that a harness command auto-arms for itself.**
+Some commands (`import`, `export`) auto-arm the vba-sync addin's
+success MsgBox under rule id `<cmdId>-arm` so the run is hands-free. A
+user `arm_response` for the same dialog races the harness's own — and
+since rules are first-armed-wins, your rule fires first, the harness's
+own arm never confirms, and the command emits `import_failed` /
+`export_failed` even though vba-sync actually succeeded. Symptom: the
+events show `dialog_auto_responded` on the success dialog, followed by
+`<cmd>_failed` with reason "addin error dialog likely surfaced" — but
+the screenshot in `captures/d1.png` is the success dialog. Fix: send
+the command on its own, no companion `arm_response`. Auto-armed
+dialogs today:
+
+| Command | Auto-armed dialog | Rule id |
+|---|---|---|
+| `import` | "VBA Sync import completed successfully" | `<cmdId>-arm` |
+| `export` | "VBA Sync export completed successfully" | `<cmdId>-arm` |
 
 ### Navigate an unfamiliar workbook — `analyze_vba`
 
