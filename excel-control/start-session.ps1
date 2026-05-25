@@ -584,20 +584,41 @@ function Get-VbaProcedures($Proj) {
         $total = [int]$cm.CountOfLines
         $headers = New-Object System.Collections.ArrayList
         for ($ln = 1; $ln -le $total; $ln++) {
+            # VBA line-continuation: a logical line can span multiple
+            # physical lines, joined by `[space]_` at end-of-line. The
+            # procedure-header regex needs the *joined* line to match
+            # Sub Name(...) where the closing paren may live several
+            # lines down. Without this, multi-line signatures are
+            # invisible to definition_of / callers_of (silent false
+            # negative — see HARNESS_IMPROVEMENTS P1.5).
             $line = $cm.Lines($ln, 1)
-            if ($line -match '^\s*(Public\s+|Private\s+|Friend\s+)?(Sub|Function)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)') {
+            $declLine = $ln
+            $joined = $line
+            $peek = $ln
+            while ($joined -match '\s_\s*$' -and $peek -lt $total) {
+                $peek++
+                $next = $cm.Lines($peek, 1)
+                # Strip the trailing ` _` from the prior chunk and
+                # concatenate with a single space; preserves the regex's
+                # \s* boundaries around the signature.
+                $joined = ($joined -replace '\s_\s*$', ' ') + $next
+            }
+            if ($joined -match '^\s*(Public\s+|Private\s+|Friend\s+)?(Sub|Function)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)') {
                 $vis = "$($Matches[1])".Trim()
                 $isPublic = ($vis -eq '') -or ($vis -ieq 'Public')
                 [void]$headers.Add(@{
                     Module        = $comp.Name
                     Kind          = $Matches[2].ToLower()
                     Name          = $Matches[3]
-                    Line          = $ln
-                    Signature     = $line.Trim()
+                    Line          = $declLine
+                    Signature     = $joined.Trim()
                     Args          = $Matches[4].Trim()
                     Public        = $isPublic
                     ComponentKind = $kindStr
                 })
+                # Skip past the continuation lines we already consumed
+                # so we don't re-scan them as separate procedures.
+                if ($peek -gt $ln) { $ln = $peek }
             }
         }
         # Assign body_start / body_end (line before next header, or end of module)

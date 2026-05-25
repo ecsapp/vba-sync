@@ -97,9 +97,28 @@ Private Sub BuildSql()
     ' return both with canonical casing
 End Sub
 '@
+    # Regression for the multi-line-signature false-negative (HARNESS_IMPROVEMENTS
+    # P1.5). VBA's `_` line-continuation can split a Sub/Function signature
+    # across physical lines. The Get-VbaProcedures scanner must join those
+    # before regex-matching, otherwise the procedure is invisible to
+    # definition_of and callers_of.
+    $modMulti = @'
+Attribute VB_Name = "modMulti"
+Option Explicit
+
+Private Function WideSig(a As String, b As String, _
+                         c As String, d As String, _
+                         e As String) As String
+    WideSig = a & b & c & d & e
+End Function
+
+Public Sub TinyOne()
+End Sub
+'@
     Set-Content -LiteralPath (Join-Path $srcDir 'Modules\modCore.bas')  -Value $modCore  -Encoding ASCII
     Set-Content -LiteralPath (Join-Path $srcDir 'Modules\modSql.bas')   -Value $modSql   -Encoding ASCII
     Set-Content -LiteralPath (Join-Path $srcDir 'Modules\modOther.bas') -Value $modOther -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $srcDir 'Modules\modMulti.bas') -Value $modMulti -Encoding ASCII
 
     Add-Content -LiteralPath $commandsFile -Value (@{ id='c0'; cmd='sync_vba'; source_dir=$srcDir } | ConvertTo-Json -Compress) -Encoding UTF8
     if (-not (Wait-ForEvent $eventsFile 'sync_completed' 15 -IdMatch 'c0')) { throw "no sync_completed" }
@@ -178,6 +197,38 @@ End Sub
     if (-not $r6) { throw "no analyze_vba_failed for c6 (missing_name)" }
     if ($r6.reason -ne 'missing_name') { throw "missing_name reason expected 'missing_name', got '$($r6.reason)'" }
     Write-Host "  (4) failure modes: not_found returns empty matches[]; unknown_op + missing_name surface correctly" -ForegroundColor Green
+
+    # ---------- (5) multi-line signature regression (P1.5) ----------
+    # WideSig in modMulti has a 3-physical-line signature joined by VBA's
+    # `_` line-continuation. Pre-P1.5 the line-by-line regex never matched
+    # the declaration line (no closing paren on it) and the procedure was
+    # invisible to definition_of. Post-fix: the scanner joins continuation
+    # lines before matching, so WideSig surfaces with Line pointing at the
+    # declaration line and Signature carrying the joined logical signature.
+    Add-Content -LiteralPath $commandsFile -Value '{"id":"c7","cmd":"analyze_vba","op":"definition_of","name":"WideSig"}' -Encoding UTF8
+    $r7 = Wait-ForEvent $eventsFile 'vba_analysis_result' 10 -IdMatch 'c7'
+    if (-not $r7) { throw "no vba_analysis_result for c7 (multi-line WideSig)" }
+    $m7 = @($r7.matches)
+    if ($m7.Count -ne 1) { throw "expected 1 match for WideSig, got $($m7.Count) — multi-line signature regression?" }
+    if ($m7[0].module -ne 'modMulti') { throw "WideSig module expected 'modMulti', got '$($m7[0].module)'" }
+    if ($m7[0].kind   -ne 'function') { throw "WideSig kind expected 'function', got '$($m7[0].kind)'" }
+    if ($m7[0].public)                { throw "WideSig public expected false (Private)" }
+    # Joined signature should contain all 5 arg names and the As String return.
+    foreach ($needle in @('a As String','b As String','c As String','d As String','e As String','As String')) {
+        if ($m7[0].signature -notmatch [regex]::Escape($needle)) {
+            throw "WideSig signature missing '$needle' — got: $($m7[0].signature)"
+        }
+    }
+    # Sanity: the sibling TinyOne in the same module is still discoverable
+    # (the scanner's line-skip after consuming continuation lines must not
+    # skip past unrelated procedures).
+    Add-Content -LiteralPath $commandsFile -Value '{"id":"c8","cmd":"analyze_vba","op":"definition_of","name":"TinyOne"}' -Encoding UTF8
+    $r8 = Wait-ForEvent $eventsFile 'vba_analysis_result' 10 -IdMatch 'c8'
+    if (-not $r8) { throw "no vba_analysis_result for c8 (TinyOne)" }
+    $m8 = @($r8.matches)
+    if ($m8.Count -ne 1) { throw "expected 1 match for TinyOne, got $($m8.Count) — continuation-line skip over-advanced?" }
+    if ($m8[0].module -ne 'modMulti') { throw "TinyOne module expected 'modMulti', got '$($m8[0].module)'" }
+    Write-Host "  (5) multi-line signature: WideSig discoverable with joined signature; TinyOne sibling unaffected" -ForegroundColor Green
 
     # Close
     Add-Content -LiteralPath $commandsFile -Value '{"id":"c9","cmd":"close"}' -Encoding UTF8

@@ -613,28 +613,47 @@ liveness probe — read it to see how stale a `ready` status is.
 
 ## Monitor filter recommendations
 
-The harness emits failure events as `<verb>_failed` — `range_read_failed`,
-`macro_failed`, `compile_failed`, `analyze_vba_failed`, etc. Every
-command type has at least one failure event; some have several. **A
-Monitor filter that matches only success events will silently stall
-when a command fails** — the agent waits forever for an event that
-never comes (this happened in production: a 66-minute stall before
-the operator noticed an unmatched `range_read_failed`).
+**Default: tail every event, filter nothing.** The harness emits
+dozens of event types and new ones ship per harness version; any
+hand-maintained allowlist is a silent-hang foot-gun. A fresh agent
+hit this at minute one of a session in 2026-05-25: their allowlist
+included `compile_result`, `vba_analysis_result`, `macro_*`,
+`*_failed` but forgot `import_completed`. A 969ms `import` succeeded
+silently, the agent assumed the harness was hung, and the user had
+to intervene with "what is happening". Same root cause as a prior
+66-minute stall on an unmatched `range_read_failed`. Two distinct
+incidents, same shape: **silence is indistinguishable from "still
+running" when your filter is incomplete**.
 
-Two reliable patterns:
+The right Monitor command is the unfiltered tail:
 
-1. **Match all `*_failed`** (preferred):
-   `grep -E --line-buffered '"t":"[a-z_]+_failed"|"t":"<success-type>"'`
-2. **Match every success event you care about, AND keep a wildcard
-   for `_failed`** — same as above but with an explicit allowlist of
-   success types. Catches typos in command names too (an unrecognised
-   command emits `unknown_command`).
+```
+Get-Content -LiteralPath events.jsonl -Wait -Tail 0
+```
 
-Specific failure events worth knowing about:
+Every appended line becomes a notification. No filter to maintain,
+no event to forget. If a command's success or failure event has any
+identifying text the agent will see it.
+
+**If you really need to cut noise**, use an exclude list (subtract
+proven-noisy events) instead of an include list (add events you
+think you'll need). Excluding is safe — at worst you get an extra
+notification on a real event. Including is unsafe — at worst you
+silently miss the only signal a command was going to produce.
+
+```
+# Excludelist example — skip response_armed chatter only
+Get-Content -LiteralPath events.jsonl -Wait -Tail 0 |
+  Where-Object { $_ -notmatch '"t":"response_armed"' }
+```
+
+**Failure-event reference** (for grep/debugging, NOT for
+hand-rolling a Monitor allowlist):
 
 - `command_error` — invalid JSON in `commands.jsonl`. The harness
   scrapes the `id` field if present so the agent can correlate.
-- `unknown_command` — command name not recognised. Often a typo.
+- `unknown_command` — command name not recognised. Often a typo
+  (e.g. `save` instead of `save_workbook`).
 - `command_rejected` — only in `crashed` state; pairs with the
   `excel_crashed` push event.
 - `<verb>_failed` for every verb — `range_read_failed`,
@@ -647,9 +666,7 @@ Specific failure events worth knowing about:
   `macros_list_failed`, `sheets_list_failed`, `workbook_info_failed`,
   `instrument_failed`, `macro_loop_failed`.
 
-The wildcard pattern future-proofs against new failure events shipping
-with later harness versions — every new command will follow the
-`<verb>_failed` convention.
+Every new command will follow the `<verb>_failed` convention.
 
 ## Debugging stuck or unhappy sessions
 
