@@ -47,11 +47,29 @@ workbook root.
    `.excel-control/sessions/s1/state.json`: `status:crashed` means startup failed
    — check the `events.jsonl` tail for a `session_error`.
 3. **Watch events** — point the Monitor tool at
-   `.excel-control/sessions/s1/events.jsonl` (one notification per appended line).
-   **Filter must include every `*_failed` event you could plausibly see** —
-   silence is not success. See [Monitor filter recommendations](#monitor-filter-recommendations) below.
+   `.excel-control/sessions/s1/events.jsonl` with an **unfiltered
+   tail**: `Get-Content -LiteralPath … -Wait -Tail 0`. **No
+   `Where-Object`, no `grep`, no `Select-String`, no allowlist, no
+   excludelist.** Filtering has caused three documented silent
+   hangs (one 66 minutes, one 2 hours, one a 969ms-fast import
+   completing while the agent waited forever). See
+   [Monitor — DO NOT FILTER events.jsonl](#monitor--do-not-filter-eventsjsonl)
+   for the rule and the rationale.
 4. **Send commands** — append one JSON object per line to
    `.excel-control/sessions/s1/commands.jsonl` (append only; never rewrite it).
+   **Never `echo` quoted JSON via the shell.** Bash/PowerShell
+   escaping mangles backslashes and apostrophes. Use a bash
+   single-quoted here-doc or PowerShell `Add-Content -Encoding UTF8`:
+   ```bash
+   cat >> .excel-control/sessions/s1/commands.jsonl <<'EOF'
+   {"id":"c1","cmd":"run_macro","name":"Foo"}
+   EOF
+   ```
+   ```pwsh
+   $cmd = @{ id='c1'; cmd='run_macro'; name='Foo' } | ConvertTo-Json -Compress
+   Add-Content -LiteralPath '.excel-control/sessions/s1/commands.jsonl' `
+               -Value $cmd -Encoding UTF8
+   ```
 5. **End the session** — append `{"id":"cN","cmd":"close"}`.
 
 **Concurrent Excel use**: the session creates a separate `EXCEL.EXE`
@@ -146,6 +164,16 @@ dialogs today:
 |---|---|---|
 | `import` | "VBA Sync import completed successfully" | `<cmdId>-arm` |
 | `export` | "VBA Sync export completed successfully" | `<cmdId>-arm` |
+
+**Send arms BEFORE the `run_macro` that triggers the dialog.** The
+dialog watcher checks armed rules at dialog-surface time — if your
+arm arrives after the dialog appears, the form fires through to its
+default handler and the macro proceeds (or blocks waiting for a
+manual click) before your rule is consulted. Practical rule:
+queue every `arm_response` / `arm_form_control` first, then the
+`run_macro` last. The harness processes commands in send order;
+this guarantees the arms are live by the time the watcher sees the
+dialog.
 
 ### Navigate an unfamiliar workbook — `analyze_vba`
 
@@ -611,44 +639,44 @@ liveness probe — read it to see how stale a `ready` status is.
   workbook (multi-workbook within a session is fine via
   `open_workbook` / `close_workbook`).
 
-## Monitor filter recommendations
+## Monitor — DO NOT FILTER events.jsonl
 
-**Default: tail every event, filter nothing.** The harness emits
-dozens of event types and new ones ship per harness version; any
-hand-maintained allowlist is a silent-hang foot-gun. A fresh agent
-hit this at minute one of a session in 2026-05-25: their allowlist
-included `compile_result`, `vba_analysis_result`, `macro_*`,
-`*_failed` but forgot `import_completed`. A 969ms `import` succeeded
-silently, the agent assumed the harness was hung, and the user had
-to intervene with "what is happening". Same root cause as a prior
-66-minute stall on an unmatched `range_read_failed`. Two distinct
-incidents, same shape: **silence is indistinguishable from "still
-running" when your filter is incomplete**.
+**The cost of the smallest filter mistake is stall and hours of
+wasted work.** Three documented incidents to date — a 66-minute
+production stall on an unmatched `range_read_failed`, a 2-hour
+stall on 2026-05-25, and a fresh-agent 969ms-silent
+`import_completed` — all had the same shape: a filter dropped the
+event the agent needed, silence became indistinguishable from
+"still running", agent waited forever. This is not a preference,
+it is a hard operational rule.
 
-The right Monitor command is the unfiltered tail:
+The Monitor command is exactly this — no more, no less:
 
 ```
 Get-Content -LiteralPath events.jsonl -Wait -Tail 0
 ```
 
-Every appended line becomes a notification. No filter to maintain,
-no event to forget. If a command's success or failure event has any
-identifying text the agent will see it.
+**Do not add:**
 
-**If you really need to cut noise**, use an exclude list (subtract
-proven-noisy events) instead of an include list (add events you
-think you'll need). Excluding is safe — at worst you get an extra
-notification on a real event. Including is unsafe — at worst you
-silently miss the only signal a command was going to produce.
+- `| Where-Object { ... }` — even excluding a "noisy" event type is
+  filtering. The event you exclude today is the signal you need
+  tomorrow. Excludelists are filters too; they have the same stall
+  failure mode and are forbidden by the same rule.
+- `| ForEach-Object { if ($_ -match ...) { $_ } }` — same shape,
+  same bug.
+- `| grep ...` / `| Select-String ...` — same shape, same bug.
+- Any allowlist of "the events I think I'll need." You WILL forget
+  one, and a 969ms-fast command will succeed silently while you
+  wait for an event that never matches your filter.
 
-```
-# Excludelist example — skip response_armed chatter only
-Get-Content -LiteralPath events.jsonl -Wait -Tail 0 |
-  Where-Object { $_ -notmatch '"t":"response_armed"' }
-```
+The harness emits ~5-50 events per macro. Noise is hypothetical;
+silence is real and expensive. Read everything.
 
-**Failure-event reference** (for grep/debugging, NOT for
-hand-rolling a Monitor allowlist):
+**Failure-event reference** (for grep-after-the-fact debugging of
+saved events.jsonl files, NOT for building any kind of live
+Monitor filter — building a Monitor filter from this list will
+stall the session the first time the harness emits an event not on
+the list):
 
 - `command_error` — invalid JSON in `commands.jsonl`. The harness
   scrapes the `id` field if present so the agent can correlate.
