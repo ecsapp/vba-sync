@@ -21,7 +21,7 @@ $ErrorActionPreference = 'Stop'
 $here       = $PSScriptRoot
 $repo       = Resolve-Path (Join-Path $here '..\..')
 $startSess  = Join-Path $repo 'excel-control\start-session.ps1'
-$workbook   = Join-Path $here 'fixtures\empty.xlsm'
+$fixture    = Join-Path $here 'fixtures\empty.xlsm'
 $sessions   = Join-Path $repo 'excel-control\sessions'
 $sessionDir = Join-Path $sessions $SessionId
 if (Test-Path $sessionDir) { Remove-Item -Recurse -Force $sessionDir }
@@ -30,9 +30,32 @@ if (Test-Path $sessionDir) { Remove-Item -Recurse -Force $sessionDir }
 Clear-OrphanSessionExcels $sessions
 Start-Sleep -Milliseconds 200
 
+# Two macros staged in the workbook's sibling folder so `import` picks
+# them up. LogAndOk: 3 xcHarness_Log calls (via Application.Run so it
+# compiles before the harness log module is injected). LogAndFail: same
+# shape but raises after the third log line.
+$bas = @'
+Attribute VB_Name = "modPreCrash"
+Option Explicit
+
+Public Sub LogAndOk()
+    Application.Run "xcHarness_Log", "ok step 1"
+    Application.Run "xcHarness_Log", "ok step 2"
+    Application.Run "xcHarness_Log", "ok step 3"
+End Sub
+
+Public Sub LogAndFail()
+    Application.Run "xcHarness_Log", "fail step A"
+    Application.Run "xcHarness_Log", "fail step B"
+    Application.Run "xcHarness_Log", "fail step C — about to err"
+    Err.Raise 9999, "LogAndFail", "deliberate fail after 3 log lines"
+End Sub
+'@
+$stagedWb = New-StagedWorkbook -Fixture $fixture -Modules @{ modPreCrash = $bas }
+
 Write-Host "Test: pre_crash_log (SessionId=$SessionId)" -ForegroundColor Cyan
 
-$proc = Start-SessionHost -StartSession $startSess -Workbook $workbook `
+$proc = Start-SessionHost -StartSession $startSess -Workbook $stagedWb `
     -SessionId $SessionId -SessionsRoot $sessions
 
 function Read-Events([string]$path) {
@@ -70,34 +93,12 @@ try {
     if (-not (Wait-ForEvent $eventsFile 'started' 30)) { throw "no 'started' event" }
     Write-Host "  started" -ForegroundColor Green
 
-    # Seed two macros. LogAndOk: 3 xcHarness_Log calls (via Application.Run
-    # so it compiles even before the module is injected — the agent flow
-    # may compile_check before run_macro). LogAndFail: same shape but
-    # raises after the third log line.
-    $srcDir = Join-Path $sessionDir '_src'
-    New-Item -ItemType Directory -Force -Path (Join-Path $srcDir 'Modules') | Out-Null
-    $bas = @'
-Attribute VB_Name = "modPreCrash"
-Option Explicit
-
-Public Sub LogAndOk()
-    Application.Run "xcHarness_Log", "ok step 1"
-    Application.Run "xcHarness_Log", "ok step 2"
-    Application.Run "xcHarness_Log", "ok step 3"
-End Sub
-
-Public Sub LogAndFail()
-    Application.Run "xcHarness_Log", "fail step A"
-    Application.Run "xcHarness_Log", "fail step B"
-    Application.Run "xcHarness_Log", "fail step C — about to err"
-    Err.Raise 9999, "LogAndFail", "deliberate fail after 3 log lines"
-End Sub
-'@
-    Set-Content -LiteralPath (Join-Path $srcDir 'Modules\modPreCrash.bas') -Value $bas -Encoding ASCII
-
-    Add-Content -LiteralPath $commandsFile -Value (@{ id='c0'; cmd='sync_vba'; source_dir=$srcDir } | ConvertTo-Json -Compress) -Encoding UTF8
-    if (-not (Wait-ForEvent $eventsFile 'sync_completed' 15 -IdMatch 'c0')) { throw "no sync_completed" }
-    Write-Host "  sync_completed" -ForegroundColor Green
+    Add-Content -LiteralPath $commandsFile -Value '{"id":"c0","cmd":"import"}' -Encoding UTF8
+    if (-not (Wait-ForEvent $eventsFile 'import_completed' 60 -IdMatch 'c0')) {
+        $f = Wait-ForEvent $eventsFile 'import_failed' 2 -IdMatch 'c0'
+        throw ('no import_completed' + $(if ($f) { " (import_failed: $($f.error))" } else { '' }))
+    }
+    Write-Host "  import_completed" -ForegroundColor Green
 
     # Pre-arm: deliberate-fail produces a Microsoft Visual Basic dialog
     # that the watcher auto-Ends; on a stopped headless session this

@@ -12,7 +12,7 @@ $ErrorActionPreference = 'Stop'
 $here       = $PSScriptRoot
 $repo       = Resolve-Path (Join-Path $here '..\..')
 $startSess  = Join-Path $repo 'excel-control\start-session.ps1'
-$workbook   = Join-Path $here 'fixtures\empty.xlsm'
+$fixture    = Join-Path $here 'fixtures\empty.xlsm'
 $sessions   = Join-Path $repo 'excel-control\sessions'
 $sessionDir = Join-Path $sessions $SessionId
 if (Test-Path $sessionDir) { Remove-Item -Recurse -Force $sessionDir }
@@ -21,9 +21,63 @@ if (Test-Path $sessionDir) { Remove-Item -Recurse -Force $sessionDir }
 Clear-OrphanSessionExcels $sessions
 Start-Sleep -Milliseconds 200
 
+# Module fixtures — see body of (1)/(2)/(3)/(5) below for what each exercises.
+$modCore = @'
+Attribute VB_Name = "modCore"
+Option Explicit
+
+Public Sub RunReport()
+    Dim s As String
+    ' below-line call site (will appear at line 8 inside RunReport's body)
+    s = BuildSql("a", "b")
+End Sub
+
+Public Sub RunBatch()
+    Dim s As String
+    s = BuildSql("x", "y")
+    s = BuildSql("p", "q")
+End Sub
+'@
+$modSql = @'
+Attribute VB_Name = "modSql"
+Option Explicit
+
+Public Function BuildSql(k As String, v As String) As String
+    BuildSql = "SET " & k & "=" & v
+End Function
+'@
+$modOther = @'
+Attribute VB_Name = "modOther"
+Option Explicit
+
+Private Sub BuildSql()
+    ' same name, different module, no args — definition_of should
+    ' return both with canonical casing
+End Sub
+'@
+$modMulti = @'
+Attribute VB_Name = "modMulti"
+Option Explicit
+
+Private Function WideSig(a As String, b As String, _
+                         c As String, d As String, _
+                         e As String) As String
+    WideSig = a & b & c & d & e
+End Function
+
+Public Sub TinyOne()
+End Sub
+'@
+$stagedWb = New-StagedWorkbook -Fixture $fixture -Modules @{
+    modCore  = $modCore
+    modSql   = $modSql
+    modOther = $modOther
+    modMulti = $modMulti
+}
+
 Write-Host "Test: analyze_vba (SessionId=$SessionId)" -ForegroundColor Cyan
 
-$proc = Start-SessionHost -StartSession $startSess -Workbook $workbook `
+$proc = Start-SessionHost -StartSession $startSess -Workbook $stagedWb `
     -SessionId $SessionId -SessionsRoot $sessions
 
 function Read-Events([string]$path) {
@@ -51,7 +105,8 @@ try {
     if (-not (Wait-ForEvent $eventsFile 'started' 30)) { throw "no 'started' event" }
     Write-Host "  started" -ForegroundColor Green
 
-    # Seed fixture with three small modules. Layout designed to exercise:
+    # Import the four modules staged in the workbook's sibling folder.
+    # Layout designed to exercise:
     #   - definition_of: BuildSql defined in modSql; case-insensitive lookup
     #     ("buildsql" should return canonical "BuildSql"); also a same-named
     #     Sub in a second module (modOther.BuildSql) to assert matches[] is
@@ -59,70 +114,15 @@ try {
     #   - callers_of: BuildSql is called from RunReport in modCore (line 8)
     #     and twice from RunBatch in modCore (lines 13 and 14). NOT called
     #     from modSql.BuildSql itself (that's the def line).
-    #   - read_module: source must contain the Attribute VB_Name header and
-    #     the known body.
-    $srcDir = Join-Path $sessionDir '_src'
-    New-Item -ItemType Directory -Force -Path (Join-Path $srcDir 'Modules') | Out-Null
-
-    $modCore = @'
-Attribute VB_Name = "modCore"
-Option Explicit
-
-Public Sub RunReport()
-    Dim s As String
-    ' below-line call site (will appear at line 8 inside RunReport's body)
-    s = BuildSql("a", "b")
-End Sub
-
-Public Sub RunBatch()
-    Dim s As String
-    s = BuildSql("x", "y")
-    s = BuildSql("p", "q")
-End Sub
-'@
-    $modSql = @'
-Attribute VB_Name = "modSql"
-Option Explicit
-
-Public Function BuildSql(k As String, v As String) As String
-    BuildSql = "SET " & k & "=" & v
-End Function
-'@
-    $modOther = @'
-Attribute VB_Name = "modOther"
-Option Explicit
-
-Private Sub BuildSql()
-    ' same name, different module, no args — definition_of should
-    ' return both with canonical casing
-End Sub
-'@
-    # Regression for the multi-line-signature false-negative (HARNESS_IMPROVEMENTS
-    # P1.5). VBA's `_` line-continuation can split a Sub/Function signature
-    # across physical lines. The Get-VbaProcedures scanner must join those
-    # before regex-matching, otherwise the procedure is invisible to
-    # definition_of and callers_of.
-    $modMulti = @'
-Attribute VB_Name = "modMulti"
-Option Explicit
-
-Private Function WideSig(a As String, b As String, _
-                         c As String, d As String, _
-                         e As String) As String
-    WideSig = a & b & c & d & e
-End Function
-
-Public Sub TinyOne()
-End Sub
-'@
-    Set-Content -LiteralPath (Join-Path $srcDir 'Modules\modCore.bas')  -Value $modCore  -Encoding ASCII
-    Set-Content -LiteralPath (Join-Path $srcDir 'Modules\modSql.bas')   -Value $modSql   -Encoding ASCII
-    Set-Content -LiteralPath (Join-Path $srcDir 'Modules\modOther.bas') -Value $modOther -Encoding ASCII
-    Set-Content -LiteralPath (Join-Path $srcDir 'Modules\modMulti.bas') -Value $modMulti -Encoding ASCII
-
-    Add-Content -LiteralPath $commandsFile -Value (@{ id='c0'; cmd='sync_vba'; source_dir=$srcDir } | ConvertTo-Json -Compress) -Encoding UTF8
-    if (-not (Wait-ForEvent $eventsFile 'sync_completed' 15 -IdMatch 'c0')) { throw "no sync_completed" }
-    Write-Host "  sync_completed (3 modules)" -ForegroundColor Green
+    #   - read_module: source must contain the known body.
+    #   - P1.5 regression: modMulti.WideSig has a 3-line signature joined
+    #     by VBA's `_` line-continuation — must still be discoverable.
+    Add-Content -LiteralPath $commandsFile -Value '{"id":"c0","cmd":"import"}' -Encoding UTF8
+    if (-not (Wait-ForEvent $eventsFile 'import_completed' 60 -IdMatch 'c0')) {
+        $f = Wait-ForEvent $eventsFile 'import_failed' 2 -IdMatch 'c0'
+        throw ('no import_completed' + $(if ($f) { " (import_failed: $($f.error))" } else { '' }))
+    }
+    Write-Host "  import_completed (4 modules)" -ForegroundColor Green
 
     # ---------- (1) definition_of ----------
     # Case-insensitive lookup: "buildsql" should hit both modSql.BuildSql
@@ -230,9 +230,10 @@ End Sub
     if ($m8[0].module -ne 'modMulti') { throw "TinyOne module expected 'modMulti', got '$($m8[0].module)'" }
     Write-Host "  (5) multi-line signature: WideSig discoverable with joined signature; TinyOne sibling unaffected" -ForegroundColor Green
 
-    # Close
+    # Close — bumped to 30s because vba-sync's xlam stays loaded after
+    # import and Excel teardown with two workbooks open is slower.
     Add-Content -LiteralPath $commandsFile -Value '{"id":"c9","cmd":"close"}' -Encoding UTF8
-    if (-not (Wait-ForEvent $eventsFile 'closed' 15)) { throw "no 'closed' event" }
+    if (-not (Wait-ForEvent $eventsFile 'closed' 30)) { throw "no 'closed' event" }
     Write-Host "  closed" -ForegroundColor Green
 
     $proc.WaitForExit(8000) | Out-Null

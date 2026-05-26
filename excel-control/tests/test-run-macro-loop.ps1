@@ -16,7 +16,7 @@ $ErrorActionPreference = 'Stop'
 $here       = $PSScriptRoot
 $repo       = Resolve-Path (Join-Path $here '..\..')
 $startSess  = Join-Path $repo 'excel-control\start-session.ps1'
-$workbook   = Join-Path $here 'fixtures\empty.xlsm'
+$fixture    = Join-Path $here 'fixtures\empty.xlsm'
 $sessions   = Join-Path $repo 'excel-control\sessions'
 $sessionDir = Join-Path $sessions $SessionId
 if (Test-Path $sessionDir) { Remove-Item -Recurse -Force $sessionDir }
@@ -25,9 +25,29 @@ if (Test-Path $sessionDir) { Remove-Item -Recurse -Force $sessionDir }
 Clear-OrphanSessionExcels $sessions
 Start-Sleep -Milliseconds 200
 
+# Stage the test macros into the workbook's sibling folder so `import`
+# (vba-sync addin-driven, sheet-safe) picks them up.
+$bas = @'
+Attribute VB_Name = "modLoopTest"
+Option Explicit
+
+Private mCallCount As Long
+
+Public Sub LoopNoop()
+End Sub
+
+Public Sub LoopFailOnSecond()
+    mCallCount = mCallCount + 1
+    If mCallCount >= 2 Then
+        Err.Raise 9999, "LoopFailOnSecond", "deliberate fail on call " & mCallCount
+    End If
+End Sub
+'@
+$stagedWb = New-StagedWorkbook -Fixture $fixture -Modules @{ modLoopTest = $bas }
+
 Write-Host "Test: run_macro_loop (SessionId=$SessionId)" -ForegroundColor Cyan
 
-$proc = Start-SessionHost -StartSession $startSess -Workbook $workbook `
+$proc = Start-SessionHost -StartSession $startSess -Workbook $stagedWb `
     -SessionId $SessionId -SessionsRoot $sessions
 
 function Read-Events([string]$path) {
@@ -55,34 +75,14 @@ try {
     if (-not (Wait-ForEvent $eventsFile 'started' 30)) { throw "no 'started' event" }
     Write-Host "  started" -ForegroundColor Green
 
-    # Sync two test macros into the empty fixture:
-    #   - LoopNoop: returns immediately, no side effects.
-    #   - LoopFailOnSecond: raises Err.Raise on iteration 2+ (uses a
-    #     module-level counter so it fails the second time it is called).
-    $srcDir = Join-Path $sessionDir '_src'
-    New-Item -ItemType Directory -Force -Path (Join-Path $srcDir 'Modules') | Out-Null
-    $bas = @'
-Attribute VB_Name = "modLoopTest"
-Option Explicit
-
-Private mCallCount As Long
-
-Public Sub LoopNoop()
-End Sub
-
-Public Sub LoopFailOnSecond()
-    mCallCount = mCallCount + 1
-    If mCallCount >= 2 Then
-        Err.Raise 9999, "LoopFailOnSecond", "deliberate fail on call " & mCallCount
-    End If
-End Sub
-'@
-    Set-Content -LiteralPath (Join-Path $srcDir 'Modules\modLoopTest.bas') -Value $bas -Encoding ASCII
-
-    $syncCmd = @{ id='c0'; cmd='sync_vba'; source_dir=$srcDir } | ConvertTo-Json -Compress
-    Add-Content -LiteralPath $commandsFile -Value $syncCmd -Encoding UTF8
-    if (-not (Wait-ForEvent $eventsFile 'sync_completed' 15 -IdMatch 'c0')) { throw "no sync_completed" }
-    Write-Host "  sync_completed" -ForegroundColor Green
+    # Import the test macros (LoopNoop + LoopFailOnSecond) from the
+    # workbook's sibling folder via vba-sync's addin (sheet-safe).
+    Add-Content -LiteralPath $commandsFile -Value '{"id":"c0","cmd":"import"}' -Encoding UTF8
+    if (-not (Wait-ForEvent $eventsFile 'import_completed' 60 -IdMatch 'c0')) {
+        $f = Wait-ForEvent $eventsFile 'import_failed' 2 -IdMatch 'c0'
+        throw ('no import_completed' + $(if ($f) { " (import_failed: $($f.error))" } else { '' }))
+    }
+    Write-Host "  import_completed" -ForegroundColor Green
 
     # ---------- (1) happy path ----------
     $cmd1 = @{ id='c1'; cmd='run_macro_loop'; name='LoopNoop'; iterations=3 } | ConvertTo-Json -Compress

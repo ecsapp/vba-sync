@@ -92,6 +92,58 @@ function Clear-OrphanSessionExcels {
     }
 }
 
+function New-StagedWorkbook {
+    <#
+        .SYNOPSIS
+        Stage a fixture .xlsm in a fresh temp dir alongside a vba-sync
+        source tree, ready for an `import` command. Returns the staged
+        workbook path.
+
+        Layout produced (workbook name stem = the basename without .xlsm):
+            <tempDir>/<stem>.xlsm           (the workbook)
+            <tempDir>/<stem>/Modules/*.bas  (your test modules)
+            <tempDir>/<stem>/ClassModules/*.cls (optional)
+            <tempDir>/<stem>/Forms/*.frm    (optional)
+            <tempDir>/<stem>/Objects/*.cls  (optional — sheet code)
+
+        Pass -Modules as a hashtable @{ 'modName' = '<.bas content>' } to
+        write each module. Same shape for -ClassModules and -Objects.
+
+        Why this exists: the harness `import` command drives the vba-sync
+        addin (sheet-safe) which reads the workbook's SIBLING <stem>/
+        folder. Tests that previously called the (removed) `sync_vba`
+        command pointed at a free-form source_dir; the addin convention
+        is stricter. This helper enforces the convention with one call.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Fixture,
+        [hashtable]$Modules,
+        [hashtable]$ClassModules,
+        [hashtable]$Objects
+    )
+    if (-not (Test-Path -LiteralPath $Fixture)) { throw "fixture missing: $Fixture" }
+    $stem = [System.IO.Path]::GetFileNameWithoutExtension($Fixture)
+    $tempDir = Join-Path $env:TEMP ("xc-stage-{0}-{1}" -f $stem, (Get-Random -Maximum 99999))
+    New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
+    $stagedWb = Join-Path $tempDir ([System.IO.Path]::GetFileName($Fixture))
+    Copy-Item -LiteralPath $Fixture -Destination $stagedWb -Force
+    $srcRoot = Join-Path $tempDir $stem
+    foreach ($pair in @(
+        @{ Sub = 'Modules';      Ext = '.bas'; Map = $Modules },
+        @{ Sub = 'ClassModules'; Ext = '.cls'; Map = $ClassModules },
+        @{ Sub = 'Objects';      Ext = '.cls'; Map = $Objects }
+    )) {
+        if (-not $pair.Map -or $pair.Map.Count -eq 0) { continue }
+        $dir = Join-Path $srcRoot $pair.Sub
+        New-Item -ItemType Directory -Force -Path $dir | Out-Null
+        foreach ($name in $pair.Map.Keys) {
+            $path = Join-Path $dir ($name + $pair.Ext)
+            Set-Content -LiteralPath $path -Value $pair.Map[$name] -Encoding ASCII
+        }
+    }
+    return $stagedWb
+}
+
 function Start-SessionHost {
     <#
         .SYNOPSIS

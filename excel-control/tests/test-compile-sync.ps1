@@ -1,7 +1,7 @@
-# Phase 6 test — compile_check + sync_vba.
+# Phase 6 test — compile_check + import.
 #
-# Round trip: sync_vba a broken module → compile_check fails →
-# sync_vba a fixed module → compile_check passes.
+# Round trip: import a broken module → compile_check fails →
+# import a fixed module → compile_check passes.
 
 [CmdletBinding()]
 param(
@@ -13,29 +13,38 @@ $ErrorActionPreference = 'Stop'
 $here       = $PSScriptRoot
 $repo       = Resolve-Path (Join-Path $here '..\..')
 $startSess  = Join-Path $repo 'excel-control\start-session.ps1'
-$workbook   = Join-Path $here 'fixtures\msgbox.xlsm'  # has modTest pre-loaded
+$fixture    = Join-Path $here 'fixtures\msgbox.xlsm'  # has modTest pre-loaded
 $sessions   = Join-Path $repo 'excel-control\sessions'
 $sessionDir = Join-Path $sessions $SessionId
 if (Test-Path $sessionDir) { Remove-Item -Recurse -Force $sessionDir }
-
-# Build a scratch source dir with one good module + one broken
-$srcDir = Join-Path $sessionDir '_src'
-New-Item -ItemType Directory -Force -Path (Join-Path $srcDir 'Modules') | Out-Null
 
 . (Join-Path $PSScriptRoot '_helpers.ps1')
 Clear-OrphanSessionExcels $sessions
 Start-Sleep -Milliseconds 200
 
-Write-Host "Test: compile + sync (SessionId=$SessionId)" -ForegroundColor Cyan
+$broken = @'
+Attribute VB_Name = "modSales"
+Option Explicit
 
-$proc = Start-SessionHost -StartSession $startSess -Workbook $workbook `
+Public Sub Broken()
+    Dim x As Long
+    y = 5    ' undeclared
+End Sub
+'@
+$stagedWb = New-StagedWorkbook -Fixture $fixture -Modules @{ modSales = $broken }
+$stemDir  = Join-Path ([System.IO.Path]::GetDirectoryName($stagedWb)) `
+    ([System.IO.Path]::GetFileNameWithoutExtension($stagedWb))
+
+Write-Host "Test: compile + import (SessionId=$SessionId)" -ForegroundColor Cyan
+
+$proc = Start-SessionHost -StartSession $startSess -Workbook $stagedWb `
     -SessionId $SessionId -SessionsRoot $sessions
 
 function Read-Events([string]$path) {
     if (-not (Test-Path $path)) { return @() }
     Get-Content -LiteralPath $path | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json }
 }
-function Wait-ForEvent($EventsPath, [string]$Type, [int]$TimeoutSec = 15, [string]$IdMatch = $null) {
+function Wait-ForEvent($EventsPath, [string]$Type, [int]$TimeoutSec = 60, [string]$IdMatch = $null) {
     $deadline = (Get-Date).AddSeconds($TimeoutSec)
     while ((Get-Date) -lt $deadline) {
         foreach ($e in Read-Events $EventsPath) {
@@ -55,23 +64,13 @@ try {
 
     if (-not (Wait-ForEvent $eventsFile 'started' 30)) { throw "no started" }
 
-    # Sync 1: broken module
-    $broken = @'
-Attribute VB_Name = "modSales"
-Option Explicit
-
-Public Sub Broken()
-    Dim x As Long
-    y = 5    ' undeclared
-End Sub
-'@
-    Set-Content -LiteralPath (Join-Path $srcDir 'Modules\modSales.bas') -Value $broken -Encoding ASCII
-
-    $syncCmd1 = @{ id='c1'; cmd='sync_vba'; source_dir=$srcDir } | ConvertTo-Json -Compress
-    Add-Content -LiteralPath $commandsFile -Value $syncCmd1 -Encoding UTF8
-    $sync1 = Wait-ForEvent $eventsFile 'sync_completed' 20 -IdMatch 'c1'
-    if (-not $sync1) { throw "no sync_completed for c1" }
-    Write-Host "  sync c1: imported=$($sync1.imported -join ',') removed=$($sync1.removed -join ',')" -ForegroundColor Green
+    # Import 1: broken module
+    Add-Content -LiteralPath $commandsFile -Value '{"id":"c1","cmd":"import"}' -Encoding UTF8
+    if (-not (Wait-ForEvent $eventsFile 'import_completed' 60 -IdMatch 'c1')) {
+        $f = Wait-ForEvent $eventsFile 'import_failed' 2 -IdMatch 'c1'
+        throw ('no import_completed for c1' + $(if ($f) { " (import_failed: $($f.error))" } else { '' }))
+    }
+    Write-Host "  import c1 ok (broken module)" -ForegroundColor Green
 
     # Compile 1: expect fail
     Add-Content -LiteralPath $commandsFile -Value '{"id":"c2","cmd":"compile_check"}' -Encoding UTF8
@@ -80,7 +79,7 @@ End Sub
     if ($r1.ok) { throw "expected compile FAIL, got ok=true" }
     Write-Host "  compile c2: ok=false module=$($r1.module) line=$($r1.line)" -ForegroundColor Green
 
-    # Sync 2: fixed module
+    # Swap to fixed module on disk, re-import.
     $fixed = @'
 Attribute VB_Name = "modSales"
 Option Explicit
@@ -90,12 +89,14 @@ Public Sub Fixed()
     x = 5
 End Sub
 '@
-    Set-Content -LiteralPath (Join-Path $srcDir 'Modules\modSales.bas') -Value $fixed -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $stemDir 'Modules\modSales.bas') -Value $fixed -Encoding ASCII
 
-    $syncCmd2 = @{ id='c3'; cmd='sync_vba'; source_dir=$srcDir } | ConvertTo-Json -Compress
-    Add-Content -LiteralPath $commandsFile -Value $syncCmd2 -Encoding UTF8
-    if (-not (Wait-ForEvent $eventsFile 'sync_completed' 20 -IdMatch 'c3')) { throw "no sync c3" }
-    Write-Host "  sync c3 ok" -ForegroundColor Green
+    Add-Content -LiteralPath $commandsFile -Value '{"id":"c3","cmd":"import"}' -Encoding UTF8
+    if (-not (Wait-ForEvent $eventsFile 'import_completed' 60 -IdMatch 'c3')) {
+        $f = Wait-ForEvent $eventsFile 'import_failed' 2 -IdMatch 'c3'
+        throw ('no import_completed for c3' + $(if ($f) { " (import_failed: $($f.error))" } else { '' }))
+    }
+    Write-Host "  import c3 ok (fixed module)" -ForegroundColor Green
 
     # Compile 2: expect pass
     Add-Content -LiteralPath $commandsFile -Value '{"id":"c4","cmd":"compile_check"}' -Encoding UTF8

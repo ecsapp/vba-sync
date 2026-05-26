@@ -1,5 +1,5 @@
 # Phase 6.7 test — Debug.Print capture.
-# Sync a temp module with 3 Debug.Print calls, run it, expect 3 debug_print events.
+# Import a temp module with 3 Debug.Print calls, run it, expect 3 debug_print events.
 
 [CmdletBinding()]
 param([string]$SessionId = "test-dbg-$(Get-Random -Maximum 99999)")
@@ -8,14 +8,15 @@ $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 $repo = Resolve-Path (Join-Path $here '..\..')
 $startSess = Join-Path $repo 'excel-control\start-session.ps1'
-$workbook  = Join-Path $here 'fixtures\empty.xlsm'
+$fixture   = Join-Path $here 'fixtures\empty.xlsm'
 $sessions  = Join-Path $repo 'excel-control\sessions'
 $sessionDir = Join-Path $sessions $SessionId
 if (Test-Path $sessionDir) { Remove-Item -Recurse -Force $sessionDir }
 
-# Build a temp source dir with one module that emits Debug.Print
-$srcDir = Join-Path $sessionDir '_src'
-New-Item -ItemType Directory -Force -Path (Join-Path $srcDir 'Modules') | Out-Null
+. (Join-Path $PSScriptRoot '_helpers.ps1')
+Clear-OrphanSessionExcels $sessions
+Start-Sleep -Milliseconds 200
+
 $bas = @'
 Attribute VB_Name = "modDbg"
 Option Explicit
@@ -26,15 +27,11 @@ Public Sub PrintStuff()
     Debug.Print "line three"
 End Sub
 '@
-Set-Content -LiteralPath (Join-Path $srcDir 'Modules\modDbg.bas') -Value $bas -Encoding ASCII
-
-. (Join-Path $PSScriptRoot '_helpers.ps1')
-Clear-OrphanSessionExcels $sessions
-Start-Sleep -Milliseconds 200
+$stagedWb = New-StagedWorkbook -Fixture $fixture -Modules @{ modDbg = $bas }
 
 Write-Host "Test: debug_print (SessionId=$SessionId)" -ForegroundColor Cyan
 
-$proc = Start-SessionHost -StartSession $startSess -Workbook $workbook `
+$proc = Start-SessionHost -StartSession $startSess -Workbook $stagedWb `
     -SessionId $SessionId -SessionsRoot $sessions
 
 function Read-Events($p) { if (-not (Test-Path $p)) { return @() }; Get-Content -LiteralPath $p | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json } }
@@ -55,10 +52,11 @@ try {
 
     if (-not (Wait-ForEvent $eventsFile 'started' 30)) { throw "no started" }
 
-    # Sync the module
-    $syncCmd = @{ id='c1'; cmd='sync_vba'; source_dir=$srcDir } | ConvertTo-Json -Compress
-    Add-Content -LiteralPath $commandsFile -Value $syncCmd -Encoding UTF8
-    if (-not (Wait-ForEvent $eventsFile 'sync_completed' 20 -Id 'c1')) { throw "no sync_completed" }
+    Add-Content -LiteralPath $commandsFile -Value '{"id":"c1","cmd":"import"}' -Encoding UTF8
+    if (-not (Wait-ForEvent $eventsFile 'import_completed' 60 -Id 'c1')) {
+        $f = Wait-ForEvent $eventsFile 'import_failed' 2 -Id 'c1'
+        throw ('no import_completed' + $(if ($f) { " (import_failed: $($f.error))" } else { '' }))
+    }
 
     # Run the macro
     Add-Content -LiteralPath $commandsFile -Value '{"id":"c2","cmd":"run_macro","name":"PrintStuff"}' -Encoding UTF8

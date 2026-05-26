@@ -258,7 +258,7 @@ Key invariants:
   opt in stay clean.
 - **`xcHarness_` namespace** — collision-proof with user code; the
   module survives a workbook save if the agent saves mid-session.
-  `sync_vba` strips it on the next call if leave-no-trace is needed.
+  `import` replaces it on the next call if leave-no-trace is needed.
 - **Once-per-failure vacuum** — the heap-corruption sequence fires
   both `macro_failed` AND `excel_crashed`; `pre_crash_log` emits on
   the first only.
@@ -383,17 +383,25 @@ Fix loop:
 1. Read the offending module to find the error site (you may need to
    `list_macros` first to know which modules exist).
 2. Edit the `.bas` / `.cls` on disk.
-3. Push the fix into the running Excel: **`import`** drives vba-sync's
-   own importer and is **sheet-safe** (worksheet code-behind survives).
-   `sync_vba` is a lower-level alternative — faster, no `VBA Sync.xlam`
-   dependency — but it mangles `Objects/` sheet modules, so only use it
-   for workbooks with no worksheet code.
+3. Push the fix into the running Excel: **`import`** drives the
+   vba-sync addin's own importer and is sheet-safe (worksheet
+   code-behind survives). This is the only way to sync source — see
+   the warning below.
 4. `compile_check` — confirm no parse errors.
 5. `run_macro` again.
 
+> **Never bypass `import`.** A previous low-level `sync_vba` command
+> was removed (2026-05-26) after it silently corrupted every workbook
+> with worksheet code-behind. `VBComponents.Import` cannot replace
+> existing `Sheet*` class modules (they are bound to a worksheet, not
+> a name), so every run created a phantom `Sheet11` / `Sheet110` /
+> `Sheet1100` ... cascade that eventually surfaced as compile-error
+> modals blocking macros. There is no fast-path alternative; `import`
+> is the supported path.
+
 ```jsonc
-{"id":"c2","cmd":"sync_vba","source_dir":"."}
-// → {"t":"sync_completed","id":"c2","imported":["modSales"],"removed":[]}
+{"id":"c2","cmd":"import","source_dir":"."}
+// → {"t":"import_completed","id":"c2","duration_ms":2400}
 
 {"id":"c3","cmd":"compile_check"}
 // → {"t":"compile_result","id":"c3","ok":true}
@@ -416,7 +424,7 @@ The harness has a discover-and-run convention for VBA tests:
 
 The shipped `.claude/skills/excel-control/tools/clsAssert.cls` is a
 minimal assertion library. Import
-it into your workbook (via `sync_vba`) and use its `Assert.AreEqual`,
+it into your workbook (via `import`) and use its `Assert.AreEqual`,
 `Assert.IsTrue`, `Assert.IsFalse`, `Assert.IsNothing`, `Assert.Fail`
 methods. Each raises a vbObjectError on mismatch, which the test
 runner catches.
@@ -451,8 +459,8 @@ To run them:
 
 ```jsonc
 // Sync your source (includes clsAssert.cls + your test modules):
-{"id":"c1","cmd":"sync_vba","source_dir":"."}
-// → {"t":"sync_completed","id":"c1","imported":["clsAssert","modSalesTests",...],"removed":[]}
+{"id":"c1","cmd":"import","source_dir":"."}
+// → {"t":"import_completed","id":"c1","duration_ms":2800}
 
 // Optional: compile first to catch typos
 {"id":"c2","cmd":"compile_check"}
@@ -633,8 +641,10 @@ liveness probe — read it to see how stale a `ready` status is.
 - **Always send `close`** before killing the session process; otherwise
   Excel may flag the .xlsm as "needing recovery" on next open.
 - **After editing `.bas`/`.cls` on disk during a live session, always
-  `sync_vba`** before `compile_check` / `run_macro` — the harness only
-  sees synced source; the in-memory VBA project does not track disk.
+  `import`** before `compile_check` / `run_macro` — the harness only
+  sees imported source; the in-memory VBA project does not track disk.
+  Never use any lower-level alternative; the removed `sync_vba`
+  command silently corrupted workbooks with worksheet code-behind.
 - **Don't open the same workbook twice** — use one session per
   workbook (multi-workbook within a session is fine via
   `open_workbook` / `close_workbook`).

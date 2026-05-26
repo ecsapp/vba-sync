@@ -19,21 +19,30 @@ if (Test-Path $sessionDir) { Remove-Item -Recurse -Force $sessionDir }
 $AddinPath = 'C:\Users\ArnaudLavignolle\AppData\Roaming\Microsoft\AddIns\VBA Sync.xlam'
 if (-not (Test-Path $AddinPath)) { throw "VBA Sync.xlam not found at $AddinPath" }
 
-# Stage a fresh copy of the fixture in a temp workdir so we can verify
-# the export bundles the harness skill next to it
-$fixtureSrc = Join-Path $here 'fixtures\msgbox.xlsm'
-$workDir = Join-Path $env:TEMP "vba-sync-bundle-test-$(Get-Random -Maximum 99999)"
-New-Item -ItemType Directory -Force -Path $workDir | Out-Null
-$workWb = Join-Path $workDir 'msgbox.xlsm'
-Copy-Item -LiteralPath $fixtureSrc -Destination $workWb -Force
-
 . (Join-Path $PSScriptRoot '_helpers.ps1')
 Clear-OrphanSessionExcels $sessions
 Start-Sleep -Milliseconds 200
 
+# Stage the fixture + a trigger module that calls vba-sync's ExportProject.
+# The trigger module is dropped into the workbook's sibling folder so
+# `import` picks it up. The wrapper is needed because PowerShell COM
+# dispatch can't synthesize a VBA Object arg for the direct
+# ExportProject(control As Object) call.
+$bas = @'
+Attribute VB_Name = "modTrigger"
+Option Explicit
+
+Public Sub TriggerVbaSyncExport()
+    Application.Run "'VBA Sync.xlam'!modSync.ExportProject", Nothing
+End Sub
+'@
+$stagedWb = New-StagedWorkbook -Fixture (Join-Path $here 'fixtures\msgbox.xlsm') `
+    -Modules @{ modTrigger = $bas }
+$workDir = [System.IO.Path]::GetDirectoryName($stagedWb)
+
 Write-Host "Test: bundle (SessionId=$SessionId)" -ForegroundColor Cyan
 
-$proc = Start-SessionHost -StartSession $startSess -Workbook $workWb `
+$proc = Start-SessionHost -StartSession $startSess -Workbook $stagedWb `
     -SessionId $SessionId -SessionsRoot $sessions
 
 function Read-Events($p) { if (-not (Test-Path $p)) { return @() }; Get-Content -LiteralPath $p | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json } }
@@ -54,32 +63,23 @@ try {
     if (-not (Wait-ForEvent $eventsFile 'started' 30)) { throw "no started" }
     Write-Host "  session started" -ForegroundColor Green
 
-    # Load the xlam so its macros are runnable (open_workbook activates
-    # the addin; we'll re-activate fixture below).
+    # Load the xlam so its macros are runnable.
     $openCmd = @{ id='c1'; cmd='open_workbook'; path=$AddinPath } | ConvertTo-Json -Compress
     Add-Content -LiteralPath $commandsFile -Value $openCmd -Encoding UTF8
     if (-not (Wait-ForEvent $eventsFile 'workbook_opened' 15 -Id 'c1')) { throw "no workbook_opened for xlam" }
     Write-Host "  xlam loaded" -ForegroundColor Green
 
-    # Sync a tiny wrapper macro into the fixture: it calls modSync.ExportProject
-    # passing Nothing for the `control As Object` ribbon arg. Lets us trigger
-    # vba-sync's export from outside the ribbon via Application.Run on a
-    # zero-arg macro (PowerShell's COM dispatch can't synthesize a VBA Object
-    # arg for the direct ExportProject call).
-    $srcDir = Join-Path $sessionDir '_src'
-    New-Item -ItemType Directory -Force -Path (Join-Path $srcDir 'Modules') | Out-Null
-    $bas = @'
-Attribute VB_Name = "modTrigger"
-Option Explicit
+    # Import the trigger module via vba-sync's addin (sheet-safe).
+    Add-Content -LiteralPath $commandsFile -Value '{"id":"c2","cmd":"import"}' -Encoding UTF8
+    if (-not (Wait-ForEvent $eventsFile 'import_completed' 60 -Id 'c2')) {
+        $f = Wait-ForEvent $eventsFile 'import_failed' 2 -Id 'c2'
+        throw ('no import_completed' + $(if ($f) { " (import_failed: $($f.error))" } else { '' }))
+    }
 
-Public Sub TriggerVbaSyncExport()
-    Application.Run "'VBA Sync.xlam'!modSync.ExportProject", Nothing
-End Sub
-'@
-    Set-Content -LiteralPath (Join-Path $srcDir 'Modules\modTrigger.bas') -Value $bas -Encoding ASCII
-    $syncCmd = @{ id='c2'; cmd='sync_vba'; source_dir=$srcDir } | ConvertTo-Json -Compress
-    Add-Content -LiteralPath $commandsFile -Value $syncCmd -Encoding UTF8
-    if (-not (Wait-ForEvent $eventsFile 'sync_completed' 15 -Id 'c2')) { throw "no sync_completed" }
+    # Count dialogs seen so far — the import auto-armed and dismissed its
+    # own success dialog (d1) which is already in events.jsonl. We need
+    # the NEXT dialog after run_macro runs.
+    $priorDialogs = @(Read-Events $eventsFile | Where-Object { $_.t -eq 'dialog_appeared' }).Count
 
     # Run the wrapper. activate_workbook to make the fixture ActiveWorkbook
     # for vba-sync's TargetWB() lookup.
@@ -93,7 +93,13 @@ End Sub
 
     # vba-sync ends with MsgBox "VBA Sync export completed successfully!"
     # The session's dialog watcher catches it. We (the agent) respond OK.
-    $dlg = Wait-ForEvent $eventsFile 'dialog_appeared' 60
+    $dlg = $null
+    $deadline = (Get-Date).AddSeconds(60)
+    while (-not $dlg -and (Get-Date) -lt $deadline) {
+        $allDialogs = @(Read-Events $eventsFile | Where-Object { $_.t -eq 'dialog_appeared' })
+        if ($allDialogs.Count -gt $priorDialogs) { $dlg = $allDialogs[$priorDialogs] }
+        else { Start-Sleep -Milliseconds 200 }
+    }
     if (-not $dlg) { throw "no dialog_appeared from ExportProject" }
     if ($dlg.title -notmatch 'VBA Sync') {
         throw "unexpected dialog title: '$($dlg.title)'"

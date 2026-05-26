@@ -147,7 +147,7 @@ Log file: `<session-dir>/macro.log` — predictable, the agent can
 also tail it directly while the macro runs. The injected module
 **survives a workbook save** (the agent might not save; if they do,
 the `xcHarness_` namespace prefix avoids collisions with user
-code). `sync_vba` strips it on the next call if leave-no-trace is
+code). `import` replaces it on the next call if leave-no-trace is
 needed.
 
 **Stale-path note** — if a session re-opens a workbook that already
@@ -155,7 +155,7 @@ has the `xcHarnessLog` module from a PRIOR session, the baked
 `xcHarness_LogPath` const points at the old session's log file. The
 module is left immutable; an `instrument_stale_path` warning event
 surfaces both paths so the agent can decide (read the old log path,
-or `sync_vba` to strip and re-inject).
+or `import` to refresh source).
 
 ### Cell I/O
 
@@ -315,10 +315,9 @@ agent does not have to grep `events.jsonl` backward to find why.
 |---------|------|--------------|
 | `import` | — | `import_completed` (`duration_ms`) or `import_failed` |
 | `export` | — | `export_completed` (`duration_ms`) or `export_failed` |
-| `sync_vba` | `source_dir` | `sync_completed` with `imported[]`, `removed[]` |
 
 `import` / `export` drive the **vba-sync addin's own** ImportProject /
-ExportProject (`VBA Sync.xlam`). This is the **recommended, sheet-safe**
+ExportProject (`VBA Sync.xlam`). This is the only supported, sheet-safe
 path: the addin replaces document / worksheet code-behind modules
 line-by-line, so sheet modules survive. The harness loads `VBA Sync.xlam`
 from `%APPDATA%\Microsoft\AddIns\` if it is not already open, activates
@@ -326,11 +325,13 @@ the session workbook, and auto-dismisses the addin's success dialog; an
 addin error dialog (e.g. workbook not saved) instead surfaces as
 `dialog_appeared` and the op reports `*_failed`.
 
-`sync_vba` is a lower-level pure-PowerShell primitive — it strips user
-VBComponents and re-imports `.bas`/`.cls`/`.frm` from `source_dir`
-(`Modules/`, `ClassModules/`, `Forms/`, `Objects/`), no `VBA Sync.xlam`
-dependency. **It imports `Objects/` sheet code-behind as orphan standard
-modules** — use `import` for any workbook with worksheet code.
+> **Removed:** `sync_vba` was a lower-level pure-PowerShell primitive
+> that called `VBComponents.Import` directly on `Objects/Sheet*.cls`.
+> Worksheet code-behind is bound to a worksheet, not a name, so the
+> direct import always created a phantom class module
+> (`Sheet11` / `Sheet110` / `Sheet1100` cascade across runs), silently
+> corrupting every workbook with sheet code. Removed in canonical on
+> 2026-05-26. There is no replacement — use `import`.
 
 ### Lifecycle
 
@@ -376,7 +377,6 @@ Every command produces a `command_ack` first. Every event also carries a
 | `macros_listed` / `sheets_listed` / `workbook_info` | see above | introspection |
 | `vba_analysis_result` | `op`, `query`, and one of `matches[]` (definition_of), `module` object (read_module), `callers[]` (callers_of) | `analyze_vba` result |
 | `analyze_vba_failed` | `reason` (`missing_op` / `missing_name` / `unknown_op` / `vba_project_locked` / exception message), optional `op` | `analyze_vba` failed |
-| `sync_completed` / `sync_failed` | see above | sync_vba |
 | `import_completed` / `export_completed` | `id`, `duration_ms` | `import` / `export` |
 | `import_failed` / `export_failed` | `id`, `error`, optional `duration_ms` | `import` / `export` error |
 | `dialog_appeared` / `userform_appeared` | `id`, `title`, `text`, `buttons[]`, `class`, `screenshot`; UserForms also `controls[]` — each `name`, `role`, `value`, `checked`, `enabled` | unsolicited modal observed |
@@ -441,7 +441,8 @@ Every command produces a `command_ack` first. Every event also carries a
 {"id":"c1","cmd":"compile_check"}
 // → {"t":"compile_result","id":"c1","ok":false,"module":"modSales","line":47,"source_context":[...]}
 // fix source on disk, then:
-{"id":"c2","cmd":"sync_vba","source_dir":"."}
+{"id":"c2","cmd":"import"}
+// → {"t":"import_completed","id":"c2","duration_ms":2400}
 {"id":"c3","cmd":"compile_check"}
 // → {"t":"compile_result","id":"c3","ok":true}
 ```

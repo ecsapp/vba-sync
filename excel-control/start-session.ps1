@@ -235,9 +235,9 @@ function Get-AccessibleVBProject($Wb) {
     return $proj
 }
 
-# item 5 — drive vba-sync's own Import/Export (sheet-safe, unlike the
-# naive sync_vba). Runs the addin's arg-less HarnessImport/HarnessExport
-# and pre-arms the addin's success MsgBox so the run needs no round-trip.
+# item 5 — drive vba-sync's own Import/Export (sheet-safe). Runs the
+# addin's arg-less HarnessImport/HarnessExport and pre-arms the addin's
+# success MsgBox so the run needs no round-trip.
 function Invoke-VbaSyncOp($Xl, $Wb, $cmd) {
     $op = $cmd.cmd   # 'import' or 'export'
     try {
@@ -268,6 +268,33 @@ function Invoke-VbaSyncOp($Xl, $Wb, $cmd) {
         $armCmd = @{ id = $armId; cmd = 'arm_response'; match = @{ text = $okText }; button = 'OK' } |
                   ConvertTo-Json -Compress
         Add-Content -LiteralPath $commandsFile -Value $armCmd -Encoding UTF8
+
+        # Wait for response_armed before invoking the macro. Otherwise the
+        # watcher's per-cycle order (find-dialogs → match-arms → read-cmds)
+        # can emit dialog_appeared for HarnessImport's success MsgBox in the
+        # SAME cycle the arm registers, but evaluate it against the empty
+        # arm set first — the dialog beats the arm by one cycle, the auto-
+        # respond never fires, and the 6s success poll below times out into
+        # *_failed even though the macro succeeded. Wait up to 5s for the
+        # watcher to confirm registration.
+        $armDeadline = [DateTime]::UtcNow.AddSeconds(5)
+        $armReady = $false
+        while (-not $armReady -and [DateTime]::UtcNow -lt $armDeadline) {
+            try {
+                foreach ($line in (Get-Content -LiteralPath $eventsFile)) {
+                    if ($line -match '"t":"response_armed"' -and
+                        $line -match ([regex]::Escape('"id":"' + $armId + '"'))) {
+                        $armReady = $true; break
+                    }
+                }
+            } catch {}
+            if (-not $armReady) { Start-Sleep -Milliseconds 50 }
+        }
+        if (-not $armReady) {
+            Write-EventLine @{ t = "${op}_failed"; id = $cmd.id
+                error = "auto-arm did not register within 5s; the watcher may be stalled. Inspect events.jsonl for arm_failed or recent watcher activity." }
+            return
+        }
 
         if ($script:Watcher) { $script:Watcher.State.MacroRunning = $true }
         $t0 = [DateTime]::UtcNow
@@ -795,11 +822,11 @@ function Ensure-XcHarnessLogModule($Wb) {
             return @{ path = $oldPath; injected = $false; stale_path = $stale }
         }
     }
-    # Inject via VBComponents.Import on a temp .bas file — same path
-    # sync_vba uses, proven to work. The earlier Add(1) +
-    # CodeModule.AddFromString sequence left Application.Run unable to
-    # resolve other macros in the project ("macro may not be available")
-    # — likely a VBE compile-state interaction; Import does not trip it.
+    # Inject via VBComponents.Import on a temp .bas file — proven path.
+    # The earlier Add(1) + CodeModule.AddFromString sequence left
+    # Application.Run unable to resolve other macros in the project
+    # ("macro may not be available") — likely a VBE compile-state
+    # interaction; Import does not trip it.
     $src = $script:XcHarnessLogVbaTemplate -replace '\{\{LOG_PATH\}\}', ($intendedPath -replace '\\', '\\')
     $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString('N') + '_xcHarness_Log.bas')
     Set-Content -LiteralPath $tmp -Value $src -Encoding ASCII
@@ -1051,10 +1078,24 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd, [switch]$Suppress) {
                 # CommandBar control id 578 = "Compile VBAProject"
                 $btn = $Xl.VBE.CommandBars.FindControl([Type]::Missing, 578)
                 if (-not $btn) { throw "Could not find Compile VBAProject control (id 578)" }
-                # "Compile VBAProject" is disabled when the project is already
-                # fully compiled. Execute() on a disabled control throws
-                # "Unexpected HRESULT" — so a disabled control is success:
-                # nothing to compile means no compile errors.
+                # VBE's "Compile VBAProject" button is disabled when VBE
+                # thinks nothing needs compiling. That flag is unreliable
+                # after a VBComponents.Import: imported modules aren't
+                # always marked dirty, and a broken module can slip
+                # through with a misleading "already compiled" ok. Force
+                # the dirty flag by ADDING then immediately removing a
+                # throwaway standard module — VBComponents.Add definitely
+                # marks the project dirty (vs CodeModule.InsertLines /
+                # ReplaceLine which do not, even with structural change).
+                $proj = $null
+                try { $proj = Get-AccessibleVBProject $Wb } catch {}
+                if ($proj) {
+                    try {
+                        # vbext_ct_StdModule = 1
+                        $tmp = $proj.VBComponents.Add(1)
+                        $proj.VBComponents.Remove($tmp)
+                    } catch {}
+                }
                 if (-not $btn.Enabled) {
                     Write-EventLine @{ t = 'compile_result'; id = $cmd.id; ok = $true; note = 'already compiled' }
                     return
@@ -1090,57 +1131,12 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd, [switch]$Suppress) {
                 Write-EventLine @{ t = 'compile_failed'; id = $cmd.id; error = $_.Exception.Message }
             }
         }
-        'sync_vba' {
-            try {
-                $sourceDir = $cmd.source_dir
-                if (-not $sourceDir) { throw "sync_vba requires source_dir" }
-                $resolvedSrc = (Resolve-Path -LiteralPath $sourceDir).Path
-
-                # Issue 3: a wrong source_dir otherwise looks like an empty
-                # success. Require at least one recognised VBA source folder.
-                $vbaSubdirs = @('Modules','ClassModules','Forms','Objects')
-                $foundSub = @($vbaSubdirs | Where-Object { Test-Path (Join-Path $resolvedSrc $_) })
-                if ($foundSub.Count -eq 0) {
-                    throw ("No VBA source folders ($($vbaSubdirs -join '/')) " +
-                           "found under '$resolvedSrc'. Check source_dir.")
-                }
-
-                $imported = @()
-                $removed  = @()
-
-                # Strip user components (anything not Document, type != 100).
-                # A password-locked project is unlocked at session startup;
-                # Get-AccessibleVBProject throws an actionable error if not.
-                $proj = Get-AccessibleVBProject $Wb
-                $toRemove = @()
-                foreach ($c in $proj.VBComponents) {
-                    if ($c.Type -ne 100) { $toRemove += $c.Name }
-                }
-                foreach ($name in $toRemove) {
-                    $proj.VBComponents.Remove($proj.VBComponents.Item($name)) | Out-Null
-                    $removed += $name
-                }
-                # Re-import .bas/.cls/.frm from source layout
-                foreach ($sub in @('Modules','ClassModules','Forms','Objects')) {
-                    $d = Join-Path $resolvedSrc $sub
-                    if (-not (Test-Path $d)) { continue }
-                    Get-ChildItem -LiteralPath $d -File | ForEach-Object {
-                        if ($_.Extension -in '.bas','.cls','.frm') {
-                            $imp = $proj.VBComponents.Import($_.FullName)
-                            $imported += $imp.Name
-                        }
-                    }
-                }
-                Write-EventLine @{
-                    t = 'sync_completed'
-                    id = $cmd.id
-                    imported = $imported
-                    removed  = $removed
-                }
-            } catch {
-                Write-EventLine @{ t = 'sync_failed'; id = $cmd.id; error = $_.Exception.Message }
-            }
-        }
+        # 'sync_vba' was removed (2026-05-26) — it silently corrupted every
+        # workbook with worksheet code-behind by calling VBComponents.Import
+        # on Objects/Sheet*.cls. Worksheet code-behind is bound to a sheet,
+        # not a name, so Import always created a phantom class module on
+        # collision. Cascade of Sheet11/110/1100/... left every workbook
+        # broken. Use 'import' instead (vba-sync addin-driven, sheet-safe).
         'read_range' {
             try {
                 $sheetName = $cmd.sheet
@@ -1189,6 +1185,106 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd, [switch]$Suppress) {
                 # Resize range if a single anchor cell was passed
                 if ($rng.Rows.Count -eq 1 -and $rng.Columns.Count -eq 1) {
                     $rng = $rng.Resize($h, $w)
+                }
+
+                # P2.11 — refuse writes that would cross a ListObject's
+                # right/bottom edge and trigger Excel's AutoExpand. The
+                # effective write footprint is h*w from the values array,
+                # anchored at the top-left of $addr — values dims can
+                # exceed $addr dims (the original T4 incident wrote a
+                # 20-wide values array into a 16-wide address, silently
+                # writing 4 cells past the address right edge and 4 cells
+                # past the table right edge). Bypass with
+                # force_listobject_extend:true.
+                $anchorTL = $sheet.Range($addr).Cells(1, 1)
+                $writeR1  = $anchorTL.Row
+                $writeC1  = $anchorTL.Column
+                $writeR2  = $writeR1 + $h - 1
+                $writeC2  = $writeC1 + $w - 1
+                $refusedByLoGuard = $false
+                if (-not $cmd.force_listobject_extend) {
+                    foreach ($lo in $sheet.ListObjects) {
+                        $loRng = $lo.Range
+                        $loR1  = $loRng.Row
+                        $loC1  = $loRng.Column
+                        $loR2  = $loR1 + $loRng.Rows.Count - 1
+                        $loC2  = $loC1 + $loRng.Columns.Count - 1
+
+                        # Right-edge crossing: write columns extend past
+                        # the table's last column AND the write row span
+                        # intersects the table's row span (header or data).
+                        # That's the geometry that triggers AutoExpand.
+                        $crossesRight = ($writeC2 -gt $loC2) -and
+                                        ($writeR1 -le $loR2) -and
+                                        ($writeR2 -ge $loR1)
+                        # Bottom-edge crossing: write rows extend past the
+                        # last data row AND the write col span intersects
+                        # the table's col span.
+                        $crossesBottom = ($writeR2 -gt $loR2) -and
+                                         ($writeC1 -le $loC2) -and
+                                         ($writeC2 -ge $loC1)
+
+                        if ($crossesRight -or $crossesBottom) {
+                            $edge = if ($crossesRight -and $crossesBottom) { 'right_and_bottom' }
+                                    elseif ($crossesRight) { 'right' }
+                                    else { 'bottom' }
+                            Write-EventLine @{
+                                t = 'range_write_failed'
+                                id = $cmd.id
+                                reason = 'listobject_autoexpand_risk'
+                                listobject = $lo.Name
+                                listobject_address = $loRng.Address($false, $false)
+                                target_address = ('{0}!{1}' -f $sheet.Name,
+                                    $sheet.Range($sheet.Cells($writeR1,$writeC1),
+                                                 $sheet.Cells($writeR2,$writeC2)).Address($false,$false))
+                                crossing_edge = $edge
+                                values_rows = $h
+                                values_cols = $w
+                                hint = ("Writing $h x $w cells anchored at " +
+                                        $sheet.Cells($writeR1,$writeC1).Address($false,$false) +
+                                        " would extend ListObject '" + $lo.Name + "' (" +
+                                        $loRng.Address($false,$false) + ") past its $edge edge. " +
+                                        "Excel's AutoExpand would silently add ListColumns or rows " +
+                                        "(default names 'Column1', 'Column2', ...) corrupting the table. " +
+                                        "If you intend to add a column, use a workbook-side " +
+                                        "'ListColumns.Add Name:=<...>' macro first, then write into " +
+                                        "the new column. To bypass this guard explicitly (advanced — " +
+                                        "risks workbook corruption), pass force_listobject_extend:true.")
+                            }
+                            $refusedByLoGuard = $true
+                            break
+                        }
+                    }
+                }
+                if ($refusedByLoGuard) { break }
+
+                # Trailing-null secondary defence — emit additive warning
+                # when the rightmost values column is uniformly null AND
+                # the write footprint is wholly inside an existing
+                # ListObject (the refuse path above already handled the
+                # cross-edge case). Caller is usually mis-shaped.
+                if (-not $cmd.force_listobject_extend) {
+                    $trailingNullCols = 0
+                    for ($j = $w - 1; $j -ge 0; $j--) {
+                        $allNull = $true
+                        for ($i = 0; $i -lt $h; $i++) {
+                            $r = @($rowsIn[$i])
+                            $v = if ($j -lt $r.Count) { $r[$j] } else { $null }
+                            if ($null -ne $v -and "$v" -ne '') { $allNull = $false; break }
+                        }
+                        if ($allNull) { $trailingNullCols++ } else { break }
+                    }
+                    if ($trailingNullCols -gt 0) {
+                        Write-EventLine @{
+                            t = 'range_write_warning'
+                            id = $cmd.id
+                            reason = 'trailing_null_columns'
+                            trailing_null_cols = $trailingNullCols
+                            values_rows = $h
+                            values_cols = $w
+                            hint = "values array has $trailingNullCols trailing column(s) that are uniformly null. If unintended, slice the array tighter before write_range — trailing nulls past a ListObject edge would trigger AutoExpand and silent table corruption."
+                        }
+                    }
                 }
 
                 # Per-cell write via the sheet's absolute Cells(row, col)
@@ -1368,6 +1464,50 @@ function Invoke-SessionCommand($Xl, $Wb, $cmd, [switch]$Suppress) {
                             if ($filter -and $tname -notmatch $filter) { continue }
                             [void]$tests.Add(@{ module = $comp.Name; name = $tname })
                         }
+                    }
+                }
+
+                # P1.6 — pre-flight compile_check before the per-test loop.
+                # If a sibling test module has a VBA compile error, the
+                # runtime compile during $Xl.Run pops a VBE modal that
+                # blocks Excel's COM dispatch synchronously; the watcher's
+                # command pump is then stuck inside the in-flight run_tests
+                # until force-killed. Refuse early — same primitive as the
+                # compile_check command (CommandBar id 578). Add+Remove
+                # of a throwaway module flips the dirty flag (a stale
+                # post-import flag would otherwise misreport "already
+                # compiled" — see the compile_check handler).
+                try {
+                    $tmp = $proj.VBComponents.Add(1)
+                    $proj.VBComponents.Remove($tmp)
+                } catch {}
+                $btn = $Xl.VBE.CommandBars.FindControl([Type]::Missing, 578)
+                if ($btn -and $btn.Enabled) {
+                    $btn.Execute()
+                    Start-Sleep -Milliseconds 600
+                    $pane = $null
+                    try { $pane = $Xl.VBE.ActiveCodePane } catch {}
+                    if ($pane) {
+                        $module = $pane.CodeModule.Name
+                        $sLine = 0; $sCol = 0; $eLine = 0; $eCol = 0
+                        [void]$pane.GetSelection([ref]$sLine, [ref]$sCol, [ref]$eLine, [ref]$eCol)
+                        $cStart = [Math]::Max(1, $sLine - 2)
+                        $cEnd   = [Math]::Min($pane.CodeModule.CountOfLines, $sLine + 2)
+                        $ctx = @()
+                        for ($i = $cStart; $i -le $cEnd; $i++) {
+                            $ctx += ('{0}: {1}' -f $i, $pane.CodeModule.Lines($i, 1))
+                        }
+                        Write-EventLine @{
+                            t = 'tests_aborted'
+                            id = $cmd.id
+                            reason = 'compile_error'
+                            module = $module
+                            line = $sLine
+                            column = $sCol
+                            source_context = $ctx
+                            hint = "VBA compile error in module '$module' would freeze the test pump on the first mid-suite invocation. Fix the source, re-import, and re-run run_tests."
+                        }
+                        break
                     }
                 }
 
@@ -1664,7 +1804,7 @@ try {
                 Write-EventLine @{ t = 'vba_unlock_failed'; error = 'Unlock-VbaProject returned false — wrong password, or the password dialog could not be driven.' }
             }
         } else {
-            Write-EventLine @{ t = 'vba_unlock_failed'; error = 'VBA project is password-locked but no password was supplied (-VbaPassword / $env:XC_VBA_PASSWORD / a .vba-password file beside the harness scripts). sync_vba / compile_check / run_tests / list_macros will fail.' }
+            Write-EventLine @{ t = 'vba_unlock_failed'; error = 'VBA project is password-locked but no password was supplied (-VbaPassword / $env:XC_VBA_PASSWORD / a .vba-password file beside the harness scripts). import / compile_check / run_tests / list_macros will fail.' }
         }
     }
 
