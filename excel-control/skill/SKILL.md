@@ -47,14 +47,11 @@ workbook root.
    `.excel-control/sessions/s1/state.json`: `status:crashed` means startup failed
    — check the `events.jsonl` tail for a `session_error`.
 3. **Watch events** — point the Monitor tool at
-   `.excel-control/sessions/s1/events.jsonl` with an **unfiltered
-   tail**: `Get-Content -LiteralPath … -Wait -Tail 0`. **No
-   `Where-Object`, no `grep`, no `Select-String`, no allowlist, no
-   excludelist.** Filtering has caused three documented silent
-   hangs (one 66 minutes, one 2 hours, one a 969ms-fast import
-   completing while the agent waited forever). See
-   [Monitor — DO NOT FILTER events.jsonl](#monitor--do-not-filter-eventsjsonl)
-   for the rule and the rationale.
+   `.excel-control/sessions/s1/events.jsonl` with `Get-Content
+   -LiteralPath … -Wait -Tail 0`. Parse each line as JSON. Read
+   every event; do not filter the live tail. See
+   [Watching events](#watching-events) for the command, the parsing
+   pattern, and the failure-event reference.
 4. **Send commands** — append one JSON object per line to
    `.excel-control/sessions/s1/commands.jsonl` (append only; never rewrite it).
    **Never `echo` quoted JSON via the shell.** Bash/PowerShell
@@ -649,62 +646,59 @@ liveness probe — read it to see how stale a `ready` status is.
   workbook (multi-workbook within a session is fine via
   `open_workbook` / `close_workbook`).
 
-## Monitor — DO NOT FILTER events.jsonl
+## Watching events
 
-**The cost of the smallest filter mistake is stall and hours of
-wasted work.** Three documented incidents to date — a 66-minute
-production stall on an unmatched `range_read_failed`, a 2-hour
-stall on 2026-05-25, and a fresh-agent 969ms-silent
-`import_completed` — all had the same shape: a filter dropped the
-event the agent needed, silence became indistinguishable from
-"still running", agent waited forever. This is not a preference,
-it is a hard operational rule.
-
-The Monitor command is exactly this — no more, no less:
+Tail the events file:
 
 ```
-Get-Content -LiteralPath events.jsonl -Wait -Tail 0
+Get-Content -LiteralPath .excel-control/sessions/<id>/events.jsonl -Wait -Tail 0
 ```
 
-**Do not add:**
+`-Tail 0` starts at the end of the file; `-Wait` blocks and emits
+each new line as it arrives. Parse each line as JSON, correlate by
+`id` (the command id you sent) and by `dialog_id` (across the
+`dialog_appeared` → `dialog_auto_responded` / `dialog_dismissed`
+chain).
 
-- `| Where-Object { ... }` — even excluding a "noisy" event type is
-  filtering. The event you exclude today is the signal you need
-  tomorrow. Excludelists are filters too; they have the same stall
-  failure mode and are forbidden by the same rule.
-- `| ForEach-Object { if ($_ -match ...) { $_ } }` — same shape,
-  same bug.
-- `| grep ...` / `| Select-String ...` — same shape, same bug.
-- Any allowlist of "the events I think I'll need." You WILL forget
-  one, and a 969ms-fast command will succeed silently while you
-  wait for an event that never matches your filter.
+**Read every event.** About half the stream is protocol mechanics —
+`command_ack`, `response_armed`, `response_disarmed` — which rarely
+change what the agent does next but matter for correlating cause and
+effect when something doesn't behave as expected. The other half
+carries the outcomes: `dialog_appeared`, `macro_completed`,
+`*_completed`, `*_failed`, etc. Treat them as one stream; do not
+filter or grep the live tail.
 
-The harness emits ~5-50 events per macro. Noise is hypothetical;
-silence is real and expensive. Read everything.
+Filtering — `Where-Object`, `Select-String`, `grep`, or an allowlist
+of "events I think I'll need" — is the most common way to wedge a
+session. A faster-than-expected `import_completed` or an unanticipated
+`range_read_failed` gets dropped from the matched set, the agent
+waits for an event that never matches its filter, and a one-second
+operation appears to hang forever. Post-hoc analysis of a saved
+`events.jsonl` with grep/jq is fine; the rule only applies to the
+live tail driving in-session decisions.
 
-**Failure-event reference** (for grep-after-the-fact debugging of
-saved events.jsonl files, NOT for building any kind of live
-Monitor filter — building a Monitor filter from this list will
-stall the session the first time the harness emits an event not on
-the list):
+### Failure events
+
+Failure events follow the `<verb>_failed` convention. The full set
+emitted today:
+
+`range_read_failed`, `range_write_failed`, `macro_failed`,
+`compile_failed`, `import_failed`, `export_failed`, `save_failed`,
+`open_failed`, `close_workbook_failed`, `calculate_failed`,
+`refresh_failed`, `connection_failed`, `screenshot_failed`,
+`analyze_vba_failed`, `respond_failed`, `form_control_failed`,
+`arm_failed`, `recovery_close_failed`, `tests_failed`,
+`macros_list_failed`, `sheets_list_failed`, `workbook_info_failed`,
+`instrument_failed`, `macro_loop_failed`.
+
+Three protocol-level failure events sit outside the convention:
 
 - `command_error` — invalid JSON in `commands.jsonl`. The harness
   scrapes the `id` field if present so the agent can correlate.
-- `unknown_command` — command name not recognised. Often a typo
+- `unknown_command` — command name not recognised. Usually a typo
   (e.g. `save` instead of `save_workbook`).
-- `command_rejected` — only in `crashed` state; pairs with the
-  `excel_crashed` push event.
-- `<verb>_failed` for every verb — `range_read_failed`,
-  `range_write_failed`, `macro_failed`, `compile_failed`,
-  `sync_failed`, `import_failed`, `export_failed`, `save_failed`,
-  `open_failed`, `close_workbook_failed`, `calculate_failed`,
-  `refresh_failed`, `connection_failed`, `screenshot_failed`,
-  `analyze_vba_failed`, `respond_failed`, `form_control_failed`,
-  `arm_failed`, `recovery_close_failed`, `tests_failed`,
-  `macros_list_failed`, `sheets_list_failed`, `workbook_info_failed`,
-  `instrument_failed`, `macro_loop_failed`.
-
-Every new command will follow the `<verb>_failed` convention.
+- `command_rejected` — sent when the session is in `crashed` state;
+  pairs with the `excel_crashed` push event.
 
 ## Debugging stuck or unhappy sessions
 
