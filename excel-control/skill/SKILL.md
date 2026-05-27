@@ -30,8 +30,27 @@ workbook root.
 
 ## Quickstart
 
-1. **Launch the session** (Bash, `run_in_background: true`). Headless by
-   default — Excel runs invisibly:
+**Order matters: arm the Monitor before launching the session.**
+Startup is fast enough that `started` and `vba_unlocked` can already
+be in `events.jsonl` by the time a later-armed Monitor attaches, and
+those events won't replay — the agent waits forever for an event
+that has already fired.
+
+1. **Arm the Monitor.** Point the Monitor tool at
+   `.excel-control/sessions/s1/events.jsonl` with:
+   ```pwsh
+   $f = '.excel-control/sessions/s1/events.jsonl'
+   while (-not (Test-Path -LiteralPath $f)) { Start-Sleep -Milliseconds 100 }
+   Get-Content -LiteralPath $f -Wait
+   ```
+   The Test-Path loop handles the case where Monitor armed before
+   `start-session.ps1` has created the file. `-Wait` (without
+   `-Tail 0`) streams from the start of the file, so no event is
+   ever missed. Parse each line as JSON; read every event; do not
+   filter the live tail. See [Watching events](#watching-events) for
+   details.
+2. **Launch the session** (Bash, `run_in_background: true`). Headless
+   by default — Excel runs invisibly:
    ```
    pwsh .claude/skills/excel-control/tools/start-session.ps1 -Workbook X.xlsm -SessionId s1
    ```
@@ -39,19 +58,14 @@ workbook root.
    meaningful worksheet screenshots (a headless automation Excel renders
    a mostly-empty main window). Headless is otherwise fine for every
    command, Export included.
-2. **Wait for readiness.** The harness emits
+3. **Wait for readiness.** The harness emits
    `{"t":"started","pid":...,"excel_pid":...,"session_id":...}` to
-   `.excel-control/sessions/s1/events.jsonl` once Excel has opened the workbook —
-   this takes a few seconds. **Do not send a command before `started`
-   arrives.** If it has not arrived in ~15s, read
-   `.excel-control/sessions/s1/state.json`: `status:crashed` means startup failed
-   — check the `events.jsonl` tail for a `session_error`.
-3. **Watch events** — point the Monitor tool at
-   `.excel-control/sessions/s1/events.jsonl` with `Get-Content
-   -LiteralPath … -Wait -Tail 0`. Parse each line as JSON. Read
-   every event; do not filter the live tail. See
-   [Watching events](#watching-events) for the command, the parsing
-   pattern, and the failure-event reference.
+   `events.jsonl` once Excel has opened the workbook — this takes a
+   few seconds. **Do not send a command before `started` arrives.**
+   If it has not arrived in ~15s, read
+   `.excel-control/sessions/s1/state.json`: `status:crashed` means
+   startup failed — check the `events.jsonl` tail for a
+   `session_error`.
 4. **Send commands** — append one JSON object per line to
    `.excel-control/sessions/s1/commands.jsonl` (append only; never rewrite it).
    **Never `echo` quoted JSON via the shell.** Bash/PowerShell
@@ -648,17 +662,25 @@ liveness probe — read it to see how stale a `ready` status is.
 
 ## Watching events
 
-Tail the events file:
+Tail the events file from the start:
 
-```
-Get-Content -LiteralPath .excel-control/sessions/<id>/events.jsonl -Wait -Tail 0
+```pwsh
+$f = '.excel-control/sessions/<id>/events.jsonl'
+while (-not (Test-Path -LiteralPath $f)) { Start-Sleep -Milliseconds 100 }
+Get-Content -LiteralPath $f -Wait
 ```
 
-`-Tail 0` starts at the end of the file; `-Wait` blocks and emits
-each new line as it arrives. Parse each line as JSON, correlate by
-`id` (the command id you sent) and by `dialog_id` (across the
-`dialog_appeared` → `dialog_auto_responded` / `dialog_dismissed`
-chain).
+The Test-Path loop lets the Monitor arm before `start-session.ps1`
+has created the file (the recommended order — see Quickstart).
+`-Wait` blocks and emits each new line as it arrives.
+**Do not use `-Tail 0`** — it seeks to current end-of-file on
+attach, so any event already written (typically `started` at +4s
+and `vba_unlocked` at +8s) is invisible to the watcher and the
+agent waits forever for an event that has already fired.
+
+Parse each line as JSON, correlate by `id` (the command id you
+sent) and by `dialog_id` (across the `dialog_appeared` →
+`dialog_auto_responded` / `dialog_dismissed` chain).
 
 **Read every event.** About half the stream is protocol mechanics —
 `command_ack`, `response_armed`, `response_disarmed` — which rarely
